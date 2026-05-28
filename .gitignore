@@ -1,0 +1,9 @@
+/target
+**/*.rs.bk
+Cargo.lock
+/.claude
+/.chainlink
+CHANGELOG.md
+bevy-symbios-audio-primer.sh
+bevy_symbios_audio_primer_*
+.mcp.json
