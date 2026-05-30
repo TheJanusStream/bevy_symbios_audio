@@ -37,12 +37,20 @@
 
 use std::any::Any;
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
+use crate::audio_source::MAX_WAV_SAMPLES;
 use crate::node::{BakeContext, Node, NodeKind};
 use crate::patch::{AudioPatch, Connection, GraphError, GraphNode, NodeId, topo_sort};
+
+/// How often [`bake_inner`] polls the cancellation flag inside the sample
+/// loop.  Coarse enough that the relaxed atomic load is free in the hot path,
+/// fine enough that a dropped [`crate::async_gen::PendingAudioPatch`] aborts
+/// an in-flight bake within a fraction of a millisecond at audio rates.
+const CANCEL_CHECK_INTERVAL: u64 = 4096;
 
 /// Bake `patch` into a mono `Vec<f32>` at `sample_rate` Hz for
 /// `duration_secs` seconds.
@@ -78,6 +86,27 @@ pub fn try_bake(
         sample_rate,
         duration_samples(sample_rate, duration_secs),
         None,
+        None,
+    )
+}
+
+/// [`try_bake`] that aborts early if `cancelled` flips to `true` while the
+/// bake is in flight.  Used by the async pool so dropping a
+/// [`crate::async_gen::PendingAudioPatch`] stops an already-running bake
+/// instead of letting it occupy a worker until completion.  The returned
+/// buffer is partial (and discarded) when cancellation fires mid-bake.
+pub(crate) fn try_bake_cancellable(
+    patch: &AudioPatch,
+    sample_rate: u32,
+    duration_secs: f32,
+    cancelled: &AtomicBool,
+) -> Result<Vec<f32>, GraphError> {
+    bake_inner(
+        patch,
+        sample_rate,
+        duration_samples(sample_rate, duration_secs),
+        None,
+        Some(cancelled),
     )
 }
 
@@ -115,6 +144,7 @@ pub(crate) fn bake_inner(
     sample_rate: u32,
     duration_samples: u64,
     gate_samples: Option<u64>,
+    cancelled: Option<&AtomicBool>,
 ) -> Result<Vec<f32>, GraphError> {
     if duration_samples == 0 {
         return Ok(Vec::new());
@@ -179,6 +209,15 @@ pub(crate) fn bake_inner(
     let mut buffer = Vec::with_capacity(duration_samples as usize);
 
     for sample_index in 0..duration_samples {
+        // Abort an in-flight bake whose owning PendingAudioPatch was dropped,
+        // so a despawned entity's work stops occupying a pool worker rather
+        // than running to completion as zombie computation.  Checked on a
+        // coarse stride so the relaxed load stays out of the per-sample path.
+        if sample_index % CANCEL_CHECK_INTERVAL == 0
+            && cancelled.is_some_and(|c| c.load(Ordering::Relaxed))
+        {
+            return Ok(buffer);
+        }
         for i in 0..plan.len() {
             let np = &plan[i];
             // Resolve this node's ports by summing each port's sources.
@@ -223,7 +262,15 @@ fn duration_samples(sample_rate: u32, duration_secs: f32) -> u64 {
     if duration_secs <= 0.0 {
         return 0;
     }
-    (f64::from(duration_secs) * f64::from(sample_rate)).round() as u64
+    let samples = (f64::from(duration_secs) * f64::from(sample_rate)).round();
+    // Clamp to the WAV ceiling so an untrusted `duration_secs` can't saturate
+    // the cast to u64::MAX and make bake_inner's `Vec::with_capacity` attempt
+    // a usize::MAX allocation.
+    if samples >= MAX_WAV_SAMPLES as f64 {
+        MAX_WAV_SAMPLES as u64
+    } else {
+        samples as u64
+    }
 }
 
 #[cfg(test)]
@@ -404,5 +451,41 @@ mod tests {
         let via_try = try_bake(&p, 44_100, 0.05).expect("valid patch bakes");
         let via_bake = bake(&p, 44_100, 0.05);
         assert_eq!(via_try, via_bake);
+    }
+
+    #[test]
+    fn bake_inner_aborts_when_cancelled() {
+        let p = silence_patch(0);
+        let cancelled = AtomicBool::new(true);
+        // Pre-cancelled: the loop checks at sample_index 0 and returns before
+        // producing the full buffer, so even a multi-million-sample request
+        // stops immediately instead of running to completion.
+        let out =
+            bake_inner(&p, 44_100, 5_000_000, None, Some(&cancelled)).expect("valid patch bakes");
+        assert!(
+            out.len() < 5_000_000,
+            "cancelled bake must not run to completion: got {} samples",
+            out.len()
+        );
+    }
+
+    #[test]
+    fn bake_inner_completes_when_not_cancelled() {
+        let p = silence_patch(0);
+        let cancelled = AtomicBool::new(false);
+        let out = bake_inner(&p, 44_100, 1_000, None, Some(&cancelled)).expect("valid patch bakes");
+        assert_eq!(out.len(), 1_000);
+    }
+
+    #[test]
+    fn duration_samples_clamps_absurd_duration() {
+        // An astronomical duration clamps to the WAV ceiling instead of
+        // saturating to u64::MAX (which would OOM bake_inner's allocation).
+        assert_eq!(
+            duration_samples(44_100, f32::MAX),
+            crate::audio_source::MAX_WAV_SAMPLES as u64
+        );
+        // Sane durations are untouched: 0.5 s × 48 kHz.
+        assert_eq!(duration_samples(48_000, 0.5), 24_000);
     }
 }

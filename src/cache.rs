@@ -323,6 +323,38 @@ mod tests {
         assert_ne!(a, b);
     }
 
+    #[test]
+    fn from_patch_tolerates_non_finite_floats() {
+        // serde_json serialises NaN / infinity as `null` rather than
+        // erroring, so `from_patch`'s `.expect()` never trips on a
+        // procedurally-built patch carrying a non-finite float — it
+        // fingerprints without panicking and stays deterministic.  (Such a
+        // patch still bakes to garbage, but it must not crash cache-key
+        // derivation and take the engine down with it.)
+        use crate::oscillator::SineOsc;
+        let patch = AudioPatch {
+            seed: 0,
+            graph: NodeGraph {
+                nodes: vec![GraphNode {
+                    id: NodeId(0),
+                    kind: NodeKind::Sine(SineOsc {
+                        freq_hz: f32::NAN,
+                        phase_offset: f32::INFINITY,
+                        amplitude: f32::NEG_INFINITY,
+                    }),
+                    inputs: BTreeMap::new(),
+                }],
+                output: NodeId(0),
+            },
+        };
+        let a = PatchCacheKey::from_patch(&patch, 44_100, 1.0);
+        let b = PatchCacheKey::from_patch(&patch, 44_100, 1.0);
+        assert_eq!(
+            a, b,
+            "fingerprint must be deterministic for non-finite floats"
+        );
+    }
+
     // --- MemoryStore -------------------------------------------------------
 
     #[test]

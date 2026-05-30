@@ -62,6 +62,7 @@
 
 use std::collections::HashMap;
 
+use crate::audio_source::MAX_WAV_SAMPLES;
 use crate::bake::bake_inner;
 use crate::patch::AudioPatch;
 use crate::sequence::{Event, SequenceRecipe};
@@ -85,7 +86,13 @@ pub fn bake_sequence(recipe: &SequenceRecipe) -> Vec<f32> {
     let sr = recipe.sample_rate;
     let main_samples = duration_to_samples(recipe.duration_beats, beat_secs, sr);
     let tail_samples = duration_to_samples(recipe.loop_crossfade_beats, beat_secs, sr);
-    let master_len = main_samples + tail_samples;
+    // saturating_add + clamp: `duration_to_samples` already caps each term at
+    // MAX_WAV_SAMPLES, but guard the sum too so an untrusted recipe can never
+    // overflow usize here or provision a buffer past the WAV-encodable ceiling
+    // (which `samples_to_wav_bytes` would later reject anyway).
+    let master_len = main_samples
+        .saturating_add(tail_samples)
+        .min(MAX_WAV_SAMPLES);
 
     let mut master = vec![0.0_f32; master_len];
     if master_len == 0 {
@@ -126,7 +133,7 @@ pub fn bake_sequence(recipe: &SequenceRecipe) -> Vec<f32> {
             let total_samples = duration_to_samples(total_beats, beat_secs, sr) as u64;
             // A malformed instrument graph shouldn't take down the whole
             // mixdown — warn and skip it, like an unknown instrument ref.
-            let buf = match bake_inner(patch, sr, total_samples, Some(gate_samples)) {
+            let buf = match bake_inner(patch, sr, total_samples, Some(gate_samples), None) {
                 Ok(buf) => buf,
                 Err(err) => {
                     bevy::log::warn!(
@@ -150,13 +157,22 @@ pub fn bake_sequence(recipe: &SequenceRecipe) -> Vec<f32> {
             if source.is_empty() {
                 continue;
             }
-            let resampled = resample_linear(source, event.pitch_multiplier);
+            let start = (f64::from(event.time_beats) * f64::from(beat_secs) * f64::from(sr)).round()
+                as usize;
+            // Resample only as many samples as can land in the master from
+            // `start`: anything past the end is discarded by write_into anyway,
+            // and bounding here stops a subnormal pitch_multiplier from
+            // inflating the output length to usize::MAX (capacity-overflow
+            // panic / OOM) before a single sample is written.
+            let max_out = master.len().saturating_sub(start);
+            if max_out == 0 {
+                continue;
+            }
+            let resampled = resample_linear(source, event.pitch_multiplier, max_out);
             if resampled.is_empty() {
                 continue;
             }
             let volume = event.volume.clamp(0.0, 1.0);
-            let start = (f64::from(event.time_beats) * f64::from(beat_secs) * f64::from(sr)).round()
-                as usize;
             write_into(&mut master, start, &resampled, volume);
         }
     }
@@ -247,7 +263,16 @@ fn duration_to_samples(beats: f32, beat_secs: f32, sample_rate: u32) -> usize {
     if beats <= 0.0 || beat_secs <= 0.0 {
         return 0;
     }
-    (f64::from(beats) * f64::from(beat_secs) * f64::from(sample_rate)).round() as usize
+    let samples = (f64::from(beats) * f64::from(beat_secs) * f64::from(sample_rate)).round();
+    // Clamp at the WAV ceiling so an astronomical duration / gate / release
+    // from an untrusted recipe can't saturate the float→usize cast to
+    // usize::MAX and blow up a downstream Vec allocation (the master buffer
+    // here, or bake_inner's per-event buffer when this feeds gate/total).
+    if samples >= MAX_WAV_SAMPLES as f64 {
+        MAX_WAV_SAMPLES
+    } else {
+        samples as usize
+    }
 }
 
 #[inline]
@@ -260,15 +285,27 @@ fn bake_key(event: &Event) -> (String, u32, u32) {
 }
 
 /// Linear-interpolation resampler.  Output length is approximately
-/// `source.len() / pitch_multiplier`.  Pitch-up shortens the buffer;
-/// pitch-down lengthens it.  An empty source or non-positive pitch
-/// produces an empty output (defensive — bake() returns empty for
-/// non-positive duration, and a zero or negative pitch is nonsense).
-fn resample_linear(source: &[f32], pitch_multiplier: f32) -> Vec<f32> {
+/// `source.len() / pitch_multiplier`, capped at `max_out` — the number of
+/// samples the caller can actually consume — so a near-zero pitch can't drive
+/// an unbounded allocation.  Pitch-up shortens the buffer; pitch-down
+/// lengthens it.  An empty source or non-positive pitch produces an empty
+/// output (defensive — bake() returns empty for non-positive duration, and a
+/// zero or negative pitch is nonsense).
+fn resample_linear(source: &[f32], pitch_multiplier: f32, max_out: usize) -> Vec<f32> {
     if source.is_empty() || !pitch_multiplier.is_finite() || pitch_multiplier <= 0.0 {
         return Vec::new();
     }
-    let out_len = (source.len() as f32 / pitch_multiplier).floor() as usize;
+    // Compute the length in f64 and cap it at `max_out`.  A subnormal
+    // pitch_multiplier (e.g. 1e-30) sends source.len()/pitch enormous — in
+    // f32 it overflows to +Inf and the `as usize` cast saturates to
+    // usize::MAX, which panics Vec::with_capacity.  The cap also avoids
+    // materialising more samples than the caller can use.
+    let raw_len = (source.len() as f64 / f64::from(pitch_multiplier)).floor();
+    let out_len = if raw_len >= max_out as f64 {
+        max_out
+    } else {
+        raw_len as usize
+    };
     let mut out = Vec::with_capacity(out_len);
     for i in 0..out_len {
         let src_pos = i as f32 * pitch_multiplier;
@@ -302,7 +339,7 @@ mod tests {
     #[test]
     fn resample_at_unit_pitch_is_identity() {
         let src = vec![0.0, 0.25, 0.5, 0.75, 1.0];
-        let out = resample_linear(&src, 1.0);
+        let out = resample_linear(&src, 1.0, usize::MAX);
         assert_eq!(out.len(), src.len());
         for (a, b) in src.iter().zip(out.iter()) {
             assert!((a - b).abs() < 1e-6);
@@ -312,7 +349,7 @@ mod tests {
     #[test]
     fn resample_at_pitch_two_halves_length() {
         let src: Vec<f32> = (0..100).map(|i| i as f32).collect();
-        let out = resample_linear(&src, 2.0);
+        let out = resample_linear(&src, 2.0, usize::MAX);
         // 100 / 2 = 50 output samples; out[i] ≈ src[2i] = 2i.
         assert_eq!(out.len(), 50);
         for (i, s) in out.iter().enumerate() {
@@ -323,7 +360,7 @@ mod tests {
     #[test]
     fn resample_at_pitch_half_doubles_length_with_interp() {
         let src = vec![0.0_f32, 10.0, 20.0, 30.0];
-        let out = resample_linear(&src, 0.5);
+        let out = resample_linear(&src, 0.5, usize::MAX);
         // src.len() / 0.5 = 8; out[i] = src[i/2] interp.
         assert_eq!(out.len(), 8);
         assert!((out[0] - 0.0).abs() < 1e-6);
@@ -333,14 +370,46 @@ mod tests {
 
     #[test]
     fn resample_rejects_non_positive_pitch() {
-        assert!(resample_linear(&[1.0, 2.0], 0.0).is_empty());
-        assert!(resample_linear(&[1.0, 2.0], -1.0).is_empty());
-        assert!(resample_linear(&[1.0, 2.0], f32::NAN).is_empty());
+        assert!(resample_linear(&[1.0, 2.0], 0.0, usize::MAX).is_empty());
+        assert!(resample_linear(&[1.0, 2.0], -1.0, usize::MAX).is_empty());
+        assert!(resample_linear(&[1.0, 2.0], f32::NAN, usize::MAX).is_empty());
     }
 
     #[test]
     fn resample_empty_source_is_empty() {
-        assert!(resample_linear(&[], 1.0).is_empty());
+        assert!(resample_linear(&[], 1.0, usize::MAX).is_empty());
+    }
+
+    #[test]
+    fn resample_caps_output_at_max_out() {
+        // Pitch-down would double the length to 200, but max_out clips it.
+        let src: Vec<f32> = (0..100).map(|i| i as f32).collect();
+        let out = resample_linear(&src, 0.5, 10);
+        assert_eq!(out.len(), 10);
+    }
+
+    #[test]
+    fn resample_subnormal_pitch_is_bounded_not_oom() {
+        // f32::MIN_POSITIVE sends source.len()/pitch to ~1e38; the old f32
+        // path saturated the usize cast to usize::MAX and panicked
+        // Vec::with_capacity.  With the cap the output is bounded at max_out.
+        let src = vec![0.5_f32; 8];
+        let out = resample_linear(&src, f32::MIN_POSITIVE, 32);
+        assert_eq!(out.len(), 32);
+        assert!(out.iter().all(|s| (*s - 0.5).abs() < 1e-6));
+    }
+
+    #[test]
+    fn duration_to_samples_clamps_absurd_durations() {
+        // An astronomical beat count clamps to the WAV ceiling instead of
+        // saturating the float→usize cast to usize::MAX.
+        assert_eq!(
+            duration_to_samples(f32::MAX, 0.5, 44_100),
+            MAX_WAV_SAMPLES,
+            "huge duration must clamp to the WAV ceiling"
+        );
+        // Sane values are unaffected: 2 beats × 0.5 s/beat × 44.1 kHz.
+        assert_eq!(duration_to_samples(2.0, 0.5, 44_100), 44_100);
     }
 
     #[test]

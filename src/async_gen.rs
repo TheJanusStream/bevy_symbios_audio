@@ -49,7 +49,7 @@ use bevy::{
 };
 
 use crate::audio_source::samples_to_wav_bytes;
-use crate::bake::try_bake;
+use crate::bake::try_bake_cancellable;
 use crate::cache::{PatchCache, PatchCacheKey};
 use crate::patch::AudioPatch;
 
@@ -57,8 +57,17 @@ use crate::patch::AudioPatch;
 /// buffer with a clear error log instead of panicking the thread (which
 /// would surface as a misleading "bake thread panicked" in
 /// [`poll_audio_tasks`]).
-fn bake_or_warn(patch: &AudioPatch, sample_rate: u32, duration_secs: f32) -> Vec<f32> {
-    match try_bake(patch, sample_rate, duration_secs) {
+///
+/// Aborts early if `cancelled` flips during the bake (the owning
+/// [`PendingAudioPatch`] was dropped): the returned partial buffer is sent
+/// into a channel whose receiver is already gone, so the send is discarded.
+fn bake_or_warn(
+    patch: &AudioPatch,
+    sample_rate: u32,
+    duration_secs: f32,
+    cancelled: &AtomicBool,
+) -> Vec<f32> {
+    match try_bake_cancellable(patch, sample_rate, duration_secs, cancelled) {
         Ok(buffer) => buffer,
         Err(err) => {
             bevy::log::error!(
@@ -181,10 +190,11 @@ fn bake_pool() -> Option<&'static rayon::ThreadPool> {
 /// each frame via [`mpsc::Receiver::try_recv`].
 ///
 /// Dropping `PendingAudioPatch` (e.g. when the entity is despawned)
-/// sets an atomic cancellation flag; tasks that have not yet started
-/// see the flag and exit without doing any work, preventing zombie
-/// tasks from saturating the thread pool when entities are rapidly
-/// spawned and destroyed.
+/// sets an atomic cancellation flag.  The bake checks it before starting
+/// *and* periodically inside the sample loop, so a dropped request both
+/// skips a not-yet-started bake and aborts one already in flight —
+/// preventing zombie tasks from saturating the thread pool when entities
+/// are rapidly spawned and destroyed.
 #[derive(Component)]
 pub struct PendingAudioPatch {
     // Mutex<…> wraps the Receiver to make the struct Sync — Bevy's
@@ -192,7 +202,8 @@ pub struct PendingAudioPatch {
     // poll, never long-held.
     pub(crate) rx: Mutex<mpsc::Receiver<Vec<f32>>>,
     /// Set to `true` on drop.  The background task checks this before
-    /// starting.
+    /// starting and periodically while baking, so an in-flight bake aborts
+    /// instead of running to completion.
     cancelled: Arc<AtomicBool>,
     /// Sample rate the buffer was baked at — needed to encode the WAV
     /// header when [`poll_audio_tasks`] wraps the samples in
@@ -329,13 +340,13 @@ fn spawn_bake(
     match bake_pool() {
         Some(pool) => pool.spawn(move || {
             if !cancelled.load(Ordering::Relaxed) {
-                tx.send(bake_or_warn(&patch, sample_rate, duration_secs))
+                tx.send(bake_or_warn(&patch, sample_rate, duration_secs, &cancelled))
                     .ok();
             }
         }),
         None => {
             if !cancelled.load(Ordering::Relaxed) {
-                tx.send(bake_or_warn(&patch, sample_rate, duration_secs))
+                tx.send(bake_or_warn(&patch, sample_rate, duration_secs, &cancelled))
                     .ok();
             }
         }
@@ -359,7 +370,7 @@ fn spawn_bake(
     AsyncComputeTaskPool::get()
         .spawn(async move {
             if !cancelled.load(Ordering::Relaxed) {
-                tx.send(bake_or_warn(&patch, sample_rate, duration_secs))
+                tx.send(bake_or_warn(&patch, sample_rate, duration_secs, &cancelled))
                     .ok();
             }
         })
@@ -476,7 +487,8 @@ mod tests {
 
         // Inline-fallback shape (mirror of spawn_bake's None branch).
         if !flag.load(Ordering::Relaxed) {
-            tx.send(bake_or_warn(&patch, 44_100, 0.001)).ok();
+            tx.send(bake_or_warn(&patch, 44_100, 0.001, &cancelled))
+                .ok();
         }
 
         let samples = rx

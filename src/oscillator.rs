@@ -68,8 +68,11 @@ fn step_phase(state: &mut OscPhase, effective_freq: f32, sample_rate: f32) -> f3
 
 /// Stateless fallback: when no [`OscPhase`] state is installed (typical
 /// for direct unit tests that bypass the baker), reconstruct phase from
-/// `t * freq`.  Equivalent to the accumulator path when the frequency is
-/// constant — different only under modulation.
+/// `t * freq`.  Callers pass the *effective* (post-modulation) frequency so
+/// a wired `"freq"` input still shifts the pitch — equivalent to the
+/// accumulator path when that frequency is constant, and only divergent
+/// under per-sample-varying modulation, which genuinely needs the
+/// integrating accumulator.
 #[inline]
 fn stateless_phase(time_secs: f64, freq_hz: f32) -> f32 {
     (time_secs as f32 * freq_hz).rem_euclid(1.0)
@@ -109,7 +112,7 @@ impl Node for SineOsc {
         let amp = self.amplitude + ctx.input("amplitude");
         let phase = match ctx.state_mut::<OscPhase>() {
             Some(s) => step_phase(s, freq, sr),
-            None => stateless_phase(ctx.time_secs(), self.freq_hz),
+            None => stateless_phase(ctx.time_secs(), freq),
         };
         let total = (phase + self.phase_offset).rem_euclid(1.0);
         (TWO_PI * total).sin() * amp
@@ -153,7 +156,7 @@ impl Node for SquareOsc {
         let amp = self.amplitude + ctx.input("amplitude");
         let phase = match ctx.state_mut::<OscPhase>() {
             Some(s) => step_phase(s, freq, sr),
-            None => stateless_phase(ctx.time_secs(), self.freq_hz),
+            None => stateless_phase(ctx.time_secs(), freq),
         };
         let duty = self.duty.clamp(f32::EPSILON, 1.0 - f32::EPSILON);
         let raw = if phase < duty { 1.0 } else { -1.0 };
@@ -193,7 +196,7 @@ impl Node for SawtoothOsc {
         let amp = self.amplitude + ctx.input("amplitude");
         let phase = match ctx.state_mut::<OscPhase>() {
             Some(s) => step_phase(s, freq, sr),
-            None => stateless_phase(ctx.time_secs(), self.freq_hz),
+            None => stateless_phase(ctx.time_secs(), freq),
         };
         let raw = match self.polarity {
             SawPolarity::Up => 2.0 * phase - 1.0,
@@ -234,7 +237,7 @@ impl Node for TriangleOsc {
         let amp = self.amplitude + ctx.input("amplitude");
         let phase = match ctx.state_mut::<OscPhase>() {
             Some(s) => step_phase(s, freq, sr),
-            None => stateless_phase(ctx.time_secs(), self.freq_hz),
+            None => stateless_phase(ctx.time_secs(), freq),
         };
         let raw = 1.0 - 4.0 * (phase - 0.5).abs();
         raw * amp
@@ -400,6 +403,36 @@ mod tests {
         // At sample sr/(4*880), a sine at 880 Hz should be at peak.
         let last = *samples.last().unwrap();
         assert!(last > 0.99, "modulated quarter-period: {last}");
+    }
+
+    #[test]
+    fn stateless_path_reflects_freq_modulation() {
+        // With no OscPhase state installed (the stateless fallback), a wired
+        // "freq" input must still shift the pitch — previously it was
+        // silently dropped in favour of the configured freq_hz.
+        let osc = SineOsc {
+            freq_hz: 0.0,
+            phase_offset: 0.0,
+            amplitude: 1.0,
+        };
+        let sr: u32 = 44_100;
+        let mut rng = ChaCha8Rng::seed_from_u64(0);
+        // Effective freq = 0 + 100 = 100 Hz.  At t = sample_index / sr ≈
+        // 1/400 s, phase = 100 × t ≈ 0.25 → sin(π/2) ≈ 1.0.  Under the old
+        // behaviour (freq_hz = 0) phase stays 0 and the output is 0.
+        let inputs = [("freq", 100.0_f32)];
+        let sample_index = u64::from(sr / 400);
+        let state_ref: Option<&mut (dyn Any + Send)> = None;
+        let mut ctx = BakeContext::new(
+            sr,
+            sample_index,
+            u64::from(sr),
+            &mut rng,
+            &inputs,
+            state_ref,
+        );
+        let s = osc.sample(&mut ctx);
+        assert!((s - 1.0).abs() < 1e-2, "stateless freq-modulated peak: {s}");
     }
 
     #[test]

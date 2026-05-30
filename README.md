@@ -81,8 +81,10 @@ Configure the worker-pool size by setting
 `SymbiosAudioPlugin { config: AsyncAudioConfig { pool_threads: N } }`
 (0 selects `available_parallelism / 2`; defaults to
 `DEFAULT_POOL_THREADS = 4`).  Dropping the `PendingAudioPatch`
-component (e.g. when its entity despawns) cancels any not-yet-started
-bake, so rapid spawn/despawn doesn't saturate the pool.
+component (e.g. when its entity despawns) cancels the bake — both a
+not-yet-started one and one already in flight (the worker checks the
+flag periodically as it bakes) — so rapid spawn/despawn doesn't
+saturate the pool with work that can no longer be used.
 
 ### 3. Sequenced multi-voice tracks → loopable buffer
 

@@ -48,22 +48,32 @@ const BLOCK_ALIGN: u16 = NUM_CHANNELS * BITS_PER_SAMPLE / 8;
 /// chunk headers = 4 + 24 + 12 + 8.
 const HEADER_BYTES: u32 = 4 + 8 + 16 + 8 + 4 + 8;
 
+/// Largest number of mono `f32` samples that fit in one WAV blob, bounded by
+/// the 32-bit RIFF size fields: `(u32::MAX − header) / bytes-per-sample`
+/// ≈ 1.07 G samples (~6.7 h at 44.1 kHz).  [`samples_to_wav_bytes`] panics
+/// above this rather than emit a silently-wrapped header; callers that build
+/// buffers from untrusted sizes (the [`crate::bake`] / [`crate::mixdown`]
+/// paths) clamp their allocations to it so an absurd request can't drive a
+/// `usize::MAX` allocation.
+pub const MAX_WAV_SAMPLES: usize = ((u32::MAX - HEADER_BYTES) / (BLOCK_ALIGN as u32)) as usize;
+
 /// Compute the WAV `data` chunk size for `num_samples` mono float samples,
 /// asserting it (plus the header) stays inside the 32-bit RIFF size fields.
 ///
-/// Beyond ~1.07 G samples (≈ 6.7 h at 44.1 kHz) the `u32` size fields would
-/// silently wrap and produce a corrupt file; we panic with a clear message
-/// instead, since a silently-broken multi-gigabyte WAV is the worse outcome.
-/// Split longer bakes into segments.
+/// Beyond [`MAX_WAV_SAMPLES`] (≈ 6.7 h at 44.1 kHz) the `u32` size fields
+/// would silently wrap and produce a corrupt file; we panic with a clear
+/// message instead, since a silently-broken multi-gigabyte WAV is the worse
+/// outcome.  Split longer bakes into segments.
 fn wav_data_size(num_samples: usize) -> u32 {
-    let data_bytes = num_samples as u64 * u64::from(BLOCK_ALIGN);
     assert!(
-        data_bytes + u64::from(HEADER_BYTES) <= u64::from(u32::MAX),
+        num_samples <= MAX_WAV_SAMPLES,
         "samples_to_wav_bytes: {num_samples} samples exceed the WAV 32-bit \
          size limit (~1.07 G samples / ~6.7 h at 44.1 kHz); split the bake \
          into segments"
     );
-    data_bytes as u32
+    // num_samples ≤ MAX_WAV_SAMPLES, so the cast is exact and the product
+    // stays inside u32 — no overflow.
+    num_samples as u32 * u32::from(BLOCK_ALIGN)
 }
 
 /// Convert a mono `f32` buffer to a Bevy [`AudioSource`] backed by an
@@ -89,7 +99,13 @@ pub fn samples_to_wav_bytes(samples: &[f32], sample_rate: u32) -> Vec<u8> {
     // silently-wrapped (corrupt) header — see [`wav_data_size`].
     let data_size: u32 = wav_data_size(samples.len());
     let num_samples_per_channel = samples.len() as u32;
-    let byte_rate: u32 = sample_rate * u32::from(NUM_CHANNELS) * u32::from(BITS_PER_SAMPLE) / 8;
+    // WAV ByteRate = SampleRate × BlockAlign.  Compute from BLOCK_ALIGN
+    // directly (rather than `sample_rate * channels * bits / 8`, whose
+    // `* bits` intermediate overflows u32 around a 134 MHz sample_rate) and
+    // saturate: a sample_rate large enough to overflow even this is far past
+    // any real audio rate and unrepresentable in the u32 header field anyway,
+    // so clamp rather than panic in debug / silently wrap in release.
+    let byte_rate: u32 = sample_rate.saturating_mul(u32::from(BLOCK_ALIGN));
     let block_align: u16 = BLOCK_ALIGN;
 
     // RIFF chunk content size (everything after `RIFF<size>`):

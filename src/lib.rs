@@ -127,7 +127,7 @@ pub use async_gen::{
     AsyncAudioConfig, AudioPatchReady, CacheOrPending, DEFAULT_POOL_THREADS, PendingAudioPatch,
     bake_with_cache,
 };
-pub use audio_source::{samples_to_audio_source, samples_to_wav_bytes};
+pub use audio_source::{MAX_WAV_SAMPLES, samples_to_audio_source, samples_to_wav_bytes};
 pub use bake::{bake, try_bake};
 pub use cache::{
     DEFAULT_MEMORY_CACHE_ENTRIES, FileStore, MemoryStore, PatchCache, PatchCacheKey,
