@@ -3,9 +3,12 @@
 //! An [`AudioPatch`] is the top-level document: a `seed` for the
 //! deterministic RNG plus a [`NodeGraph`].  The graph is a DAG of
 //! [`GraphNode`]s; each node has an identifier, a configuration
-//! ([`crate::node::NodeKind`]), and a map of named input ports to
+//! ([`crate::node::NodeKind`]), and a map of named input ports to lists of
 //! [`Connection`]s.  A connection sources its value either from a literal
-//! constant or from another node's output port.
+//! constant or from another node's output.  Multiple connections may target
+//! the same port — their resolved values are **summed** before delivery, so
+//! signal mixing and modulation stacking are expressible without a dedicated
+//! node (though [`crate::node::NodeKind::Mix`] exists for clarity).
 //!
 //! Sample rate and duration are *not* part of the patch — they are passed
 //! to [`crate::bake::bake`] at bake time, so the same patch can render at
@@ -101,22 +104,40 @@ pub struct GraphNode {
     /// Concrete node configuration (oscillator settings, filter
     /// cutoff, etc.).  Tagged on the serde wire by `"kind"`.
     pub kind: NodeKind,
-    /// Wired inputs, keyed by port name.  A missing port reads `0.0`
-    /// at evaluation time, so partially-wired nodes behave sensibly
-    /// without filling in every slot.
+    /// Wired inputs, keyed by port name.  Each port holds a *list* of
+    /// connections whose resolved values are **summed** at evaluation
+    /// time, so several sources can feed one port (signal mixing,
+    /// modulation stacking).  A missing port — or an empty list — reads
+    /// `0.0`, so partially-wired nodes behave sensibly without filling
+    /// in every slot.
     #[serde(default)]
-    pub inputs: BTreeMap<String, Connection>,
+    pub inputs: BTreeMap<String, Vec<Connection>>,
 }
 
-/// Source of a single input port — either a literal value or another node's
-/// output port.
+impl GraphNode {
+    /// Builder helper: append `conn` to the named port's connection list,
+    /// creating the list if absent.  Returns `self` for chaining.
+    ///
+    /// Because ports sum their connections, calling this twice for the
+    /// same port wires *both* sources into it.
+    pub fn with_input(mut self, port: impl Into<String>, conn: Connection) -> Self {
+        self.inputs.entry(port.into()).or_default().push(conn);
+        self
+    }
+}
+
+/// Source of a single input contribution — either a literal value or
+/// another node's output.
 ///
 /// `Node` connections carry an `amount` multiplier (default `1.0`).  At
-/// bake time the value delivered to the downstream port is
+/// bake time the value contributed to the downstream port is
 /// `upstream_output * amount`.  This is how modulation routing is
 /// expressed: an LFO wired to a filter's `"cutoff_hz"` port with `amount =
 /// 900.0` sweeps the cutoff by ±900 Hz around the filter's base setting.
 /// Pass-through signal connections leave `amount` at the default `1.0`.
+///
+/// Each port holds a *list* of connections (see [`GraphNode::inputs`]);
+/// when more than one targets a port, their contributions are summed.
 ///
 /// `Default` is `Constant { value: 0.0 }` — a silent fixed connection.
 /// Useful as a placeholder for Sovereign* mirror shims and for
@@ -127,12 +148,10 @@ pub struct GraphNode {
 pub enum Connection {
     /// A fixed DC value.
     Constant { value: f32 },
-    /// Reads from another node's output port.  `output` defaults to `"out"`
-    /// if absent in JSON; `amount` defaults to `1.0`.
+    /// Reads from another node's output, scaled by `amount` (default
+    /// `1.0` if absent in JSON).
     Node {
         id: NodeId,
-        #[serde(default = "default_output_port")]
-        output: String,
         #[serde(default = "default_amount")]
         amount: f32,
     },
@@ -147,34 +166,24 @@ impl Default for Connection {
     }
 }
 
-fn default_output_port() -> String {
-    "out".to_string()
-}
-
 fn default_amount() -> f32 {
     1.0
 }
 
 impl Connection {
-    /// Convenience constructor for `Node` connections with the default
-    /// output port name and unity amount.
+    /// Convenience constructor for a unity-amount `Node` connection.
     pub fn from_node(id: NodeId) -> Self {
         Self::Node {
             id,
-            output: default_output_port(),
             amount: default_amount(),
         }
     }
 
-    /// Modulation connection from `id`'s default output port, scaled by
-    /// `amount` before delivery.  Use this for LFO → cutoff, envelope →
-    /// amplitude, oscillator → oscillator (FM) wiring.
+    /// Modulation connection from `id`'s output, scaled by `amount` before
+    /// delivery.  Use this for LFO → cutoff, envelope → amplitude,
+    /// oscillator → oscillator (FM) wiring.
     pub fn modulation(id: NodeId, amount: f32) -> Self {
-        Self::Node {
-            id,
-            output: default_output_port(),
-            amount,
-        }
+        Self::Node { id, amount }
     }
 
     /// Convenience constructor for a constant DC connection.
@@ -238,13 +247,15 @@ pub fn topo_sort(graph: &NodeGraph) -> Result<Vec<NodeId>, GraphError> {
     }
 
     for node in &graph.nodes {
-        for conn in node.inputs.values() {
-            if let Connection::Node { id, .. } = conn {
-                if !indegree.contains_key(id) {
-                    return Err(GraphError::UnknownNode(*id));
+        for conns in node.inputs.values() {
+            for conn in conns {
+                if let Connection::Node { id, .. } = conn {
+                    if !indegree.contains_key(id) {
+                        return Err(GraphError::UnknownNode(*id));
+                    }
+                    adjacency.get_mut(id).expect("inserted above").push(node.id);
+                    *indegree.get_mut(&node.id).expect("inserted above") += 1;
                 }
-                adjacency.get_mut(id).expect("inserted above").push(node.id);
-                *indegree.get_mut(&node.id).expect("inserted above") += 1;
             }
         }
     }
@@ -294,9 +305,9 @@ mod tests {
     }
 
     fn silence_with(id: u32, inputs: &[(&str, Connection)]) -> GraphNode {
-        let mut m = BTreeMap::new();
+        let mut m: BTreeMap<String, Vec<Connection>> = BTreeMap::new();
         for (k, v) in inputs {
-            m.insert((*k).to_string(), v.clone());
+            m.entry((*k).to_string()).or_default().push(v.clone());
         }
         GraphNode {
             id: NodeId(id),
@@ -398,13 +409,12 @@ mod tests {
     }
 
     #[test]
-    fn connection_default_output_port_deserialises() {
+    fn connection_default_amount_deserialises() {
         let json = r#"{"source":"node","id":7}"#;
         let conn: Connection = serde_json::from_str(json).unwrap();
         match conn {
-            Connection::Node { id, output, amount } => {
+            Connection::Node { id, amount } => {
                 assert_eq!(id, NodeId(7));
-                assert_eq!(output, "out");
                 assert_eq!(amount, 1.0);
             }
             _ => panic!("expected Node connection"),
@@ -417,9 +427,22 @@ mod tests {
         let json = serde_json::to_string(&conn).unwrap();
         let back: Connection = serde_json::from_str(&json).unwrap();
         assert_eq!(conn, back);
-        // And explicit JSON with all three fields parses back correctly.
-        let explicit = r#"{"source":"node","id":2,"output":"out","amount":500.0}"#;
+        // And explicit JSON with both fields parses back correctly.
+        let explicit = r#"{"source":"node","id":2,"amount":500.0}"#;
         let parsed: Connection = serde_json::from_str(explicit).unwrap();
         assert_eq!(parsed, conn);
+    }
+
+    #[test]
+    fn multiple_connections_per_port_are_retained() {
+        // Fan-in: two sources on one port survive a round-trip and are
+        // both present (the baker sums them).
+        let node = GraphNode::default()
+            .with_input("in", Connection::from_node(NodeId(0)))
+            .with_input("in", Connection::constant(0.5));
+        assert_eq!(node.inputs["in"].len(), 2);
+        let json = serde_json::to_string(&node).unwrap();
+        let back: GraphNode = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.inputs["in"].len(), 2);
     }
 }

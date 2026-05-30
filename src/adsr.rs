@@ -262,8 +262,6 @@ post_crossover: |c| {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
 
@@ -287,12 +285,10 @@ mod tests {
         let mut state = AdsrState::default();
         let mut rng = ChaCha8Rng::seed_from_u64(0);
         let mut samples = Vec::new();
-        let mut inputs = BTreeMap::new();
         let mut sample_index: u64 = 0;
         let total: u64 = pattern.iter().map(|(n, _)| *n).sum();
         for &(count, high) in pattern {
-            inputs.clear();
-            inputs.insert("gate".to_string(), if high { 1.0 } else { 0.0 });
+            let inputs = [("gate", if high { 1.0_f32 } else { 0.0 })];
             for _ in 0..count {
                 let mut ctx = BakeContext::new(
                     sample_rate,
@@ -456,8 +452,7 @@ mod tests {
         // crashing.
         let env = linear_test_envelope();
         let mut rng = ChaCha8Rng::seed_from_u64(0);
-        let mut inputs = BTreeMap::new();
-        inputs.insert("gate".to_string(), 1.0_f32);
+        let inputs = [("gate", 1.0_f32)];
         let mut ctx = BakeContext::new(44_100, 0, 1, &mut rng, &inputs, None);
         let s = env.sample(&mut ctx);
         assert!((s - env.sustain_level).abs() < 1e-6);

@@ -1,19 +1,29 @@
 //! Sample-loop evaluator — turns an [`AudioPatch`] into a mono `Vec<f32>`.
 //!
 //! Phase 1 ticket #3.  Single-threaded, single-buffer, deterministic.  The
-//! inner loop iterates from sample 0 to `duration_samples`, evaluates every
-//! node once per sample in topological order, then pushes the output
-//! node's value into the buffer.
+//! graph is compiled once into a flat plan in topological order (dense node
+//! indices, pre-resolved input sources); the inner loop then iterates from
+//! sample 0 to `duration_samples`, evaluates every node once per sample,
+//! and pushes the output node's value into the buffer.  Outputs live in a
+//! `Vec<f32>` indexed by plan position and the per-node input values are
+//! filled into reusable scratch, so the hot loop allocates nothing.
 //!
 //! # Determinism
 //!
 //! Two bakes of the same patch with the same sample rate, duration, and
-//! seed produce a bit-identical buffer.  This is guaranteed by:
-//! - [`crate::patch::topo_sort`] yielding a deterministic order (Kahn's
-//!   with sorted tie-breaking, no `HashMap` iteration anywhere).
-//! - `BTreeMap` rather than `HashMap` for all per-sample lookups.
-//! - A single [`ChaCha8Rng`] seeded from `AudioPatch::seed`, advanced only
-//!   by node draws — never reset or reseeded mid-bake.
+//! seed produce a bit-identical buffer.  This only requires two things, and
+//! the evaluator guarantees both:
+//! - A deterministic **node evaluation order** — [`crate::patch::topo_sort`]
+//!   uses Kahn's algorithm with sorted tie-breaking (no `HashMap`
+//!   iteration), and that order is frozen into the plan.
+//! - A deterministic **RNG draw order** — a single [`ChaCha8Rng`] seeded
+//!   from `AudioPatch::seed`, advanced only by node draws in evaluation
+//!   order, never reset or reseeded mid-bake.
+//!
+//! Input resolution and output storage draw no RNG, so their containers
+//! (a flat `Vec`, a fixed-order scratch list) need only be deterministic,
+//! not sorted — which is why this layer no longer leans on `BTreeMap` in
+//! the inner loop.
 //!
 //! See the `tests` module at the bottom for the regression hash test.
 //!
@@ -31,81 +41,174 @@ use std::collections::BTreeMap;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
-use crate::node::{BakeContext, Node};
-use crate::patch::{AudioPatch, Connection, GraphNode, NodeId, topo_sort};
+use crate::node::{BakeContext, Node, NodeKind};
+use crate::patch::{AudioPatch, Connection, GraphError, GraphNode, NodeId, topo_sort};
 
 /// Bake `patch` into a mono `Vec<f32>` at `sample_rate` Hz for
 /// `duration_secs` seconds.
 ///
-/// Returns an empty buffer if `duration_secs <= 0.0`.  Panics if the
-/// underlying [`crate::patch::NodeGraph`] is structurally invalid
-/// (cycle, dangling reference, duplicate id, or missing output) — callers
-/// who can't trust their patch should validate it with
-/// [`crate::patch::topo_sort`] beforehand.
+/// Returns an empty buffer if `duration_secs <= 0.0`.  **Panics** if the
+/// underlying [`crate::patch::NodeGraph`] is structurally invalid (cycle,
+/// dangling reference, duplicate id, or missing output).  Callers that
+/// can't trust their patch should use [`try_bake`], which surfaces the
+/// [`GraphError`] instead.
 ///
 /// # Determinism
 ///
 /// `bake(p, sr, d) == bake(p, sr, d)` bit-for-bit for any well-formed
 /// patch, sample rate, and duration.  Seed lives on [`AudioPatch::seed`].
 pub fn bake(patch: &AudioPatch, sample_rate: u32, duration_secs: f32) -> Vec<f32> {
-    let duration_samples = duration_samples(sample_rate, duration_secs);
+    try_bake(patch, sample_rate, duration_secs)
+        .expect("bake: AudioPatch.graph is structurally invalid")
+}
+
+/// Fallible sibling of [`bake`] — bake `patch` into a mono `Vec<f32>`, or
+/// return the [`GraphError`] that made the graph un-bakeable.
+///
+/// Returns `Ok(empty)` for a non-positive duration.  Use this on the async
+/// / sequencer paths where a malformed patch should be reported or skipped
+/// rather than panicking a worker thread.
+pub fn try_bake(
+    patch: &AudioPatch,
+    sample_rate: u32,
+    duration_secs: f32,
+) -> Result<Vec<f32>, GraphError> {
+    bake_inner(
+        patch,
+        sample_rate,
+        duration_samples(sample_rate, duration_secs),
+        None,
+    )
+}
+
+/// One resolved contribution to an input port.
+enum InputSource {
+    /// A fixed DC value.
+    Const(f32),
+    /// `outputs[src] * amount`, where `src` is the upstream node's dense
+    /// plan index (resolved once, so the hot loop indexes a `Vec`).
+    Node { src: usize, amount: f32 },
+}
+
+/// A single input port of a planned node: its name plus the (summed) list
+/// of contributions feeding it.
+struct PortPlan {
+    name: String,
+    sources: Vec<InputSource>,
+}
+
+/// One node, compiled for the sample loop: its config and its resolved
+/// input ports.  Borrows the [`NodeKind`] out of the patch for the bake.
+struct NodePlan<'a> {
+    kind: &'a NodeKind,
+    ports: Vec<PortPlan>,
+}
+
+/// Core evaluator shared by [`bake`] / [`try_bake`] and the sequencer.
+///
+/// `gate_samples` threads a per-event gate window into every
+/// [`BakeContext`] so [`NodeKind::Gate`] can open the gate for the first
+/// `gate_samples` samples and close it (triggering envelope release) for
+/// the rest of the bake.  `None` leaves the gate always open.
+pub(crate) fn bake_inner(
+    patch: &AudioPatch,
+    sample_rate: u32,
+    duration_samples: u64,
+    gate_samples: Option<u64>,
+) -> Result<Vec<f32>, GraphError> {
     if duration_samples == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
-    let order = topo_sort(&patch.graph).expect("bake: AudioPatch.graph is structurally invalid");
+    // Deterministic evaluation order — the one thing the bake's output
+    // identity actually hinges on (alongside RNG draw order).
+    let order = topo_sort(&patch.graph)?;
 
-    // id → node lookup; built once, used every sample.
-    let nodes: BTreeMap<NodeId, &GraphNode> = patch.graph.nodes.iter().map(|n| (n.id, n)).collect();
+    let node_by_id: BTreeMap<NodeId, &GraphNode> =
+        patch.graph.nodes.iter().map(|n| (n.id, n)).collect();
+    // NodeId → dense plan index, so node-sourced inputs can read a Vec.
+    let index_of: BTreeMap<NodeId, usize> =
+        order.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+
+    // Compile the graph into a flat, index-addressed plan once.
+    let plan: Vec<NodePlan> = order
+        .iter()
+        .map(|id| {
+            let node = node_by_id[id];
+            let ports = node
+                .inputs
+                .iter()
+                .map(|(name, conns)| {
+                    let sources = conns
+                        .iter()
+                        .map(|c| match c {
+                            Connection::Constant { value } => InputSource::Const(*value),
+                            Connection::Node { id, amount } => InputSource::Node {
+                                src: index_of[id],
+                                amount: *amount,
+                            },
+                        })
+                        .collect();
+                    PortPlan {
+                        name: name.clone(),
+                        sources,
+                    }
+                })
+                .collect();
+            NodePlan {
+                kind: &node.kind,
+                ports,
+            }
+        })
+        .collect();
+
+    let output_index = index_of[&patch.graph.output];
 
     let mut rng = ChaCha8Rng::seed_from_u64(u64::from(patch.seed));
 
-    // Per-node persistent state, built once before the sample loop.
-    // Type-erased so each node kind can own its own state shape; node
-    // implementations downcast via BakeContext::state_mut::<S>().
-    let mut states: BTreeMap<NodeId, Box<dyn Any + Send>> = BTreeMap::new();
-    for node in &patch.graph.nodes {
-        if let Some(state) = node.kind.init_state() {
-            states.insert(node.id, state);
-        }
-    }
+    // Per-node persistent state, indexed by plan position.  Type-erased so
+    // each node kind owns its own state shape; impls downcast via
+    // BakeContext::state_mut::<S>().
+    let mut states: Vec<Option<Box<dyn Any + Send>>> =
+        plan.iter().map(|np| np.kind.init_state()).collect();
 
-    // Reusable per-sample scratch space.
-    let mut outputs: BTreeMap<NodeId, f32> = order.iter().map(|id| (*id, 0.0_f32)).collect();
-    let mut inputs_scratch: BTreeMap<String, f32> = BTreeMap::new();
+    // Reusable scratch: dense outputs and a per-node (port, value) list.
+    let mut outputs = vec![0.0_f32; plan.len()];
+    let mut input_scratch: Vec<(&str, f32)> = Vec::new();
 
     let mut buffer = Vec::with_capacity(duration_samples as usize);
 
     for sample_index in 0..duration_samples {
-        for &node_id in &order {
-            let node = nodes[&node_id];
-            inputs_scratch.clear();
-            for (port, conn) in &node.inputs {
-                let value = match conn {
-                    Connection::Constant { value } => *value,
-                    Connection::Node { id, amount, .. } => {
-                        outputs.get(id).copied().unwrap_or(0.0) * amount
-                    }
-                };
-                inputs_scratch.insert(port.clone(), value);
+        for i in 0..plan.len() {
+            let np = &plan[i];
+            // Resolve this node's ports by summing each port's sources.
+            input_scratch.clear();
+            for port in &np.ports {
+                let mut value = 0.0_f32;
+                for src in &port.sources {
+                    value += match *src {
+                        InputSource::Const(c) => c,
+                        InputSource::Node { src, amount } => outputs[src] * amount,
+                    };
+                }
+                input_scratch.push((port.name.as_str(), value));
             }
-            let state_ref: Option<&mut (dyn Any + Send)> =
-                states.get_mut(&node_id).map(|b| &mut **b);
+            let state_ref = states[i].as_deref_mut();
             let mut ctx = BakeContext::new(
                 sample_rate,
                 sample_index,
                 duration_samples,
                 &mut rng,
-                &inputs_scratch,
+                &input_scratch,
                 state_ref,
-            );
-            let s = node.kind.sample(&mut ctx);
-            outputs.insert(node_id, s);
+            )
+            .with_gate(gate_samples);
+            outputs[i] = np.kind.sample(&mut ctx);
         }
-        buffer.push(outputs.get(&patch.graph.output).copied().unwrap_or(0.0));
+        buffer.push(outputs[output_index]);
     }
 
-    buffer
+    Ok(buffer)
 }
 
 /// Convert a `f32` seconds duration into a sample count for the given rate.
@@ -196,11 +299,11 @@ mod tests {
     #[test]
     fn bake_is_deterministic_across_repeated_calls() {
         // A graph with constant-wired and node-wired inputs, plus a
-        // multi-node DAG, exercises the per-sample input resolution and
-        // BTreeMap iteration paths even though Silence ignores its inputs.
-        let mut n1_inputs = BTreeMap::new();
-        n1_inputs.insert("a".to_string(), Connection::from_node(NodeId(0)));
-        n1_inputs.insert("b".to_string(), Connection::constant(0.25));
+        // multi-node DAG, exercises the per-sample input resolution path
+        // even though Silence ignores its inputs.
+        let mut n1_inputs: BTreeMap<String, Vec<Connection>> = BTreeMap::new();
+        n1_inputs.insert("a".to_string(), vec![Connection::from_node(NodeId(0))]);
+        n1_inputs.insert("b".to_string(), vec![Connection::constant(0.25)]);
         let patch = AudioPatch {
             seed: 0xDEAD_BEEF,
             graph: NodeGraph {
@@ -273,5 +376,33 @@ mod tests {
             },
         };
         let _ = bake(&p, 44_100, 0.01);
+    }
+
+    #[test]
+    fn try_bake_returns_err_on_invalid_graph() {
+        // The fallible sibling surfaces the GraphError instead of panicking.
+        let p = AudioPatch {
+            seed: 0,
+            graph: NodeGraph {
+                nodes: vec![GraphNode {
+                    id: NodeId(0),
+                    kind: NodeKind::Silence,
+                    inputs: BTreeMap::new(),
+                }],
+                output: NodeId(99),
+            },
+        };
+        assert_eq!(
+            try_bake(&p, 44_100, 0.01),
+            Err(crate::patch::GraphError::MissingOutput(NodeId(99)))
+        );
+    }
+
+    #[test]
+    fn try_bake_ok_matches_bake_for_valid_patch() {
+        let p = silence_patch(0);
+        let via_try = try_bake(&p, 44_100, 0.05).expect("valid patch bakes");
+        let via_bake = bake(&p, 44_100, 0.05);
+        assert_eq!(via_try, via_bake);
     }
 }

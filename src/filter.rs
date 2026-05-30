@@ -19,6 +19,16 @@
 //! - `"in"` — signal to filter.  Defaults to zero (silent input) if
 //!   unwired, so an isolated filter node bakes silence rather than
 //!   crashing.
+//! - `"cutoff_hz"` (lowpass / highpass) or `"center_hz"` (bandpass) —
+//!   *added* to the configured cutoff/centre frequency each sample, so an
+//!   LFO here sweeps the corner (this is how the wind drone gets its
+//!   motion).  Note the deliberate name difference: a lowpass/highpass has
+//!   a *cutoff*, a bandpass has a *centre*.
+//! - `"q"` — added to the configured `q` each sample.
+//!
+//! All modulation ports default to zero when unwired, leaving the
+//! configured value untouched.  Cutoff and Q are clamped to a stable range
+//! at sample time, so out-of-range modulation can't blow the filter up.
 //!
 //! # State machinery
 //!
@@ -251,24 +261,21 @@ crate::impl_genotype!(BiquadBandpass {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use rand::{Rng, SeedableRng};
     use rand_chacha::ChaCha8Rng;
 
     use super::*;
 
     /// Drive `n` raw inputs through a single filter's `Node::sample`,
-    /// returning the output buffer.  Each call gets a fresh `inputs` map
-    /// so the wired sample value can change per step.
+    /// returning the output buffer.  Each step builds a fresh `inputs`
+    /// list so the wired sample value can change per step.
     fn drive<F: Node>(filt: &F, sample_rate: u32, signal: &[f32]) -> Vec<f32> {
         let mut state_box = filt.init_state().expect("filter must install state");
         let mut rng = ChaCha8Rng::seed_from_u64(0);
         let mut out = Vec::with_capacity(signal.len());
         let total = signal.len() as u64;
         for (i, x) in signal.iter().copied().enumerate() {
-            let mut inputs = BTreeMap::new();
-            inputs.insert("in".to_string(), x);
+            let inputs = [("in", x)];
             let mut ctx = BakeContext::new(
                 sample_rate,
                 i as u64,
@@ -432,8 +439,7 @@ mod tests {
     fn falls_back_to_pass_through_when_state_missing() {
         let filt = BiquadLowpass::default();
         let mut rng = ChaCha8Rng::seed_from_u64(0);
-        let mut inputs = BTreeMap::new();
-        inputs.insert("in".to_string(), 0.42_f32);
+        let inputs = [("in", 0.42_f32)];
         let mut ctx = BakeContext::new(44_100, 0, 1, &mut rng, &inputs, None);
         let y = filt.sample(&mut ctx);
         assert_eq!(y, 0.42);

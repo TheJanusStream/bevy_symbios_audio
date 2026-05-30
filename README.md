@@ -2,11 +2,13 @@
 
 Algorithmic audio generator for Bevy — a DAG-of-nodes synth (sine /
 square / sawtooth / triangle oscillators, white / pink / brown noise,
-ADSR envelopes, biquad LP/HP/BP filters, LFOs and cross-node modulation
-routing) that bakes deterministic `Vec<f32>` buffers off the main
-thread via a private [`rayon`](https://crates.io/crates/rayon) pool,
-with an optional content-addressed `PatchCache` (memory + on-disk WAV)
-so DID-seeded ambient survives a process restart.
+ADSR envelopes, biquad LP/HP/BP filters, LFOs, `Mix` / `Gain` (VCA)
+combiners, a sequencer-driven `Gate`, and cross-node modulation routing
+where several sources can feed one input port and are summed) that bakes
+deterministic `Vec<f32>` buffers off the main thread via a private
+[`rayon`](https://crates.io/crates/rayon) pool, with an optional
+content-addressed `PatchCache` (memory + on-disk WAV) so DID-seeded
+ambient survives a process restart.
 
 The DSP layer is Bevy-free and unit-testable on its own; the Bevy
 integration adds `SymbiosAudioPlugin` with a `PendingAudioPatch` →
@@ -49,7 +51,14 @@ let samples: Vec<f32> = bake(&patch, 44_100, 1.0); // 1 s @ 44.1 kHz
 
 `bake` is single-threaded, fully deterministic for a given
 `(patch, sample_rate, duration)` triple, and Bevy-free — use it in
-unit tests, CLI tools, or anywhere you just want raw samples.
+unit tests, CLI tools, or anywhere you just want raw samples.  It
+panics on a structurally invalid graph; call `try_bake` instead for a
+`Result<Vec<f32>, GraphError>` when the patch can't be trusted.
+
+To combine voices inside a single patch, wire several connections into
+one port (they're summed) or use a `Mix` node; `Gain` is a VCA whose
+`"gain"` port multiplies the signal (clean tremolo / ring-mod, as
+opposed to an oscillator's *additive* `"amplitude"` port).
 
 ### 2. Async bake inside a Bevy app
 
@@ -86,6 +95,15 @@ use bevy_symbios_audio::{bake_sequence, SequenceRecipe};
 
 let buffer: Vec<f32> = bake_sequence(&recipe);
 ```
+
+Each `Event` has a real note shape: the gate is held open for
+`gate_beats` and then the bake continues through `release_beats` of
+tail.  Wire a `Gate` node into an `AdsrEnvelope`'s `"gate"` port and the
+envelope attacks/sustains while the gate is open, then *releases* and
+rings out across the tail — `release_beats: 0.0` reproduces a hard
+one-shot.  Instruments with an unresolvable graph (or a typo'd
+`instrument_id`) are skipped with a warning rather than aborting the
+mixdown.
 
 Set `recipe.loop_start_beats = Some(b)` and a non-zero
 `loop_crossfade_beats` to get a seamless loop — the mixdown baker
@@ -148,10 +166,14 @@ A bake of the same `(patch, sample_rate, duration)` returns a
 bit-identical `Vec<f32>` every time, on every machine:
 
 - [`patch::topo_sort`](src/patch.rs) uses Kahn's algorithm with
-  sorted tie-breaking — no `HashMap` iteration.
-- Every per-sample lookup uses `BTreeMap`, not `HashMap`.
+  sorted tie-breaking — no `HashMap` iteration.  The graph is compiled
+  once into a flat, index-addressed plan in that order; per-sample
+  evaluation is `Vec`-indexed (no map iteration), so output identity
+  hinges only on the topo order and the RNG draw order.
 - A single `ChaCha8Rng` seeded from `AudioPatch::seed` drives every
-  stochastic node; it is never reset or reseeded mid-bake.
+  stochastic node; it is never reset or reseeded mid-bake, and stateful
+  nodes (e.g. the sample-and-hold LFO) draw from it at well-defined
+  points only.
 
 This is the contract the DID-seeded ambient layer in the Overlands
 integration relies on — one stable ambient track per room seed.
@@ -180,5 +202,6 @@ produces.
   pitch-down hangs past it.  PSOLA / phase vocoder paths are not
   implemented.
 - **Buffer ≤ ~6 hours.**  `data_size` in the WAV header is a 32-bit
-  field, capping ~1.07 G samples (≈ 6.7 h @ 44.1 kHz).  Split longer
-  bakes into segments.
+  field, capping ~1.07 G samples (≈ 6.7 h @ 44.1 kHz).  `samples_to_wav_bytes`
+  now panics rather than emitting a silently-wrapped (corrupt) header, so
+  split longer bakes into segments.

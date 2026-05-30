@@ -31,7 +31,7 @@ fn linear_test_envelope() -> AdsrEnvelope {
 
 fn gated_envelope_patch(env: AdsrEnvelope) -> AudioPatch {
     let mut inputs = BTreeMap::new();
-    inputs.insert("gate".to_string(), Connection::constant(1.0));
+    inputs.insert("gate".to_string(), vec![Connection::constant(1.0)]);
     AudioPatch {
         seed: 0,
         graph: NodeGraph {

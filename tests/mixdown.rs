@@ -66,6 +66,7 @@ fn event(time_beats: f32, instrument_id: &str, volume: f32, gate_beats: f32) -> 
         pitch_multiplier: 1.0,
         volume,
         gate_beats,
+        release_beats: 0.0,
     }
 }
 
@@ -193,6 +194,7 @@ fn pitch_multiplier_of_two_halves_event_length() {
                 pitch_multiplier: 2.0,
                 volume: 0.3,
                 gate_beats: 1.0,
+                release_beats: 0.0,
             }],
         }],
     };
@@ -282,6 +284,44 @@ fn dangling_instrument_id_is_skipped_not_panicked() {
         instruments: vec![square_instrument()],
         tracks: vec![Track {
             events: vec![event(0.0, "does-not-exist", 0.5, 0.5)],
+        }],
+    };
+    let master = bake_sequence(&recipe);
+    assert!(master.iter().all(|s| *s == 0.0));
+}
+
+#[test]
+fn invalid_instrument_graph_is_skipped_not_panicked() {
+    // An instrument whose graph is structurally invalid (output points at
+    // a missing node) must be skipped via try_bake's Result rather than
+    // panicking the whole mixdown.
+    let broken = Instrument {
+        id: "broken".into(),
+        patch: AudioPatch {
+            seed: 0,
+            graph: NodeGraph {
+                nodes: vec![GraphNode {
+                    id: NodeId(0),
+                    kind: NodeKind::Square(SquareOsc {
+                        freq_hz: 440.0,
+                        duty: 0.5,
+                        amplitude: 1.0,
+                    }),
+                    inputs: BTreeMap::new(),
+                }],
+                output: NodeId(99), // missing node → GraphError::MissingOutput
+            },
+        },
+    };
+    let recipe = SequenceRecipe {
+        bpm: 120.0,
+        sample_rate: SR,
+        duration_beats: 1.0,
+        loop_start_beats: None,
+        loop_crossfade_beats: 0.0,
+        instruments: vec![broken],
+        tracks: vec![Track {
+            events: vec![event(0.0, "broken", 0.5, 0.5)],
         }],
     };
     let master = bake_sequence(&recipe);

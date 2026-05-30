@@ -38,6 +38,34 @@ use std::sync::Arc;
 
 use bevy::audio::AudioSource;
 
+const NUM_CHANNELS: u16 = 1;
+const BITS_PER_SAMPLE: u16 = 32;
+const FORMAT_IEEE_FLOAT: u16 = 3;
+/// Bytes per (mono) sample frame: `channels * bits / 8`.
+const BLOCK_ALIGN: u16 = NUM_CHANNELS * BITS_PER_SAMPLE / 8;
+/// Fixed header bytes preceding the sample data (everything counted by the
+/// RIFF chunk-size field besides `data_size`): `"WAVE"` + fmt + fact + data
+/// chunk headers = 4 + 24 + 12 + 8.
+const HEADER_BYTES: u32 = 4 + 8 + 16 + 8 + 4 + 8;
+
+/// Compute the WAV `data` chunk size for `num_samples` mono float samples,
+/// asserting it (plus the header) stays inside the 32-bit RIFF size fields.
+///
+/// Beyond ~1.07 G samples (≈ 6.7 h at 44.1 kHz) the `u32` size fields would
+/// silently wrap and produce a corrupt file; we panic with a clear message
+/// instead, since a silently-broken multi-gigabyte WAV is the worse outcome.
+/// Split longer bakes into segments.
+fn wav_data_size(num_samples: usize) -> u32 {
+    let data_bytes = num_samples as u64 * u64::from(BLOCK_ALIGN);
+    assert!(
+        data_bytes + u64::from(HEADER_BYTES) <= u64::from(u32::MAX),
+        "samples_to_wav_bytes: {num_samples} samples exceed the WAV 32-bit \
+         size limit (~1.07 G samples / ~6.7 h at 44.1 kHz); split the bake \
+         into segments"
+    );
+    data_bytes as u32
+}
+
 /// Convert a mono `f32` buffer to a Bevy [`AudioSource`] backed by an
 /// in-memory WAV blob.
 ///
@@ -57,21 +85,19 @@ pub fn samples_to_audio_source(samples: &[f32], sample_rate: u32) -> AudioSource
 /// their own `Bytes` plumbing (CLI tools writing to disk, the offline
 /// baker in ticket #12) can skip the `AudioSource` wrapper.
 pub fn samples_to_wav_bytes(samples: &[f32], sample_rate: u32) -> Vec<u8> {
-    const NUM_CHANNELS: u16 = 1;
-    const BITS_PER_SAMPLE: u16 = 32;
-    const FORMAT_IEEE_FLOAT: u16 = 3;
-
+    // Panics on bakes past the 32-bit WAV size limit rather than emitting a
+    // silently-wrapped (corrupt) header — see [`wav_data_size`].
+    let data_size: u32 = wav_data_size(samples.len());
     let num_samples_per_channel = samples.len() as u32;
     let byte_rate: u32 = sample_rate * u32::from(NUM_CHANNELS) * u32::from(BITS_PER_SAMPLE) / 8;
-    let block_align: u16 = NUM_CHANNELS * BITS_PER_SAMPLE / 8;
-    let data_size: u32 = num_samples_per_channel * u32::from(block_align);
+    let block_align: u16 = BLOCK_ALIGN;
 
     // RIFF chunk content size (everything after `RIFF<size>`):
     //   "WAVE" (4)
     // + "fmt " chunk header (8) + body (16)
     // + "fact" chunk header (8) + body (4)
     // + "data" chunk header (8) + body (data_size)
-    let riff_chunk_size: u32 = 4 + 8 + 16 + 8 + 4 + 8 + data_size;
+    let riff_chunk_size: u32 = HEADER_BYTES + data_size;
 
     let mut buf = Vec::with_capacity(8 + riff_chunk_size as usize);
 
@@ -235,6 +261,22 @@ mod tests {
         assert_eq!(format_code, 3);
         assert_eq!(sr, 44_100);
         assert!(samples.is_empty());
+    }
+
+    #[test]
+    fn wav_data_size_is_four_bytes_per_sample() {
+        assert_eq!(wav_data_size(0), 0);
+        assert_eq!(wav_data_size(1), 4);
+        assert_eq!(wav_data_size(1_000), 4_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "32-bit")]
+    fn wav_data_size_panics_past_32bit_limit() {
+        // 2 billion samples × 4 bytes overflows the u32 size fields; the
+        // helper must panic rather than wrap.  (Just an integer — no
+        // multi-gigabyte allocation.)
+        let _ = wav_data_size(2_000_000_000);
     }
 
     #[test]

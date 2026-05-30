@@ -3,17 +3,29 @@
 //!
 //! Sits one layer above [`crate::bake::bake`]: takes a sequencer
 //! recipe with named instruments and timed events, bakes each
-//! instrument once per unique gate length, resamples by the event's
-//! `pitch_multiplier`, sums all events into a master buffer at the
-//! right sample offsets, applies a smooth `tanh` soft-clip so peaks
+//! instrument once per unique gate/release length, resamples by the
+//! event's `pitch_multiplier`, sums all events into a master buffer at
+//! the right sample offsets, applies a smooth `tanh` soft-clip so peaks
 //! don't punch through `[-1, 1]`, and — when looping is enabled —
 //! pre-mixes the tail crossfade into the loop region so a hard
 //! `Source::loop_..()` is click-free at the seam.
 //!
+//! # Gate and release
+//!
+//! Each event bakes its instrument with a **gate window** open for
+//! `gate_beats` and then keeps baking through `release_beats` of tail
+//! (via the crate-internal `bake_inner`, the gated core of
+//! [`crate::bake::try_bake`]).  An instrument that wires a
+//! [`crate::node::NodeKind::Gate`] into an [`crate::adsr::AdsrEnvelope`]
+//! therefore attacks and sustains for the gate, then releases and rings
+//! out across the tail — so `gate_beats` is a real note length, not just
+//! a buffer trim.  `release_beats = 0` reproduces the old hard one-shot.
+//!
 //! # Algorithm
 //!
-//! 1. Bake each `(instrument_id, gate_beats)` pair exactly once.
-//!    Identical events anywhere on the timeline share the bake.
+//! 1. Bake each `(instrument_id, gate_beats, release_beats)` triple
+//!    exactly once, with the gate open for `gate_beats`.  Identical
+//!    events anywhere on the timeline share the bake.
 //! 2. Allocate the master buffer.  If `loop_start_beats` is set, the
 //!    buffer is provisioned with an extra `loop_crossfade_beats` of
 //!    tail so late event releases that spill past `duration_beats`
@@ -40,15 +52,17 @@
 //! out of scope for v0.1.0 — flag the limitation here and revisit
 //! if users's sound design surfaces a need.
 //!
-//! # Dangling references
+//! # Dangling references and bad graphs
 //!
 //! Events whose `instrument_id` doesn't appear in `recipe.instruments`
-//! are skipped with a warn log rather than panicking — a typo
-//! shouldn't crash the bake.  The cache miss is the canonical signal.
+//! are skipped with a warn log rather than panicking — a typo shouldn't
+//! crash the bake.  Likewise an instrument whose patch graph is
+//! structurally invalid is skipped (the gated baker returns a `Result`,
+//! like [`crate::bake::try_bake`]) instead of aborting the whole mixdown.
 
 use std::collections::HashMap;
 
-use crate::bake::bake;
+use crate::bake::bake_inner;
 use crate::patch::AudioPatch;
 use crate::sequence::{Event, SequenceRecipe};
 
@@ -86,10 +100,10 @@ pub fn bake_sequence(recipe: &SequenceRecipe) -> Vec<f32> {
         .map(|i| (i.id.as_str(), &i.patch))
         .collect();
 
-    // Bake cache keyed by (instrument_id, gate_beats.to_bits()) so two
-    // events with identical (id, gate) reuse the source buffer; only
+    // Bake cache keyed by (instrument_id, gate, release) bit patterns so
+    // two events with identical timing reuse the source buffer; only
     // pitch / volume / offset are per-event.
-    let mut bake_cache: HashMap<(String, u32), Vec<f32>> = HashMap::new();
+    let mut bake_cache: HashMap<(String, u32, u32), Vec<f32>> = HashMap::new();
 
     for track in &recipe.tracks {
         for event in &track.events {
@@ -104,8 +118,24 @@ pub fn bake_sequence(recipe: &SequenceRecipe) -> Vec<f32> {
                 );
                 continue;
             };
-            let gate_secs = event.gate_beats.max(0.0) * beat_secs;
-            let buf = bake(patch, sr, gate_secs);
+            // The gate is open for `gate_beats`, then the bake continues
+            // through `release_beats` of tail so a Gate→ADSR release rings
+            // out instead of being cut off at the gate edge.
+            let gate_samples = duration_to_samples(event.gate_beats, beat_secs, sr) as u64;
+            let total_beats = event.gate_beats.max(0.0) + event.release_beats.max(0.0);
+            let total_samples = duration_to_samples(total_beats, beat_secs, sr) as u64;
+            // A malformed instrument graph shouldn't take down the whole
+            // mixdown — warn and skip it, like an unknown instrument ref.
+            let buf = match bake_inner(patch, sr, total_samples, Some(gate_samples)) {
+                Ok(buf) => buf,
+                Err(err) => {
+                    bevy::log::warn!(
+                        "mixdown: instrument '{}' has an invalid graph ({err}); skipping",
+                        event.instrument_id
+                    );
+                    continue;
+                }
+            };
             bake_cache.insert(key, buf);
         }
     }
@@ -221,8 +251,12 @@ fn duration_to_samples(beats: f32, beat_secs: f32, sample_rate: u32) -> usize {
 }
 
 #[inline]
-fn bake_key(event: &Event) -> (String, u32) {
-    (event.instrument_id.clone(), event.gate_beats.to_bits())
+fn bake_key(event: &Event) -> (String, u32, u32) {
+    (
+        event.instrument_id.clone(),
+        event.gate_beats.to_bits(),
+        event.release_beats.to_bits(),
+    )
 }
 
 /// Linear-interpolation resampler.  Output length is approximately

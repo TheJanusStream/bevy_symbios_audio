@@ -274,19 +274,17 @@ crate::impl_genotype!(TriangleOsc {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
 
     use super::*;
 
-    /// Drive an oscillator through N samples with installed state and an
-    /// empty inputs map (no modulation), returning the per-sample buffer.
-    /// Matches what the production bake() path does for a one-node patch.
+    /// Drive an oscillator through N samples with installed state and no
+    /// modulation, returning the per-sample buffer.  Matches what the
+    /// production bake() path does for a one-node patch.
     fn drive<N: Node>(node: &N, sample_rate: u32, n: usize) -> Vec<f32> {
         let mut state = node.init_state();
-        let inputs = BTreeMap::new();
+        let inputs: &[(&str, f32)] = &[];
         let mut rng = ChaCha8Rng::seed_from_u64(0);
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
@@ -296,7 +294,7 @@ mod tests {
                 i as u64,
                 n as u64,
                 &mut rng,
-                &inputs,
+                inputs,
                 state_ref,
             );
             out.push(node.sample(&mut ctx));
@@ -397,8 +395,7 @@ mod tests {
         let mut state = osc.init_state();
         let mut rng = ChaCha8Rng::seed_from_u64(0);
         // Mod input is +440 Hz, so total freq = 880 Hz.
-        let mut inputs = BTreeMap::new();
-        inputs.insert("freq".to_string(), 440.0_f32);
+        let inputs = [("freq", 440.0_f32)];
         let half_period_at_880 = (sr as f32 / (4.0 * 880.0)).round() as u64;
         let mut samples = Vec::new();
         for i in 0..=half_period_at_880 {
@@ -421,8 +418,7 @@ mod tests {
         let sr: u32 = 44_100;
         let mut state = osc.init_state();
         let mut rng = ChaCha8Rng::seed_from_u64(0);
-        let mut inputs = BTreeMap::new();
-        inputs.insert("amplitude".to_string(), 0.5_f32);
+        let inputs = [("amplitude", 0.5_f32)];
         let state_ref: Option<&mut (dyn Any + Send)> = state.as_deref_mut();
         let mut ctx = BakeContext::new(sr, 0, 1, &mut rng, &inputs, state_ref);
         // amplitude is 0.0 + 0.5 = 0.5; phase 0.25 means sin(π/2) = 1.0.

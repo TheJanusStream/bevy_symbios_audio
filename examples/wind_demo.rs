@@ -26,19 +26,19 @@ use std::collections::BTreeMap;
 use std::fs;
 
 use bevy_symbios_audio::{
-    AdsrCurve, AdsrEnvelope, AudioPatch, BiquadLowpass, BrownNoise, Connection, Event, GraphNode,
-    Instrument, Lfo, LfoShape, NodeGraph, NodeId, NodeKind, SequenceRecipe, SineOsc, Track,
-    bake_sequence, samples_to_wav_bytes,
+    AdsrCurve, AdsrEnvelope, AudioPatch, BiquadLowpass, BrownNoise, Connection, Event, Gate,
+    GraphNode, Instrument, Lfo, LfoShape, NodeGraph, NodeId, NodeKind, SequenceRecipe, SineOsc,
+    Track, bake_sequence, samples_to_wav_bytes,
 };
 
 /// Build a wind-drone patch: BrownNoise → LP with cutoff swept by a
 /// 0.3 Hz sine LFO between roughly 200 and 2000 Hz.
 fn wind_patch() -> AudioPatch {
     let mut lp_inputs = BTreeMap::new();
-    lp_inputs.insert("in".to_string(), Connection::from_node(NodeId(1)));
+    lp_inputs.insert("in".to_string(), vec![Connection::from_node(NodeId(1))]);
     lp_inputs.insert(
         "cutoff_hz".to_string(),
-        Connection::modulation(NodeId(0), 1.0),
+        vec![Connection::modulation(NodeId(0), 1.0)],
     );
     AudioPatch {
         seed: 0xCAFE_BABE,
@@ -73,14 +73,19 @@ fn wind_patch() -> AudioPatch {
     }
 }
 
-/// Build a tonal voice: ADSR-gated detuned sine.
+/// Build a tonal voice: a detuned sine through an ADSR that is gated by
+/// a [`Gate`] node — so each sequenced swell attacks while its event's
+/// gate is open, then releases and rings out across the event's
+/// `release_beats` tail instead of cutting off abruptly.
 fn voice_patch() -> AudioPatch {
     let mut adsr_inputs = BTreeMap::new();
-    adsr_inputs.insert("gate".to_string(), Connection::constant(1.0));
+    // Gate (node 2) drives the envelope: open for the event's gate_beats,
+    // then closed so the release stage fires.
+    adsr_inputs.insert("gate".to_string(), vec![Connection::from_node(NodeId(2))]);
     let mut sine_inputs = BTreeMap::new();
     sine_inputs.insert(
         "amplitude".to_string(),
-        Connection::modulation(NodeId(0), 1.0),
+        vec![Connection::modulation(NodeId(0), 1.0)],
     );
     AudioPatch {
         seed: 0,
@@ -105,6 +110,11 @@ fn voice_patch() -> AudioPatch {
                         amplitude: 0.0,
                     }),
                     inputs: sine_inputs,
+                },
+                GraphNode {
+                    id: NodeId(2),
+                    kind: NodeKind::Gate(Gate::default()),
+                    ..Default::default()
                 },
             ],
             output: NodeId(1),
@@ -134,7 +144,8 @@ fn main() {
             },
         ],
         tracks: vec![
-            // Sustained wind layer through the whole loop.
+            // Sustained wind layer through the whole loop — a drone, so
+            // no gate release (release_beats: 0).
             Track {
                 events: vec![Event {
                     time_beats: 0.0,
@@ -142,11 +153,13 @@ fn main() {
                     pitch_multiplier: 1.0,
                     volume: 0.6,
                     gate_beats: 8.0,
+                    release_beats: 0.0,
                 }],
             },
-            // Voice swells at the start and mid-loop, each ringing into
-            // the next.  The last one's release tail will be mixed into
-            // the loop start by the crossfade.
+            // Voice swells at the start and mid-loop, each gated for two
+            // beats then ringing out over a one-beat release tail.  The
+            // last one's release is mixed into the loop start by the
+            // crossfade.
             Track {
                 events: vec![
                     Event {
@@ -154,14 +167,16 @@ fn main() {
                         instrument_id: "voice".into(),
                         pitch_multiplier: 1.0,
                         volume: 0.3,
-                        gate_beats: 3.0,
+                        gate_beats: 2.0,
+                        release_beats: 1.0,
                     },
                     Event {
                         time_beats: 4.0,
                         instrument_id: "voice".into(),
                         pitch_multiplier: 1.5,
                         volume: 0.3,
-                        gate_beats: 3.0,
+                        gate_beats: 2.0,
+                        release_beats: 1.0,
                     },
                 ],
             },

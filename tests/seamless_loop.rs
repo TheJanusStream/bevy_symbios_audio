@@ -9,23 +9,25 @@
 use std::collections::BTreeMap;
 
 use bevy_symbios_audio::{
-    AdsrCurve, AdsrEnvelope, AudioPatch, Connection, Event, GraphNode, Instrument, NodeGraph,
+    AdsrCurve, AdsrEnvelope, AudioPatch, Connection, Event, Gate, GraphNode, Instrument, NodeGraph,
     NodeId, NodeKind, SequenceRecipe, SineOsc, Track, bake_sequence,
 };
 
 const SR: u32 = 44_100;
 const BPM: f32 = 120.0;
 
-/// AdsrEnvelope-gated sine instrument.  The ADSR has a long release
-/// (0.5 s) — so an event placed near `duration_beats` will have its
-/// release tail extending into the crossfade region.
+/// Gate-driven, ADSR-gated sine instrument.  A [`Gate`] node feeds the
+/// envelope, so when an event's gate closes the ADSR's long release
+/// (0.5 s) rings out across the event's `release_beats` tail — and an
+/// event placed near `duration_beats` puts that release into the
+/// crossfade region, exactly what the seamless loop folds back.
 fn ringing_sine_instrument() -> Instrument {
     let mut adsr_inputs = BTreeMap::new();
-    adsr_inputs.insert("gate".to_string(), Connection::constant(1.0));
+    adsr_inputs.insert("gate".to_string(), vec![Connection::from_node(NodeId(2))]);
     let mut sine_inputs = BTreeMap::new();
     sine_inputs.insert(
         "amplitude".to_string(),
-        Connection::modulation(NodeId(0), 1.0),
+        vec![Connection::modulation(NodeId(0), 1.0)],
     );
     Instrument {
         id: "bell".into(),
@@ -62,6 +64,11 @@ fn ringing_sine_instrument() -> Instrument {
                         }),
                         inputs: sine_inputs,
                     },
+                    GraphNode {
+                        id: NodeId(2),
+                        kind: NodeKind::Gate(Gate::default()),
+                        inputs: BTreeMap::new(),
+                    },
                 ],
                 output: NodeId(1),
             },
@@ -87,16 +94,20 @@ fn looping_ringing_recipe(loop_crossfade_beats: f32) -> SequenceRecipe {
                     pitch_multiplier: 1.0,
                     volume: 0.5,
                     gate_beats: 0.5,
+                    release_beats: 0.5,
                 },
                 // Trailing event whose ring-out extends past
-                // duration_beats — its release lives in the tail
-                // window the crossfade overlays back onto loop start.
+                // duration_beats — the gate closes at beat 3.75 and the
+                // 0.75-beat release tail rings through beat 4.5, so the
+                // release lives in the crossfade window the loop folds
+                // back onto loop start.
                 Event {
                     time_beats: 3.5,
                     instrument_id: "bell".into(),
                     pitch_multiplier: 1.0,
                     volume: 0.5,
-                    gate_beats: 1.0,
+                    gate_beats: 0.25,
+                    release_beats: 0.75,
                 },
             ],
         }],

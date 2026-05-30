@@ -14,8 +14,8 @@
 //! - [`patch`] — schema + topology.
 //! - [`node`] — `Node` trait + `BakeContext` + the closed `NodeKind`
 //!   enum that all built-in nodes plug into.
-//! - [`oscillator`], [`noise`], [`adsr`], [`filter`], [`lfo`] — the
-//!   built-in node implementations.
+//! - [`oscillator`], [`noise`], [`adsr`], [`filter`], [`lfo`], [`mix`]
+//!   (Mix/Gain), [`gate`] — the built-in node implementations.
 //! - [`mod@bake`] — turns one [`AudioPatch`] into `Vec<f32>`.
 //! - [`sequence`] + [`mixdown`] — the timeline-of-events layer and the
 //!   seamless-loop-aware [`bake_sequence`].
@@ -110,8 +110,10 @@ pub mod audio_source;
 pub mod bake;
 pub mod cache;
 pub mod filter;
+pub mod gate;
 pub mod genetics;
 pub mod lfo;
+pub mod mix;
 pub mod mixdown;
 pub mod node;
 pub mod noise;
@@ -125,13 +127,15 @@ pub use async_gen::{
     bake_with_cache,
 };
 pub use audio_source::{samples_to_audio_source, samples_to_wav_bytes};
-pub use bake::bake;
+pub use bake::{bake, try_bake};
 pub use cache::{
     DEFAULT_MEMORY_CACHE_ENTRIES, FileStore, MemoryStore, PatchCache, PatchCacheKey,
     PatchCacheStore,
 };
 pub use filter::{BiquadBandpass, BiquadHighpass, BiquadLowpass, BiquadState};
+pub use gate::Gate;
 pub use lfo::{Lfo, LfoShape};
+pub use mix::{Gain, Mix};
 pub use mixdown::bake_sequence;
 pub use node::{BakeContext, Node, NodeKind};
 pub use noise::{BrownNoise, PinkNoise, WhiteNoise};

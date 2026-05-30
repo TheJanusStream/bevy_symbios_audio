@@ -34,7 +34,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use bevy::ecs::resource::Resource;
 use serde::{Deserialize, Serialize};
@@ -90,14 +90,16 @@ impl PatchCacheKey {
 
 /// Trait implemented by patch cache backends.
 ///
-/// Implementations must be `Send + Sync` — the resource lookup hands a
-/// `&mut PatchCache` to systems on the main scheduling thread, but the
-/// trait object may be queried from any thread that holds a reference.
+/// Implementations must be `Send + Sync`: [`PatchCache`] wraps the store in
+/// an `RwLock` and exposes shared (`&self`) access, so lookups can run
+/// concurrently from any system holding a reference while inserts take the
+/// exclusive write lock.
 pub trait PatchCacheStore: Send + Sync {
     /// Returns the WAV bytes previously stored under `key`, or `None`
-    /// on miss.  Implementations that load lazily (e.g. [`FileStore`])
-    /// should perform the I/O here.
-    fn get(&mut self, key: &PatchCacheKey) -> Option<Arc<[u8]>>;
+    /// on miss.  Takes `&self` so the [`PatchCache`] wrapper can serve
+    /// lookups under a shared read lock; lazy loaders (e.g. [`FileStore`])
+    /// perform their read-only I/O here.
+    fn get(&self, key: &PatchCacheKey) -> Option<Arc<[u8]>>;
 
     /// Stores `bytes` under `key`, evicting older entries if needed.
     fn put(&mut self, key: PatchCacheKey, bytes: Arc<[u8]>);
@@ -118,7 +120,10 @@ pub struct PatchCache {
     /// but exposed so callers can rotate caches out-of-band when DSP
     /// internals change without a config-field change.
     pub manifest_version: u32,
-    inner: Mutex<Box<dyn PatchCacheStore>>,
+    /// `RwLock` rather than `Mutex` so concurrent cache *reads* (the hot
+    /// path on room re-entry) don't serialise against each other; only
+    /// inserts take the exclusive write lock.
+    inner: RwLock<Box<dyn PatchCacheStore>>,
 }
 
 impl PatchCache {
@@ -126,7 +131,7 @@ impl PatchCache {
     pub fn new(store: Box<dyn PatchCacheStore>, manifest_version: u32) -> Self {
         Self {
             manifest_version,
-            inner: Mutex::new(store),
+            inner: RwLock::new(store),
         }
     }
 
@@ -145,17 +150,18 @@ impl PatchCache {
         ))
     }
 
-    /// Look up cached WAV bytes for `key`.  Returns `None` on miss or
-    /// if the internal lock is poisoned (in which case the cache is
-    /// degraded but the bake path still works).
+    /// Look up cached WAV bytes for `key`.  Takes a shared read lock, so
+    /// concurrent lookups don't block each other.  Returns `None` on miss
+    /// or if the lock is poisoned (the cache is degraded but the bake path
+    /// still works).
     pub fn get(&self, key: &PatchCacheKey) -> Option<Arc<[u8]>> {
-        self.inner.lock().ok()?.get(key)
+        self.inner.read().ok()?.get(key)
     }
 
     /// Store WAV `bytes` under `key`, evicting older entries if the
-    /// backend's capacity is reached.
+    /// backend's capacity is reached.  Takes the exclusive write lock.
     pub fn insert(&self, key: PatchCacheKey, bytes: Arc<[u8]>) {
-        if let Ok(mut store) = self.inner.lock() {
+        if let Ok(mut store) = self.inner.write() {
             store.put(key, bytes);
         }
     }
@@ -189,7 +195,7 @@ impl MemoryStore {
 }
 
 impl PatchCacheStore for MemoryStore {
-    fn get(&mut self, key: &PatchCacheKey) -> Option<Arc<[u8]>> {
+    fn get(&self, key: &PatchCacheKey) -> Option<Arc<[u8]>> {
         self.entries.get(key).cloned()
     }
 
@@ -241,7 +247,7 @@ impl FileStore {
 }
 
 impl PatchCacheStore for FileStore {
-    fn get(&mut self, key: &PatchCacheKey) -> Option<Arc<[u8]>> {
+    fn get(&self, key: &PatchCacheKey) -> Option<Arc<[u8]>> {
         let path = self.path_for(key);
         let bytes = fs::read(&path).ok()?;
         Some(Arc::from(bytes.into_boxed_slice()))
@@ -384,14 +390,14 @@ mod tests {
             let mut s = FileStore::new(dir.path().to_path_buf()).unwrap();
             s.put(k.clone(), fake_wav(0xEE));
         }
-        let mut s2 = FileStore::new(dir.path().to_path_buf()).unwrap();
+        let s2 = FileStore::new(dir.path().to_path_buf()).unwrap();
         assert_eq!(s2.get(&k).unwrap()[0], 0xEE);
     }
 
     #[test]
     fn file_store_get_on_missing_returns_none() {
         let dir = TempDir::new().unwrap();
-        let mut s = FileStore::new(dir.path().to_path_buf()).unwrap();
+        let s = FileStore::new(dir.path().to_path_buf()).unwrap();
         assert!(s.get(&key(999)).is_none());
     }
 
@@ -418,5 +424,20 @@ mod tests {
         assert!(cache.get(&key(0)).is_none());
         cache.insert(key(0), fake_wav(0x42));
         assert_eq!(cache.get(&key(0)).unwrap()[0], 0x42);
+    }
+
+    #[test]
+    fn patch_cache_allows_concurrent_reads() {
+        // The RwLock-backed cache must serve many simultaneous readers
+        // sharing a single `&PatchCache` — the room-re-entry hot path.
+        let cache = PatchCache::memory(8);
+        cache.insert(key(0), fake_wav(0x42));
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    assert_eq!(cache.get(&key(0)).unwrap()[0], 0x42);
+                });
+            }
+        });
     }
 }

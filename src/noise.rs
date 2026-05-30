@@ -173,8 +173,6 @@ crate::impl_genotype!(BrownNoise {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
 
@@ -183,7 +181,7 @@ mod tests {
     fn pink_ctx<'a>(
         rng: &'a mut ChaCha8Rng,
         state: &'a mut PinkState,
-        inputs: &'a BTreeMap<String, f32>,
+        inputs: &'a [(&'a str, f32)],
     ) -> BakeContext<'a> {
         BakeContext::new(44_100, 0, 44_100, rng, inputs, Some(state))
     }
@@ -191,7 +189,7 @@ mod tests {
     fn brown_ctx<'a>(
         rng: &'a mut ChaCha8Rng,
         state: &'a mut BrownState,
-        inputs: &'a BTreeMap<String, f32>,
+        inputs: &'a [(&'a str, f32)],
     ) -> BakeContext<'a> {
         BakeContext::new(44_100, 0, 44_100, rng, inputs, Some(state))
     }
@@ -200,9 +198,9 @@ mod tests {
     fn white_is_bounded_by_amplitude() {
         let osc = WhiteNoise { amplitude: 0.4 };
         let mut rng = ChaCha8Rng::seed_from_u64(0);
-        let inputs = BTreeMap::new();
+        let inputs: &[(&str, f32)] = &[];
         for _ in 0..10_000 {
-            let mut ctx = BakeContext::new(44_100, 0, 44_100, &mut rng, &inputs, None);
+            let mut ctx = BakeContext::new(44_100, 0, 44_100, &mut rng, inputs, None);
             let s = osc.sample(&mut ctx);
             assert!(s.abs() < 0.4, "white sample {s} out of |s|<0.4");
         }
@@ -212,10 +210,10 @@ mod tests {
     fn white_is_not_silent() {
         let osc = WhiteNoise::default();
         let mut rng = ChaCha8Rng::seed_from_u64(0);
-        let inputs = BTreeMap::new();
+        let inputs: &[(&str, f32)] = &[];
         let mut nonzero = 0;
         for _ in 0..1000 {
-            let mut ctx = BakeContext::new(44_100, 0, 44_100, &mut rng, &inputs, None);
+            let mut ctx = BakeContext::new(44_100, 0, 44_100, &mut rng, inputs, None);
             if osc.sample(&mut ctx).abs() > 1e-6 {
                 nonzero += 1;
             }
@@ -232,9 +230,9 @@ mod tests {
         let osc = PinkNoise::default();
         let mut rng = ChaCha8Rng::seed_from_u64(0);
         let mut state = PinkState::default();
-        let inputs = BTreeMap::new();
+        let inputs: &[(&str, f32)] = &[];
         for _ in 0..200 {
-            let mut ctx = pink_ctx(&mut rng, &mut state, &inputs);
+            let mut ctx = pink_ctx(&mut rng, &mut state, inputs);
             osc.sample(&mut ctx);
         }
         // After 200 samples driven by uniform white, the LP-filter values
@@ -248,8 +246,8 @@ mod tests {
         // BakeContext, the impl returns scaled white instead of panicking.
         let osc = PinkNoise { amplitude: 1.0 };
         let mut rng = ChaCha8Rng::seed_from_u64(0);
-        let inputs = BTreeMap::new();
-        let mut ctx = BakeContext::new(44_100, 0, 44_100, &mut rng, &inputs, None);
+        let inputs: &[(&str, f32)] = &[];
+        let mut ctx = BakeContext::new(44_100, 0, 44_100, &mut rng, inputs, None);
         let s = osc.sample(&mut ctx);
         assert!(s.abs() <= 1.0);
     }
@@ -259,10 +257,10 @@ mod tests {
         let osc = BrownNoise { amplitude: 1.0 };
         let mut rng = ChaCha8Rng::seed_from_u64(0xDEAD);
         let mut state = BrownState::default();
-        let inputs = BTreeMap::new();
+        let inputs: &[(&str, f32)] = &[];
         let mut max_abs = 0.0_f32;
         for _ in 0..100_000 {
-            let mut ctx = brown_ctx(&mut rng, &mut state, &inputs);
+            let mut ctx = brown_ctx(&mut rng, &mut state, inputs);
             let s = osc.sample(&mut ctx);
             max_abs = max_abs.max(s.abs());
         }
@@ -276,8 +274,8 @@ mod tests {
         // should return None — the runtime downcast is the safety net.
         let mut rng = ChaCha8Rng::seed_from_u64(0);
         let mut wrong = BrownState::default();
-        let inputs = BTreeMap::new();
-        let mut ctx = BakeContext::new(44_100, 0, 44_100, &mut rng, &inputs, Some(&mut wrong));
+        let inputs: &[(&str, f32)] = &[];
+        let mut ctx = BakeContext::new(44_100, 0, 44_100, &mut rng, inputs, Some(&mut wrong));
         assert!(ctx.state_mut::<PinkState>().is_none());
     }
 }

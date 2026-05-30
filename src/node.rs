@@ -12,14 +12,15 @@
 //! evaluator — keeps configs pure data, serde-clean, and `Genotype`-friendly.
 
 use std::any::Any;
-use std::collections::BTreeMap;
 
 use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::adsr::AdsrEnvelope;
 use crate::filter::{BiquadBandpass, BiquadHighpass, BiquadLowpass};
+use crate::gate::Gate;
 use crate::lfo::Lfo;
+use crate::mix::{Gain, Mix};
 use crate::noise::{BrownNoise, PinkNoise, WhiteNoise};
 use crate::oscillator::{SawtoothOsc, SineOsc, SquareOsc, TriangleOsc};
 
@@ -63,6 +64,15 @@ pub enum NodeKind {
     BiquadBandpass(BiquadBandpass),
     /// Low-frequency oscillator (modulation source) — see [`Lfo`].
     Lfo(Lfo),
+    /// Additive mixer — sums all wired input ports, scaled by gain.  See
+    /// [`Mix`].
+    Mix(Mix),
+    /// Voltage-controlled amplifier — `in * (gain + gain-CV)`.  See
+    /// [`Gain`].
+    Gain(Gain),
+    /// Note-gate signal driven by the sequencer's gate window.  See
+    /// [`Gate`].
+    Gate(Gate),
 }
 
 /// Per-sample context handed to every [`Node::sample`] invocation.
@@ -84,8 +94,17 @@ pub struct BakeContext<'a> {
     /// Total number of samples this bake will produce.
     pub duration_samples: u64,
     /// Inputs wired to the node currently being evaluated, resolved to
-    /// their f32 sample values (constants or upstream node outputs).
-    pub(crate) inputs: &'a BTreeMap<String, f32>,
+    /// their summed `f32` sample values and keyed by port name.  Stored
+    /// as a borrowed `(port, value)` slice rather than a map so the baker
+    /// can fill it from reusable scratch with no per-sample allocation;
+    /// [`Self::input`] does the (short) name lookup.
+    pub(crate) inputs: &'a [(&'a str, f32)],
+    /// Number of samples the note's gate is held open, or `None` for an
+    /// always-open gate (the default for a standalone [`crate::bake::bake`]).
+    /// The sequencer sets this per event so [`NodeKind::Gate`] can drive
+    /// an [`crate::adsr::AdsrEnvelope`] through attack→…→release.  Read via
+    /// [`Self::gate_open`].
+    pub(crate) gate_samples: Option<u64>,
     /// Seeded deterministic RNG, shared across the entire bake so the same
     /// patch + same seed always yields the same buffer.
     pub(crate) rng: &'a mut ChaCha8Rng,
@@ -99,12 +118,15 @@ pub struct BakeContext<'a> {
 impl<'a> BakeContext<'a> {
     /// Construct a context for a single node evaluation.  Intended for
     /// evaluator code; user node implementations only read from `&self`.
+    ///
+    /// The gate defaults to always-open; the baker sets a finite window
+    /// via [`Self::with_gate`] when a sequencer event drives the note.
     pub fn new(
         sample_rate: u32,
         sample_index: u64,
         duration_samples: u64,
         rng: &'a mut ChaCha8Rng,
-        inputs: &'a BTreeMap<String, f32>,
+        inputs: &'a [(&'a str, f32)],
         state: Option<&'a mut (dyn Any + Send)>,
     ) -> Self {
         Self {
@@ -112,9 +134,19 @@ impl<'a> BakeContext<'a> {
             sample_index,
             duration_samples,
             inputs,
+            gate_samples: None,
             rng,
             state,
         }
+    }
+
+    /// Set the gate window (in samples) for this evaluation and return
+    /// `self`, so the baker can chain it onto [`Self::new`].  `None`
+    /// restores the always-open default.
+    #[inline]
+    pub fn with_gate(mut self, gate_samples: Option<u64>) -> Self {
+        self.gate_samples = gate_samples;
+        self
     }
 
     /// Mutably borrow the per-node state as a concrete type `S`.  Returns
@@ -126,12 +158,38 @@ impl<'a> BakeContext<'a> {
         self.state.as_deref_mut()?.downcast_mut::<S>()
     }
 
-    /// Resolved value at the named input port.  Returns 0.0 if the port is
-    /// unwired — matches the "missing connection reads zero" convention
-    /// every modular synth uses.
+    /// Resolved (summed) value at the named input port.  Returns 0.0 if the
+    /// port is unwired — matches the "missing connection reads zero"
+    /// convention every modular synth uses.  A linear scan over the node's
+    /// (few) ports; cheaper than a map lookup at these sizes and free of
+    /// per-sample allocation.
     #[inline]
     pub fn input(&self, port: &str) -> f32 {
-        self.inputs.get(port).copied().unwrap_or(0.0)
+        self.inputs
+            .iter()
+            .find(|(name, _)| *name == port)
+            .map(|(_, value)| *value)
+            .unwrap_or(0.0)
+    }
+
+    /// Sum of *every* wired input port's (already-summed) value.  Used by
+    /// [`NodeKind::Mix`], which combines all its sources regardless of port
+    /// name.  Unwired nodes read `0.0`.
+    #[inline]
+    pub fn input_sum(&self) -> f32 {
+        self.inputs.iter().map(|(_, value)| *value).sum()
+    }
+
+    /// Whether the note's gate is currently open.  `true` for the first
+    /// `gate_samples` samples of a gated bake, and always `true` for an
+    /// ungated (standalone) bake.  [`NodeKind::Gate`] turns this into a
+    /// `1.0`/`0.0` control signal.
+    #[inline]
+    pub fn gate_open(&self) -> bool {
+        match self.gate_samples {
+            Some(g) => self.sample_index < g,
+            None => true,
+        }
     }
 
     /// Wall-clock time at the current sample, in seconds.
@@ -186,6 +244,9 @@ impl Node for NodeKind {
             NodeKind::BiquadHighpass(f) => f.sample(ctx),
             NodeKind::BiquadBandpass(f) => f.sample(ctx),
             NodeKind::Lfo(l) => l.sample(ctx),
+            NodeKind::Mix(m) => m.sample(ctx),
+            NodeKind::Gain(g) => g.sample(ctx),
+            NodeKind::Gate(g) => g.sample(ctx),
         }
     }
 
@@ -220,24 +281,23 @@ mod tests {
 
     #[test]
     fn silence_samples_zero() {
-        let inputs = BTreeMap::new();
+        let inputs: &[(&str, f32)] = &[];
         let mut r = rng();
-        let mut ctx = BakeContext::new(44_100, 0, 44_100, &mut r, &inputs, None);
+        let mut ctx = BakeContext::new(44_100, 0, 44_100, &mut r, inputs, None);
         assert_eq!(NodeKind::Silence.sample(&mut ctx), 0.0);
     }
 
     #[test]
     fn input_defaults_to_zero_when_unwired() {
-        let inputs = BTreeMap::new();
+        let inputs: &[(&str, f32)] = &[];
         let mut r = rng();
-        let ctx = BakeContext::new(48_000, 100, 48_000, &mut r, &inputs, None);
+        let ctx = BakeContext::new(48_000, 100, 48_000, &mut r, inputs, None);
         assert_eq!(ctx.input("anything"), 0.0);
     }
 
     #[test]
     fn input_returns_wired_value() {
-        let mut inputs = BTreeMap::new();
-        inputs.insert("freq".to_string(), 440.0_f32);
+        let inputs = [("freq", 440.0_f32)];
         let mut r = rng();
         let ctx = BakeContext::new(44_100, 0, 44_100, &mut r, &inputs, None);
         assert_eq!(ctx.input("freq"), 440.0);
@@ -245,20 +305,20 @@ mod tests {
 
     #[test]
     fn time_secs_advances_with_sample_index() {
-        let inputs = BTreeMap::new();
+        let inputs: &[(&str, f32)] = &[];
         let mut r = rng();
-        let ctx = BakeContext::new(44_100, 22_050, 44_100, &mut r, &inputs, None);
+        let ctx = BakeContext::new(44_100, 22_050, 44_100, &mut r, inputs, None);
         let t = ctx.time_secs();
         assert!((t - 0.5).abs() < 1e-9, "expected ~0.5s, got {t}");
     }
 
     #[test]
     fn rng_is_deterministic_for_same_seed() {
-        let inputs = BTreeMap::new();
+        let inputs: &[(&str, f32)] = &[];
         let mut r1 = ChaCha8Rng::seed_from_u64(42);
         let mut r2 = ChaCha8Rng::seed_from_u64(42);
-        let mut ctx1 = BakeContext::new(44_100, 0, 100, &mut r1, &inputs, None);
-        let mut ctx2 = BakeContext::new(44_100, 0, 100, &mut r2, &inputs, None);
+        let mut ctx1 = BakeContext::new(44_100, 0, 100, &mut r1, inputs, None);
+        let mut ctx2 = BakeContext::new(44_100, 0, 100, &mut r2, inputs, None);
         let a: u32 = ctx1.rng().random();
         let b: u32 = ctx2.rng().random();
         assert_eq!(a, b);

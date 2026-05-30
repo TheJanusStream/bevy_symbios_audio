@@ -24,6 +24,15 @@
 //!
 //! Optional `post_mutate` / `post_crossover` blocks run custom fixup logic
 //! after the per-field operations.
+//!
+//! # Coverage note
+//!
+//! The macro is deliberately general.  The audio node configs in this crate
+//! only exercise the `f32`, `f32_log`, `bool`, and `enum_cycle` kinds; the
+//! `seed`, `f64`, `f64_round`, and `usize` kinds (and the matching mutation
+//! helpers below, each `#[allow(dead_code)]`) are kept for parity with the
+//! sibling `symbios-texture` configs and are covered only by this module's
+//! `TestConfig`, not by any real node.
 
 use rand::Rng;
 

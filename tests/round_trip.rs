@@ -14,12 +14,12 @@ use bevy_symbios_audio::{
 
 fn build_patch() -> AudioPatch {
     let mut node_b_inputs = BTreeMap::new();
-    node_b_inputs.insert("carrier".to_string(), Connection::from_node(NodeId(0)));
-    node_b_inputs.insert("gain".to_string(), Connection::constant(0.75));
+    node_b_inputs.insert("carrier".to_string(), vec![Connection::from_node(NodeId(0))]);
+    node_b_inputs.insert("gain".to_string(), vec![Connection::constant(0.75)]);
 
     let mut node_c_inputs = BTreeMap::new();
-    node_c_inputs.insert("left".to_string(), Connection::from_node(NodeId(0)));
-    node_c_inputs.insert("right".to_string(), Connection::from_node(NodeId(1)));
+    node_c_inputs.insert("left".to_string(), vec![Connection::from_node(NodeId(0))]);
+    node_c_inputs.insert("right".to_string(), vec![Connection::from_node(NodeId(1))]);
 
     AudioPatch {
         seed: 0xC0FF_EE00,
@@ -79,9 +79,9 @@ fn connection_constant_serialises_with_tag() {
 }
 
 #[test]
-fn connection_node_omits_default_output_on_deserialize() {
-    // Schema-evolution check: older patches that don't specify an output
-    // port name must still deserialize.
+fn connection_node_omits_default_amount_on_deserialize() {
+    // Schema-evolution check: patches that don't specify an amount must
+    // still deserialize, defaulting to unity gain.
     let json = r#"{"source":"node","id":3}"#;
     let conn: Connection = serde_json::from_str(json).unwrap();
     assert_eq!(conn, Connection::from_node(NodeId(3)));

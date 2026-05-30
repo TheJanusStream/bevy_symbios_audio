@@ -88,64 +88,55 @@ impl Node for Lfo {
     fn sample(&self, ctx: &mut BakeContext) -> f32 {
         let sr = ctx.sample_rate as f32;
         let rate = self.rate_hz.max(0.0);
-        // Drawing from the rng for the Random shape must happen before
-        // we borrow state, since rng and state are both borrowed
-        // mutably via ctx.
-        let raw = match ctx.state_mut::<LfoState>() {
-            Some(state) => {
-                // First sample of the bake — kick the held value if we're
-                // a Random LFO so the very first cycle isn't silent.
-                if !state.cycle_started {
-                    state.cycle_started = true;
-                    state.held_value = 0.0; // placeholder; overwritten if Random
-                }
-                let phase = state.phase;
-                let raw = match self.shape {
-                    LfoShape::Sine => (2.0 * PI * phase).sin(),
-                    LfoShape::Triangle => 1.0 - 4.0 * (phase - 0.5).abs(),
-                    LfoShape::Square => {
-                        if phase < 0.5 {
-                            1.0
-                        } else {
-                            -1.0
-                        }
-                    }
-                    LfoShape::Saw => 2.0 * phase - 1.0,
-                    LfoShape::Random => state.held_value,
-                };
-                // Advance phase.  rem_euclid handles negative rate
-                // accidentally slipping in without making the phase go
-                // outside [0, 1).
-                let next_phase = (phase + rate / sr).rem_euclid(1.0);
-                let cycle_wrapped = next_phase < phase;
-                state.phase = next_phase;
-                // For Random shape, redraw at cycle boundary.  We do this
-                // *after* the phase advance so the value held across the
-                // current sample is the previous one — guarantees
-                // monotonic step-and-hold semantics.
-                if matches!(self.shape, LfoShape::Random) && cycle_wrapped {
-                    // Held value updates next cycle — we draw below.
-                }
-                raw
-            }
-            None => 0.0,
+        let is_random = matches!(self.shape, LfoShape::Random);
+
+        // Copy the state out so the (mutable) state borrow is released
+        // before we touch the rng — the two share `ctx` and can't be
+        // borrowed at once.
+        let mut st = match ctx.state_mut::<LfoState>() {
+            Some(s) => *s,
+            // No state container: emit the offset (raw waveform = 0).
+            None => return self.offset,
         };
 
-        // Random redraw — must come outside the state borrow so we can
-        // touch the rng.  Recompute phase wrap from the now-updated state.
-        if matches!(self.shape, LfoShape::Random) {
-            let new_value: f32 = ctx.rng().random_range(-1.0_f32..1.0_f32);
-            if let Some(state) = ctx.state_mut::<LfoState>() {
-                // Initialise the very first held value on sample 0, OR
-                // redraw whenever the phase wrapped during this step.
-                if !state.cycle_started || state.phase < rate / sr {
-                    // (The `phase < rate/sr` predicate identifies "we
-                    // just wrapped" — small leftover phase indicates a
-                    // recent reset.)
-                    state.held_value = new_value;
-                    state.cycle_started = true;
+        // Sample-and-hold: draw the very first held value on sample 0 so
+        // the first cycle isn't silent.  (Subsequent draws happen on wrap,
+        // below.)
+        if is_random && !st.cycle_started {
+            st.held_value = ctx.rng().random_range(-1.0_f32..1.0_f32);
+        }
+        st.cycle_started = true;
+
+        let phase = st.phase;
+        let raw = match self.shape {
+            LfoShape::Sine => (2.0 * PI * phase).sin(),
+            LfoShape::Triangle => 1.0 - 4.0 * (phase - 0.5).abs(),
+            LfoShape::Square => {
+                if phase < 0.5 {
+                    1.0
+                } else {
+                    -1.0
                 }
             }
+            LfoShape::Saw => 2.0 * phase - 1.0,
+            LfoShape::Random => st.held_value,
+        };
+
+        // Advance the phase.  rem_euclid keeps it in [0, 1) even if a
+        // negative rate slips through.
+        let next_phase = (phase + rate / sr).rem_euclid(1.0);
+        let wrapped = next_phase < phase;
+        st.phase = next_phase;
+
+        // On a cycle wrap, draw the next cycle's held value (Random only).
+        // Drawing exactly once per cycle — rather than every sample —
+        // keeps the step-and-hold honest and the rng stream lean.
+        if is_random && wrapped {
+            st.held_value = ctx.rng().random_range(-1.0_f32..1.0_f32);
+        }
+
+        if let Some(s) = ctx.state_mut::<LfoState>() {
+            *s = st;
         }
 
         raw * self.depth + self.offset
@@ -173,8 +164,6 @@ crate::impl_genotype!(Lfo {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use rand::SeedableRng;
     use rand_chacha::ChaCha8Rng;
 
@@ -182,7 +171,7 @@ mod tests {
 
     fn drive(lfo: &Lfo, sample_rate: u32, n: usize) -> Vec<f32> {
         let mut state = lfo.init_state();
-        let inputs = BTreeMap::new();
+        let inputs: &[(&str, f32)] = &[];
         let mut rng = ChaCha8Rng::seed_from_u64(0);
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
@@ -192,7 +181,7 @@ mod tests {
                 i as u64,
                 n as u64,
                 &mut rng,
-                &inputs,
+                inputs,
                 state_ref,
             );
             out.push(lfo.sample(&mut ctx));
@@ -279,6 +268,31 @@ mod tests {
     }
 
     #[test]
+    fn random_lfo_first_cycle_is_a_nonzero_held_value() {
+        // Regression for the first-cycle-silence bug: sample 0 must draw a
+        // real value and hold it flat for the whole first cycle (instead of
+        // being stuck at 0 until the first phase wrap).
+        let lfo = Lfo {
+            rate_hz: 2.0, // first cycle = sr / 2 = 22_050 samples
+            shape: LfoShape::Random,
+            depth: 1.0,
+            offset: 0.0,
+        };
+        // Drive a sub-range comfortably inside the ~22_050-sample first
+        // cycle (the exact wrap drifts a sample or two from f32 phase
+        // accumulation, so we stay clear of the boundary).
+        let buf = drive(&lfo, 44_100, 20_000);
+        let first = buf[0];
+        assert!(first != 0.0, "first S&H value should not be silent");
+        for (i, s) in buf.iter().enumerate() {
+            assert!(
+                (*s - first).abs() < 1e-9,
+                "first cycle not held flat at sample {i}: {s} vs {first}"
+            );
+        }
+    }
+
+    #[test]
     fn lfo_falls_back_to_offset_when_state_missing() {
         let lfo = Lfo {
             rate_hz: 1.0,
@@ -286,9 +300,9 @@ mod tests {
             depth: 1.0,
             offset: 0.5,
         };
-        let inputs = BTreeMap::new();
+        let inputs: &[(&str, f32)] = &[];
         let mut rng = ChaCha8Rng::seed_from_u64(0);
-        let mut ctx = BakeContext::new(44_100, 0, 1, &mut rng, &inputs, None);
+        let mut ctx = BakeContext::new(44_100, 0, 1, &mut rng, inputs, None);
         let s = lfo.sample(&mut ctx);
         // With no state, raw waveform is 0, so output is just offset.
         assert!((s - 0.5).abs() < 1e-6);

@@ -113,10 +113,22 @@ pub struct Event {
     /// Volume scaler applied at mixdown time.  Bounded `[0, 1]` by
     /// convention; the baker clamps before summation.
     pub volume: f32,
-    /// How long the gate is held open in beats.  Longer than the
-    /// patch's natural decay → the envelope sustains for the extra
-    /// time; shorter → it releases early.
+    /// How long the note's gate is held **open**, in beats.  The mixdown
+    /// baker opens the instrument's gate window for this long (see
+    /// [`crate::node::NodeKind::Gate`]), so an [`crate::adsr::AdsrEnvelope`]
+    /// wired `Gate → gate` attacks, decays, and sustains for the gate.  At
+    /// the end of the window the gate closes and the envelope enters its
+    /// release stage.  Longer than the patch's attack+decay → it holds at
+    /// sustain for the extra time; shorter → it releases early, from a
+    /// partial value.
     pub gate_beats: f32,
+    /// Extra tail baked *after* the gate closes, in beats — enough for the
+    /// envelope's release to ring out (and for resonant filters / delays
+    /// to decay).  `0.0` (the default) cuts the note the instant the gate
+    /// closes, reproducing a hard one-shot.  An instrument with no
+    /// gate-driven release can leave this at `0.0`.
+    #[serde(default)]
+    pub release_beats: f32,
 }
 
 impl Default for Event {
@@ -127,6 +139,7 @@ impl Default for Event {
             pitch_multiplier: 1.0,
             volume: 1.0,
             gate_beats: 1.0,
+            release_beats: 0.0,
         }
     }
 }
@@ -235,6 +248,7 @@ mod tests {
                             pitch_multiplier: 1.0,
                             volume: 0.6,
                             gate_beats: 8.0,
+                            release_beats: 0.0,
                         },
                         Event {
                             time_beats: 4.0,
@@ -242,6 +256,7 @@ mod tests {
                             pitch_multiplier: 0.97,
                             volume: 0.4,
                             gate_beats: 4.0,
+                            release_beats: 0.0,
                         },
                     ],
                 },
@@ -252,6 +267,7 @@ mod tests {
                         pitch_multiplier: 1.0,
                         volume: 0.8,
                         gate_beats: 0.25,
+                        release_beats: 0.0,
                     }],
                 },
             ],

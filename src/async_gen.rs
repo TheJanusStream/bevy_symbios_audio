@@ -44,14 +44,31 @@ use bevy::{
         component::Component,
         entity::Entity,
         resource::Resource,
-        system::{Commands, Query, ResMut},
+        system::{Commands, Query, Res, ResMut},
     },
 };
 
 use crate::audio_source::samples_to_wav_bytes;
-use crate::bake::bake;
+use crate::bake::try_bake;
 use crate::cache::{PatchCache, PatchCacheKey};
 use crate::patch::AudioPatch;
+
+/// Bake on a worker, downgrading a structurally-invalid patch to an empty
+/// buffer with a clear error log instead of panicking the thread (which
+/// would surface as a misleading "bake thread panicked" in
+/// [`poll_audio_tasks`]).
+fn bake_or_warn(patch: &AudioPatch, sample_rate: u32, duration_secs: f32) -> Vec<f32> {
+    match try_bake(patch, sample_rate, duration_secs) {
+        Ok(buffer) => buffer,
+        Err(err) => {
+            bevy::log::error!(
+                "bevy_symbios_audio: skipping bake of structurally-invalid patch ({err}); \
+                 producing a silent buffer"
+            );
+            Vec::new()
+        }
+    }
+}
 
 /// Default concurrency cap applied when no explicit
 /// [`AsyncAudioConfig::pool_threads`] is supplied.
@@ -312,12 +329,12 @@ fn spawn_bake(
     match bake_pool() {
         Some(pool) => pool.spawn(move || {
             if !cancelled.load(Ordering::Relaxed) {
-                tx.send(bake(&patch, sample_rate, duration_secs)).ok();
+                tx.send(bake_or_warn(&patch, sample_rate, duration_secs)).ok();
             }
         }),
         None => {
             if !cancelled.load(Ordering::Relaxed) {
-                tx.send(bake(&patch, sample_rate, duration_secs)).ok();
+                tx.send(bake_or_warn(&patch, sample_rate, duration_secs)).ok();
             }
         }
     }
@@ -340,7 +357,7 @@ fn spawn_bake(
     AsyncComputeTaskPool::get()
         .spawn(async move {
             if !cancelled.load(Ordering::Relaxed) {
-                tx.send(bake(&patch, sample_rate, duration_secs)).ok();
+                tx.send(bake_or_warn(&patch, sample_rate, duration_secs)).ok();
             }
         })
         .detach();
@@ -370,7 +387,10 @@ pub fn poll_audio_tasks(
     mut commands: Commands,
     tasks: Query<(Entity, &PendingAudioPatch)>,
     mut audio_sources: ResMut<Assets<AudioSource>>,
-    cache: Option<ResMut<PatchCache>>,
+    // Shared (`Res`) rather than exclusive: `PatchCache::insert` takes
+    // `&self` behind an `RwLock`, so the poller doesn't need mutable
+    // access and won't serialise against other systems reading the cache.
+    cache: Option<Res<PatchCache>>,
 ) {
     for (entity, pending) in &tasks {
         let poll = pending
@@ -453,7 +473,7 @@ mod tests {
 
         // Inline-fallback shape (mirror of spawn_bake's None branch).
         if !flag.load(Ordering::Relaxed) {
-            tx.send(bake(&patch, 44_100, 0.001)).ok();
+            tx.send(bake_or_warn(&patch, 44_100, 0.001)).ok();
         }
 
         let samples = rx

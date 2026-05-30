@@ -30,7 +30,7 @@ fn rms(buf: &[f32]) -> f32 {
 /// Two-node patch: `Sine(freq) → filter(in)` with `filter` as the output.
 fn sine_through(freq: f32, filter_kind: NodeKind) -> AudioPatch {
     let mut filter_inputs = BTreeMap::new();
-    filter_inputs.insert("in".to_string(), Connection::from_node(NodeId(0)));
+    filter_inputs.insert("in".to_string(), vec![Connection::from_node(NodeId(0))]);
     AudioPatch {
         seed: 0,
         graph: NodeGraph {

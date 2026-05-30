@@ -29,12 +29,12 @@ fn rms(buf: &[f32]) -> f32 {
 /// 0.3 Hz sine LFO sweeping ±900 around base 1100 (so 200..2000 Hz).
 fn wind_patch() -> AudioPatch {
     let mut lp_inputs = BTreeMap::new();
-    lp_inputs.insert("in".to_string(), Connection::from_node(NodeId(1)));
+    lp_inputs.insert("in".to_string(), vec![Connection::from_node(NodeId(1))]);
     // Connection amount is 1.0 here; the depth/offset live on the LFO so
     // the modulation range is fully described by the modulator.
     lp_inputs.insert(
         "cutoff_hz".to_string(),
-        Connection::modulation(NodeId(0), 1.0),
+        vec![Connection::modulation(NodeId(0), 1.0)],
     );
     AudioPatch {
         seed: 0xABCD,
@@ -139,7 +139,10 @@ fn fm_sine_to_sine_changes_spectral_content() {
         amplitude: 1.0,
     });
     let mut carrier_inputs = BTreeMap::new();
-    carrier_inputs.insert("freq".to_string(), Connection::modulation(NodeId(0), 200.0));
+    carrier_inputs.insert(
+        "freq".to_string(),
+        vec![Connection::modulation(NodeId(0), 200.0)],
+    );
     let fm_patch = AudioPatch {
         seed: 0,
         graph: NodeGraph {
@@ -222,7 +225,7 @@ fn am_lfo_into_sine_amplitude_creates_tremolo() {
     let mut carrier_inputs = BTreeMap::new();
     carrier_inputs.insert(
         "amplitude".to_string(),
-        Connection::modulation(NodeId(0), 1.0),
+        vec![Connection::modulation(NodeId(0), 1.0)],
     );
     let am_patch = AudioPatch {
         seed: 0,
