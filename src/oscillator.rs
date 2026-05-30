@@ -44,7 +44,7 @@ pub struct OscPhase {
 }
 
 /// Direction of a sawtooth ramp.  `Up` rises from −1 to +1 over the period
-/// (the classic "supersaw" shape); `Down` falls from +1 to −1.
+/// (the classic bright sawtooth ramp); `Down` falls from +1 to −1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum SawPolarity {
     #[default]
@@ -289,14 +289,8 @@ mod tests {
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
             let state_ref: Option<&mut (dyn Any + Send)> = state.as_deref_mut();
-            let mut ctx = BakeContext::new(
-                sample_rate,
-                i as u64,
-                n as u64,
-                &mut rng,
-                inputs,
-                state_ref,
-            );
+            let mut ctx =
+                BakeContext::new(sample_rate, i as u64, n as u64, &mut rng, inputs, state_ref);
             out.push(node.sample(&mut ctx));
         }
         out

@@ -176,14 +176,8 @@ mod tests {
         let mut out = Vec::with_capacity(n);
         for i in 0..n {
             let state_ref: Option<&mut (dyn Any + Send)> = state.as_deref_mut();
-            let mut ctx = BakeContext::new(
-                sample_rate,
-                i as u64,
-                n as u64,
-                &mut rng,
-                inputs,
-                state_ref,
-            );
+            let mut ctx =
+                BakeContext::new(sample_rate, i as u64, n as u64, &mut rng, inputs, state_ref);
             out.push(lfo.sample(&mut ctx));
         }
         out

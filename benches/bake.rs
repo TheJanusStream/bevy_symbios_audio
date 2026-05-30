@@ -25,7 +25,10 @@ use bevy_symbios_audio::{
 fn wind_patch() -> AudioPatch {
     let mut lp_inputs: BTreeMap<String, Vec<Connection>> = BTreeMap::new();
     lp_inputs.insert("in".into(), vec![Connection::from_node(NodeId(1))]);
-    lp_inputs.insert("cutoff_hz".into(), vec![Connection::modulation(NodeId(0), 1.0)]);
+    lp_inputs.insert(
+        "cutoff_hz".into(),
+        vec![Connection::modulation(NodeId(0), 1.0)],
+    );
     AudioPatch {
         seed: 0xCAFE_BABE,
         graph: NodeGraph {
@@ -65,7 +68,10 @@ fn voice_instrument() -> Instrument {
     let mut adsr_inputs: BTreeMap<String, Vec<Connection>> = BTreeMap::new();
     adsr_inputs.insert("gate".into(), vec![Connection::from_node(NodeId(2))]);
     let mut sine_inputs: BTreeMap<String, Vec<Connection>> = BTreeMap::new();
-    sine_inputs.insert("amplitude".into(), vec![Connection::modulation(NodeId(0), 1.0)]);
+    sine_inputs.insert(
+        "amplitude".into(),
+        vec![Connection::modulation(NodeId(0), 1.0)],
+    );
     Instrument {
         id: "voice".into(),
         patch: AudioPatch {

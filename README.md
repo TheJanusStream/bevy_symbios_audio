@@ -182,7 +182,7 @@ integration relies on — one stable ambient track per room seed.
 
 | Feature | Default | What it does                                   |
 |---------|---------|------------------------------------------------|
-| `egui`  | off     | Pulls in `bevy_egui` for editor-side UI shims. |
+| `egui`  | off     | `bevy_egui` for a planned editor UI; unused.   |
 
 The crate's own `bevy` dependency enables Bevy's `wav` feature so
 downstream users don't need to enable it on their own `bevy = ...`

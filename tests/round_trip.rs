@@ -14,7 +14,10 @@ use bevy_symbios_audio::{
 
 fn build_patch() -> AudioPatch {
     let mut node_b_inputs = BTreeMap::new();
-    node_b_inputs.insert("carrier".to_string(), vec![Connection::from_node(NodeId(0))]);
+    node_b_inputs.insert(
+        "carrier".to_string(),
+        vec![Connection::from_node(NodeId(0))],
+    );
     node_b_inputs.insert("gain".to_string(), vec![Connection::constant(0.75)]);
 
     let mut node_c_inputs = BTreeMap::new();

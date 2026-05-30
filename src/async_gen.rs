@@ -329,12 +329,14 @@ fn spawn_bake(
     match bake_pool() {
         Some(pool) => pool.spawn(move || {
             if !cancelled.load(Ordering::Relaxed) {
-                tx.send(bake_or_warn(&patch, sample_rate, duration_secs)).ok();
+                tx.send(bake_or_warn(&patch, sample_rate, duration_secs))
+                    .ok();
             }
         }),
         None => {
             if !cancelled.load(Ordering::Relaxed) {
-                tx.send(bake_or_warn(&patch, sample_rate, duration_secs)).ok();
+                tx.send(bake_or_warn(&patch, sample_rate, duration_secs))
+                    .ok();
             }
         }
     }
@@ -357,7 +359,8 @@ fn spawn_bake(
     AsyncComputeTaskPool::get()
         .spawn(async move {
             if !cancelled.load(Ordering::Relaxed) {
-                tx.send(bake_or_warn(&patch, sample_rate, duration_secs)).ok();
+                tx.send(bake_or_warn(&patch, sample_rate, duration_secs))
+                    .ok();
             }
         })
         .detach();

@@ -7,12 +7,11 @@
 //! crate produces.
 //!
 //! Coefficients are recomputed every sample.  That is the *whole point*
-//! of doing it this way rather than caching: when Phase 2 ticket #8 lands
-//! and wires up cross-node modulation, an LFO driving the cutoff produces
-//! audio-rate frequency sweeps for free — the filter already reads the
-//! current cutoff value, no extra plumbing needed.  If profiling later
-//! shows it matters, a static-cutoff fast path can be added behind a
-//! detection check.
+//! of doing it this way rather than caching: because cross-node modulation
+//! is wired up, an LFO driving the cutoff produces audio-rate frequency
+//! sweeps for free — the filter already reads the current cutoff value, no
+//! extra plumbing needed.  If profiling later shows it matters, a
+//! static-cutoff fast path can be added behind a detection check.
 //!
 //! # Input ports
 //!

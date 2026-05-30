@@ -46,9 +46,7 @@ impl Node for Gate {
     }
 }
 
-crate::impl_genotype!(Gate {
-    invert: bool,
-});
+crate::impl_genotype!(Gate { invert: bool });
 
 #[cfg(test)]
 mod tests {
@@ -60,8 +58,8 @@ mod tests {
     fn gate_value(gate: &Gate, sample_index: u64, gate_samples: Option<u64>) -> f32 {
         let mut rng = ChaCha8Rng::seed_from_u64(0);
         let inputs: &[(&str, f32)] = &[];
-        let mut ctx =
-            BakeContext::new(44_100, sample_index, 44_100, &mut rng, inputs, None).with_gate(gate_samples);
+        let mut ctx = BakeContext::new(44_100, sample_index, 44_100, &mut rng, inputs, None)
+            .with_gate(gate_samples);
         gate.sample(&mut ctx)
     }
 

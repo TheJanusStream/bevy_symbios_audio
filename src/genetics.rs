@@ -135,8 +135,8 @@ pub(crate) fn mutate_seed<R: Rng>(val: u32, rng: &mut R, rate: f32) -> u32 {
 
 /// Generates a `Genotype` (mutate + crossover) impl for a config struct.
 ///
-/// See module docs for the supported field kinds.  Invoke once per
-/// node-config struct in subsequent phase tickets.
+/// See module docs for the supported field kinds.  Invoked once per
+/// node-config struct in this crate.
 #[macro_export]
 macro_rules! impl_genotype {
     // Entry point

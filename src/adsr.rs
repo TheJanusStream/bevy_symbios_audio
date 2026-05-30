@@ -46,8 +46,8 @@ pub enum AdsrCurve {
     #[default]
     Linear,
     /// Ease-out curve `1 − (1 − α)²`.  Capacitor-charge shape — fast
-    /// initial change, asymptotic approach.  The default if you don't
-    /// know which to pick.
+    /// initial change, asymptotic approach.  Reach for this if you don't
+    /// know which to pick (note the type's `Default` is `Linear`).
     Exponential,
 }
 

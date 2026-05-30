@@ -31,13 +31,13 @@ use crate::oscillator::{SawtoothOsc, SineOsc, SquareOsc, TriangleOsc};
 /// (callers can wrap deserialization in their own validation step).
 ///
 /// Marked `#[non_exhaustive]`: external matches must include a wildcard arm,
-/// so new variants in future phases don't break downstream callers.
+/// so new variants added in future versions don't break downstream callers.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind")]
 #[non_exhaustive]
 pub enum NodeKind {
     /// Outputs 0.0 every sample.  Useful as a pad, a bypassed channel, or a
-    /// schema placeholder before later phases populate richer node types.
+    /// neutral placeholder while a graph is being assembled.
     #[default]
     Silence,
     /// Pure-tone sine oscillator — see [`SineOsc`].
