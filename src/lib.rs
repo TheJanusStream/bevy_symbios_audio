@@ -122,6 +122,12 @@ pub mod oscillator;
 pub mod patch;
 pub mod sequence;
 
+/// Egui editor widgets for the patch schema.  Enabled by the `egui` Cargo
+/// feature; mirrors the sibling `bevy_symbios_texture::ui` convention so a
+/// `bevy_egui` host (Overlands) can embed audio-patch editing.
+#[cfg(feature = "egui")]
+pub mod ui;
+
 pub use adsr::{AdsrCurve, AdsrEnvelope};
 pub use async_gen::{
     AsyncAudioConfig, AudioPatchReady, CacheOrPending, DEFAULT_POOL_THREADS, PendingAudioPatch,

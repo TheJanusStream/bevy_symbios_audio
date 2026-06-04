@@ -1,6 +1,6 @@
 [package]
 name = "bevy_symbios_audio"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Janus"]
 description = "Algorithmic audio generator for Bevy."
@@ -33,6 +33,14 @@ bevy_egui = "0.39"
 [[bin]]
 name = "symbios-audio-cli"
 path = "src/bin/symbios_audio_cli.rs"
+
+[[example]]
+name = "patch_editor"
+required-features = ["egui"]
+
+[[example]]
+name = "sequence_editor"
+required-features = ["egui"]
 
 [[bench]]
 name = "bake"
