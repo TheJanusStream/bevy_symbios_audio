@@ -29,7 +29,7 @@ use bevy_egui::egui::{self, Align2, Color32, Id, Pos2, Rect, Sense, Stroke, Stro
 use symbios_genetics::Genotype;
 
 use crate::patch::AudioPatch;
-use crate::sequence::{Event, Instrument, SequenceRecipe, Track};
+use crate::sequence::{Event, Instrument, PitchMode, SequenceRecipe, Track};
 
 use super::evolve::fresh_rng;
 use super::io::json_io;
@@ -664,6 +664,22 @@ fn event_inspector(
                 .logarithmic(true)
                 .text("pitch \u{00D7}"),
         ));
+        // Pitch mode: tape varispeed (pitch ↔ time coupled) vs. synthesis-
+        // time retune (note keeps its slot regardless of pitch).
+        ui.horizontal(|ui| {
+            ui.label("pitch mode");
+            for (variant, label) in [
+                (PitchMode::Varispeed, "Varispeed"),
+                (PitchMode::TimePreserving, "Time-preserving"),
+            ] {
+                let selected = ev.pitch_mode == variant;
+                if ui.selectable_label(selected, label).clicked() && !selected {
+                    ev.pitch_mode = variant;
+                    res.changed = true;
+                    res.rebake = true;
+                }
+            }
+        });
         res.merge(slider_debounced(
             ui,
             egui::Slider::new(&mut ev.volume, 0.0..=1.0).text("volume"),

@@ -157,10 +157,12 @@ pub use mix::{Gain, Mix};
 pub use mixdown::bake_sequence;
 pub use node::{BakeContext, Node, NodeKind};
 pub use noise::{BrownNoise, PinkNoise, WhiteNoise};
-pub use oscillator::{OscPhase, SawPolarity, SawtoothOsc, SineOsc, SquareOsc, TriangleOsc};
+pub use oscillator::{
+    AntiAlias, OscPhase, SawPolarity, SawtoothOsc, SineOsc, SquareOsc, TriangleOsc,
+};
 pub use patch::{AudioPatch, Connection, GraphError, GraphNode, NodeGraph, NodeId, topo_sort};
 pub use reverb::Reverb;
-pub use sequence::{Event, Instrument, SequenceRecipe, Track};
+pub use sequence::{Event, Instrument, PitchMode, SequenceRecipe, Track};
 
 use bevy::prelude::*;
 

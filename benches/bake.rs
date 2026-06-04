@@ -127,6 +127,7 @@ fn voice_recipe() -> SequenceRecipe {
                     volume: 0.4,
                     gate_beats: 2.0,
                     release_beats: 1.0,
+                    ..Default::default()
                 },
                 Event {
                     time_beats: 4.0,
@@ -135,6 +136,7 @@ fn voice_recipe() -> SequenceRecipe {
                     volume: 0.4,
                     gate_beats: 2.0,
                     release_beats: 1.0,
+                    ..Default::default()
                 },
             ],
         }],

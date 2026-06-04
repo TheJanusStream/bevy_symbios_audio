@@ -27,7 +27,7 @@ use crate::lfo::{Lfo, LfoShape};
 use crate::mix::{Gain, Mix};
 use crate::node::NodeKind;
 use crate::noise::{BrownNoise, PinkNoise, WhiteNoise};
-use crate::oscillator::{SawPolarity, SawtoothOsc, SineOsc, SquareOsc, TriangleOsc};
+use crate::oscillator::{AntiAlias, SawPolarity, SawtoothOsc, SineOsc, SquareOsc, TriangleOsc};
 use crate::reverb::Reverb;
 
 use super::{EditorResponse, bool_instant, drag_debounced, slider_debounced};
@@ -122,6 +122,10 @@ impl_node_editor!(
         slider_log("Freq (Hz)", freq_hz, 20.0..=20_000.0),
         slider("Duty", duty, 0.05..=0.95),
         slider("Amplitude", amplitude, 0.0..=1.0),
+        enum_select("Anti-alias", anti_alias, [
+            ("Naive", AntiAlias::Naive),
+            ("BLEP", AntiAlias::PolyBlep),
+        ]),
     }
 );
 
@@ -134,6 +138,10 @@ impl_node_editor!(
             ("Down", SawPolarity::Down),
         ]),
         slider("Amplitude", amplitude, 0.0..=1.0),
+        enum_select("Anti-alias", anti_alias, [
+            ("Naive", AntiAlias::Naive),
+            ("BLEP", AntiAlias::PolyBlep),
+        ]),
     }
 );
 
@@ -142,6 +150,10 @@ impl_node_editor!(
     fn triangle_osc_editor, TriangleOsc => {
         slider_log("Freq (Hz)", freq_hz, 20.0..=20_000.0),
         slider("Amplitude", amplitude, 0.0..=1.0),
+        enum_select("Anti-alias", anti_alias, [
+            ("Naive", AntiAlias::Naive),
+            ("BLEP", AntiAlias::PolyBlep),
+        ]),
     }
 );
 

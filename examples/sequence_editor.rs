@@ -92,6 +92,7 @@ fn starter_recipe() -> SequenceRecipe {
                     volume: 0.5,
                     gate_beats: 8.0,
                     release_beats: 0.0,
+                    ..Default::default()
                 }],
             },
             Track {
@@ -114,6 +115,7 @@ fn pluck_event(time_beats: f32, pitch_multiplier: f32) -> Event {
         volume: 0.8,
         gate_beats: 0.5,
         release_beats: 0.6,
+        ..Default::default()
     }
 }
 

@@ -81,6 +81,44 @@ pub enum NodeKind {
     Reverb(Reverb),
 }
 
+impl NodeKind {
+    /// Scale this node's *pitch* by `mult` for synthesis-time transposition
+    /// (the engine behind [`crate::sequence::PitchMode::TimePreserving`]).
+    ///
+    /// Only oscillator frequencies are scaled.  LFO rate and filter cutoff
+    /// are musical-time / spectral controls that must **not** track note
+    /// pitch — a vibrato shouldn't speed up when you transpose a note up,
+    /// and a fixed filter colour shouldn't slide with it.  Noise has no
+    /// pitch; combiners and envelopes carry none.
+    ///
+    /// The match is deliberately exhaustive (no wildcard): adding a new
+    /// `NodeKind` forces a pitch decision here at compile time rather than
+    /// silently defaulting to "ignored".
+    pub fn scale_pitch(&mut self, mult: f32) {
+        match self {
+            NodeKind::Sine(o) => o.freq_hz *= mult,
+            NodeKind::Square(o) => o.freq_hz *= mult,
+            NodeKind::Sawtooth(o) => o.freq_hz *= mult,
+            NodeKind::Triangle(o) => o.freq_hz *= mult,
+            // Deliberately pitch-invariant.
+            NodeKind::Silence
+            | NodeKind::WhiteNoise(_)
+            | NodeKind::PinkNoise(_)
+            | NodeKind::BrownNoise(_)
+            | NodeKind::Adsr(_)
+            | NodeKind::BiquadLowpass(_)
+            | NodeKind::BiquadHighpass(_)
+            | NodeKind::BiquadBandpass(_)
+            | NodeKind::Lfo(_)
+            | NodeKind::Mix(_)
+            | NodeKind::Gain(_)
+            | NodeKind::Gate(_)
+            | NodeKind::Chorus(_)
+            | NodeKind::Reverb(_) => {}
+        }
+    }
+}
+
 /// Per-sample context handed to every [`Node::sample`] invocation.
 ///
 /// Carries the patch sample rate, the current sample index, the total
@@ -332,5 +370,43 @@ mod tests {
         let a: u32 = ctx1.rng().random();
         let b: u32 = ctx2.rng().random();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn scale_pitch_retunes_oscillators_only() {
+        use crate::filter::BiquadLowpass;
+        use crate::lfo::Lfo;
+        use crate::oscillator::SineOsc;
+
+        // Oscillator frequency tracks the note pitch.
+        let mut sine = NodeKind::Sine(SineOsc {
+            freq_hz: 100.0,
+            ..Default::default()
+        });
+        sine.scale_pitch(2.0);
+        let NodeKind::Sine(o) = &sine else {
+            panic!("variant changed");
+        };
+        assert_eq!(o.freq_hz, 200.0);
+
+        // LFO rate is musical time, not pitch — must be untouched.
+        let lfo = Lfo::default();
+        let mut lfo_kind = NodeKind::Lfo(lfo.clone());
+        lfo_kind.scale_pitch(2.0);
+        assert_eq!(
+            lfo_kind,
+            NodeKind::Lfo(lfo),
+            "LFO rate must not track pitch"
+        );
+
+        // Filter cutoff is a fixed spectral colour — must be untouched.
+        let lp = BiquadLowpass::default();
+        let mut lp_kind = NodeKind::BiquadLowpass(lp.clone());
+        lp_kind.scale_pitch(2.0);
+        assert_eq!(
+            lp_kind,
+            NodeKind::BiquadLowpass(lp),
+            "filter cutoff must not track pitch"
+        );
     }
 }

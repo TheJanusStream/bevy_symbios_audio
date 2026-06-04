@@ -11,8 +11,8 @@
 use std::collections::BTreeMap;
 
 use bevy_symbios_audio::{
-    AudioPatch, Event, GraphNode, Instrument, NodeGraph, NodeId, NodeKind, SequenceRecipe, SineOsc,
-    SquareOsc, Track, bake_sequence,
+    AudioPatch, Event, GraphNode, Instrument, NodeGraph, NodeId, NodeKind, PitchMode,
+    SequenceRecipe, SineOsc, SquareOsc, Track, bake_sequence,
 };
 
 const SR: u32 = 44_100;
@@ -29,6 +29,7 @@ fn square_instrument() -> Instrument {
                         freq_hz: 440.0,
                         duty: 0.5,
                         amplitude: 1.0,
+                        ..Default::default()
                     }),
                     inputs: BTreeMap::new(),
                 }],
@@ -67,6 +68,7 @@ fn event(time_beats: f32, instrument_id: &str, volume: f32, gate_beats: f32) -> 
         volume,
         gate_beats,
         release_beats: 0.0,
+        ..Default::default()
     }
 }
 
@@ -195,6 +197,7 @@ fn pitch_multiplier_of_two_halves_event_length() {
                 volume: 0.3,
                 gate_beats: 1.0,
                 release_beats: 0.0,
+                ..Default::default()
             }],
         }],
     };
@@ -207,6 +210,105 @@ fn pitch_multiplier_of_two_halves_event_length() {
         master[three_quarters].abs() < 1e-6,
         "expected silence past pitch-shortened event, got {}",
         master[three_quarters]
+    );
+}
+
+/// Index of the last sample louder than `eps` — i.e. how far into the
+/// master the event's audio actually reaches.
+fn last_nonsilent(buf: &[f32], eps: f32) -> usize {
+    buf.iter().rposition(|s| s.abs() > eps).unwrap_or(0)
+}
+
+/// Count zero crossings (sign changes) — a cheap, FFT-free pitch proxy.
+fn zero_crossings(buf: &[f32]) -> usize {
+    buf.windows(2)
+        .filter(|w| (w[0] < 0.0) != (w[1] < 0.0))
+        .count()
+}
+
+fn single_sine_event(pitch_multiplier: f32, pitch_mode: PitchMode) -> SequenceRecipe {
+    // gate 1.0 beat @ 120 BPM = 0.5 s = 22_050 samples; no release.
+    SequenceRecipe {
+        bpm: 120.0,
+        sample_rate: SR,
+        duration_beats: 1.0,
+        loop_start_beats: None,
+        loop_crossfade_beats: 0.0,
+        instruments: vec![sine_instrument()],
+        tracks: vec![Track {
+            events: vec![Event {
+                time_beats: 0.0,
+                instrument_id: "sine".into(),
+                pitch_multiplier,
+                volume: 0.8,
+                gate_beats: 1.0,
+                release_beats: 0.0,
+                pitch_mode,
+            }],
+        }],
+    }
+}
+
+#[test]
+fn time_preserving_pitch_keeps_event_length_independent_of_pitch() {
+    // The headline fix: a pitch-up event under TimePreserving fills its
+    // whole gate slot, whereas the same multiplier under Varispeed (the
+    // resample path) finishes in half the time.
+    let master_len = bake_sequence(&single_sine_event(1.0, PitchMode::Varispeed)).len();
+
+    let varispeed = bake_sequence(&single_sine_event(2.0, PitchMode::Varispeed));
+    let preserving = bake_sequence(&single_sine_event(2.0, PitchMode::TimePreserving));
+
+    let vari_reach = last_nonsilent(&varispeed, 1e-4);
+    let pres_reach = last_nonsilent(&preserving, 1e-4);
+
+    // Varispeed pitch-2.0 finishes around the halfway mark...
+    assert!(
+        vari_reach < master_len * 6 / 10,
+        "varispeed reach {vari_reach} should be ~half of {master_len}"
+    );
+    // ...while TimePreserving runs essentially to the end of the gate.
+    assert!(
+        pres_reach > master_len * 9 / 10,
+        "time-preserving reach {pres_reach} should fill {master_len}"
+    );
+}
+
+#[test]
+fn time_preserving_pitch_actually_raises_the_pitch() {
+    // Retuning the oscillator must double the frequency at pitch 2.0 —
+    // verified by a doubling of zero crossings over an identical-length
+    // buffer (both TimePreserving, same gate).
+    let unison = bake_sequence(&single_sine_event(1.0, PitchMode::TimePreserving));
+    let octave = bake_sequence(&single_sine_event(2.0, PitchMode::TimePreserving));
+    assert_eq!(
+        unison.len(),
+        octave.len(),
+        "lengths must match for a fair count"
+    );
+
+    let base = zero_crossings(&unison) as f32;
+    let up = zero_crossings(&octave) as f32;
+    let ratio = up / base;
+    assert!(
+        (1.8..=2.2).contains(&ratio),
+        "expected ~2x crossings at octave up, got {ratio} ({base} → {up})"
+    );
+}
+
+#[test]
+fn time_preserving_non_positive_pitch_is_skipped_not_panicked() {
+    // A nonsense pitch must be dropped (like resample_linear's guard), not
+    // crash the mixdown or emit garbage.
+    let recipe = single_sine_event(0.0, PitchMode::TimePreserving);
+    let master = bake_sequence(&recipe);
+    assert_eq!(
+        master.len(),
+        bake_sequence(&single_sine_event(1.0, PitchMode::Varispeed)).len()
+    );
+    assert!(
+        master.iter().all(|s| s.abs() < 1e-6),
+        "skipped event should leave the master silent"
     );
 }
 
@@ -306,6 +408,7 @@ fn invalid_instrument_graph_is_skipped_not_panicked() {
                         freq_hz: 440.0,
                         duty: 0.5,
                         amplitude: 1.0,
+                        ..Default::default()
                     }),
                     inputs: BTreeMap::new(),
                 }],

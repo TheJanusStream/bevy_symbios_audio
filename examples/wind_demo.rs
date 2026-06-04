@@ -154,6 +154,7 @@ fn main() {
                     volume: 0.6,
                     gate_beats: 8.0,
                     release_beats: 0.0,
+                    ..Default::default()
                 }],
             },
             // Voice swells at the start and mid-loop, each gated for two
@@ -169,6 +170,7 @@ fn main() {
                         volume: 0.3,
                         gate_beats: 2.0,
                         release_beats: 1.0,
+                        ..Default::default()
                     },
                     Event {
                         time_beats: 4.0,
@@ -177,6 +179,7 @@ fn main() {
                         volume: 0.3,
                         gate_beats: 2.0,
                         release_beats: 1.0,
+                        ..Default::default()
                     },
                 ],
             },

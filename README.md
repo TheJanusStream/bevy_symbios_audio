@@ -223,13 +223,22 @@ produces.
 
 - **Mono only.**  Both `bake` and `bake_sequence` produce a single
   channel.  Stereo / multichannel routing is out of scope.
-- **Naïve oscillators.**  Square / saw / triangle don't band-limit;
-  the audible aliasing is part of the aesthetic.  Add PolyBLEP /
-  BLIT variants as new `NodeKind`s if you need them.
-- **No time-preserving pitch shift.**  Sequencer events shift pitch
-  by resampling, so pitch-up plays shorter than its gate and
-  pitch-down hangs past it.  PSOLA / phase vocoder paths are not
-  implemented.
+- **Oscillator aliasing is opt-out.**  Square / saw / triangle default
+  to naïve generators (`anti_alias: Naive`) — the audible grit is part of
+  the aesthetic.  Set `anti_alias: PolyBlep` on any of them to band-limit
+  the discontinuities (PolyBLEP for square/saw value steps, polyBLAMP for
+  triangle slope corners); it stays pure-arithmetic deterministic and
+  tracks per-sample `"freq"` modulation.  Residual aliasing remains at
+  extreme high pitches; a wavetable/mipmap path would go further.
+- **Pitch shift is per-event.**  Each sequencer `Event` picks a
+  `pitch_mode`: `Varispeed` (the default) resamples — pitch and time are
+  coupled, so pitch-up plays shorter than its gate and pitch-down hangs
+  past it (tape-style, handy for SFX); `TimePreserving` retunes the
+  instrument's oscillators at synthesis time and bakes the event at its
+  true length, so pitch and duration are independent with no resampling
+  artifacts.  Because retuning happens at synthesis, no PSOLA / phase
+  vocoder is needed — but it only re-pitches *oscillators* (not sampled
+  or noise-based material), and LFO/filter settings stay fixed.
 - **Buffer ≤ ~6 hours.**  `data_size` in the WAV header is a 32-bit
   field, capping ~1.07 G samples (≈ 6.7 h @ 44.1 kHz).  `samples_to_wav_bytes`
   now panics rather than emitting a silently-wrapped (corrupt) header, so

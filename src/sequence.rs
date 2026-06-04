@@ -21,6 +21,21 @@
 //! 1.0 plays the instrument at its native pitch; 2.0 is an octave up;
 //! 0.97 is a 3% detune.  Quantised semitone playback is a
 //! caller-side convention: `2.0_f32.powf(semitones / 12.0)`.
+//!
+//! # Pitch vs. time ([`PitchMode`])
+//!
+//! `Event::pitch_mode` chooses *how* the multiplier is realised:
+//!
+//! - [`PitchMode::Varispeed`] (the default) resamples the native bake —
+//!   tape-style, so pitch and duration are coupled: a pitch-up finishes
+//!   before its gate window and a pitch-down hangs past it.  Cheap, shares
+//!   one bake across every pitch of an instrument, and the right call for
+//!   SFX where the speed-up *is* the effect.
+//! - [`PitchMode::TimePreserving`] retunes the instrument's oscillators at
+//!   synthesis time and bakes the event at its true `gate + release`
+//!   length, so pitch and duration are independent — the note fills its
+//!   slot regardless of transposition, with no resampling artifacts.  Each
+//!   distinct pitch is its own bake (see [`crate::mixdown::bake_sequence`]).
 
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -99,6 +114,23 @@ pub struct Track {
     pub events: Vec<Event>,
 }
 
+/// How an [`Event`]'s `pitch_multiplier` is realised at mixdown time.
+///
+/// See the module-level "Pitch vs. time" section for the trade-off.  The
+/// default is [`PitchMode::Varispeed`] so recipes authored before this
+/// field existed (no `pitch_mode` on the wire) bake byte-for-byte as
+/// before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PitchMode {
+    /// Resample the native bake — pitch and duration are coupled
+    /// (tape varispeed).  The historical behaviour.
+    #[default]
+    Varispeed,
+    /// Retune the oscillators at synthesis time and bake at the event's
+    /// true `gate + release` length — pitch and duration are independent.
+    TimePreserving,
+}
+
 /// One scheduled note / sound / gust on a track.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Event {
@@ -129,6 +161,12 @@ pub struct Event {
     /// gate-driven release can leave this at `0.0`.
     #[serde(default)]
     pub release_beats: f32,
+    /// How `pitch_multiplier` is realised — resample (default) or
+    /// synthesis-time retune.  See [`PitchMode`].  `#[serde(default)]`
+    /// keeps pre-existing recipes (no `pitch_mode` key) on the historical
+    /// resample path.
+    #[serde(default)]
+    pub pitch_mode: PitchMode,
 }
 
 impl Default for Event {
@@ -140,6 +178,7 @@ impl Default for Event {
             volume: 1.0,
             gate_beats: 1.0,
             release_beats: 0.0,
+            pitch_mode: PitchMode::Varispeed,
         }
     }
 }
@@ -249,6 +288,7 @@ mod tests {
                             volume: 0.6,
                             gate_beats: 8.0,
                             release_beats: 0.0,
+                            ..Default::default()
                         },
                         Event {
                             time_beats: 4.0,
@@ -257,6 +297,7 @@ mod tests {
                             volume: 0.4,
                             gate_beats: 4.0,
                             release_beats: 0.0,
+                            ..Default::default()
                         },
                     ],
                 },
@@ -268,6 +309,7 @@ mod tests {
                         volume: 0.8,
                         gate_beats: 0.25,
                         release_beats: 0.0,
+                        ..Default::default()
                     }],
                 },
             ],
@@ -292,6 +334,24 @@ mod tests {
         assert_eq!(e.pitch_multiplier, 1.0);
         assert_eq!(e.volume, 1.0);
         assert_eq!(e.time_beats, 0.0);
+        // Default pitch mode is the historical resample path so existing
+        // recipes bake unchanged.
+        assert_eq!(e.pitch_mode, PitchMode::Varispeed);
+    }
+
+    #[test]
+    fn event_without_pitch_mode_field_deserializes_to_varispeed() {
+        // A recipe authored before pitch_mode existed has no such key;
+        // #[serde(default)] must fill Varispeed rather than erroring.
+        let json = r#"{
+            "time_beats": 0.0,
+            "instrument_id": "x",
+            "pitch_multiplier": 1.0,
+            "volume": 1.0,
+            "gate_beats": 1.0
+        }"#;
+        let e: Event = serde_json::from_str(json).unwrap();
+        assert_eq!(e.pitch_mode, PitchMode::Varispeed);
     }
 
     // --- Genotype ----------------------------------------------------------

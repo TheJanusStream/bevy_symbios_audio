@@ -30,10 +30,11 @@
 //!    buffer is provisioned with an extra `loop_crossfade_beats` of
 //!    tail so late event releases that spill past `duration_beats`
 //!    can be folded back into the loop start.
-//! 3. For each event: linear-interpolation resample by
-//!    `pitch_multiplier` (so 2.0 plays an octave higher and finishes
-//!    in half the wall-clock time), scale by `volume`, sum into the
-//!    master starting at `time_beats × beat_secs × sample_rate`.
+//! 3. For each event: apply its `pitch_multiplier` per its
+//!    [`PitchMode`] (Varispeed → linear-interpolation resample of the
+//!    native bake; TimePreserving → use the already-retuned bake as-is),
+//!    scale by `volume`, sum into the master starting at
+//!    `time_beats × beat_secs × sample_rate`.
 //! 4. `master[i] = master[i].tanh()` — saturates roughly linearly up
 //!    to ±0.5 then smoothly compresses, which sounds nicer than a
 //!    hard `clamp` and avoids the harmonic spray a true clipping
@@ -46,11 +47,21 @@
 //!
 //! # Pitch and time
 //!
-//! Resampling-based pitch shift means a pitch-up event finishes
-//! sooner than its gate length and a pitch-down event hangs past
-//! it.  True time-preserving pitch shift (PSOLA, phase vocoder) is
-//! out of scope for now — flag the limitation here and revisit
-//! if users' sound design surfaces a need.
+//! Each event's [`crate::sequence::PitchMode`] selects how its
+//! `pitch_multiplier` is applied:
+//!
+//! - [`PitchMode::Varispeed`] (default) resamples the native bake, so a
+//!   pitch-up event finishes sooner than its gate length and a pitch-down
+//!   event hangs past it — tape-style, pitch and time coupled.  Every
+//!   pitch of an instrument shares one native bake.
+//! - [`PitchMode::TimePreserving`] retunes the instrument's oscillators
+//!   (via [`crate::node::NodeKind::scale_pitch`]) and bakes the event at
+//!   its true `gate + release` length, so no resampling is needed: pitch
+//!   and time are independent and there are no resampling artifacts.  This
+//!   is a synthesizer retuning its oscillators, not a sampler stretching a
+//!   recording — strictly higher quality than PSOLA / phase-vocoder
+//!   stretching of the wrong-length bake would be.  Each distinct pitch is
+//!   its own bake (the bake cache keys on it).
 //!
 //! # Dangling references and bad graphs
 //!
@@ -65,7 +76,7 @@ use std::collections::HashMap;
 use crate::audio_source::MAX_WAV_SAMPLES;
 use crate::bake::bake_inner;
 use crate::patch::AudioPatch;
-use crate::sequence::{Event, SequenceRecipe};
+use crate::sequence::{Event, PitchMode, SequenceRecipe};
 
 /// Bake a [`SequenceRecipe`] into a mono `Vec<f32>` mixdown buffer.
 ///
@@ -107,10 +118,13 @@ pub fn bake_sequence(recipe: &SequenceRecipe) -> Vec<f32> {
         .map(|i| (i.id.as_str(), &i.patch))
         .collect();
 
-    // Bake cache keyed by (instrument_id, gate, release) bit patterns so
-    // two events with identical timing reuse the source buffer; only
-    // pitch / volume / offset are per-event.
-    let mut bake_cache: HashMap<(String, u32, u32), Vec<f32>> = HashMap::new();
+    // Bake cache keyed by (instrument_id, gate, release, pitch) bit
+    // patterns so two events with identical timing reuse the source buffer.
+    // The pitch slot is a fixed `1.0` sentinel for Varispeed events (they
+    // bake once at native pitch and resample per event, sharing one bake
+    // across every pitch) and the actual multiplier for TimePreserving ones
+    // (each pitch is a distinct retuned bake).
+    let mut bake_cache: HashMap<(String, u32, u32, u32), Vec<f32>> = HashMap::new();
 
     for track in &recipe.tracks {
         for event in &track.events {
@@ -131,9 +145,33 @@ pub fn bake_sequence(recipe: &SequenceRecipe) -> Vec<f32> {
             let gate_samples = duration_to_samples(event.gate_beats, beat_secs, sr) as u64;
             let total_beats = event.gate_beats.max(0.0) + event.release_beats.max(0.0);
             let total_samples = duration_to_samples(total_beats, beat_secs, sr) as u64;
+            // TimePreserving retunes the oscillators and bakes at the true
+            // gate+release length (no later resample); Varispeed bakes the
+            // instrument at native pitch and resamples in the sum pass.  A
+            // non-positive / non-finite TimePreserving pitch is nonsense —
+            // skip the bake (the sum pass then finds no cache entry and
+            // skips the event too), mirroring resample_linear's guard.
+            let result = match event.pitch_mode {
+                PitchMode::Varispeed => {
+                    bake_inner(patch, sr, total_samples, Some(gate_samples), None)
+                }
+                PitchMode::TimePreserving => {
+                    if !event.pitch_multiplier.is_finite() || event.pitch_multiplier <= 0.0 {
+                        bevy::log::warn!(
+                            "mixdown: time-preserving event on '{}' has non-positive pitch {}; \
+                             skipping",
+                            event.instrument_id,
+                            event.pitch_multiplier
+                        );
+                        continue;
+                    }
+                    let retuned = retuned_patch(patch, event.pitch_multiplier);
+                    bake_inner(&retuned, sr, total_samples, Some(gate_samples), None)
+                }
+            };
             // A malformed instrument graph shouldn't take down the whole
             // mixdown — warn and skip it, like an unknown instrument ref.
-            let buf = match bake_inner(patch, sr, total_samples, Some(gate_samples), None) {
+            let buf = match result {
                 Ok(buf) => buf,
                 Err(err) => {
                     bevy::log::warn!(
@@ -159,21 +197,32 @@ pub fn bake_sequence(recipe: &SequenceRecipe) -> Vec<f32> {
             }
             let start = (f64::from(event.time_beats) * f64::from(beat_secs) * f64::from(sr)).round()
                 as usize;
-            // Resample only as many samples as can land in the master from
-            // `start`: anything past the end is discarded by write_into anyway,
-            // and bounding here stops a subnormal pitch_multiplier from
-            // inflating the output length to usize::MAX (capacity-overflow
-            // panic / OOM) before a single sample is written.
             let max_out = master.len().saturating_sub(start);
             if max_out == 0 {
                 continue;
             }
-            let resampled = resample_linear(source, event.pitch_multiplier, max_out);
-            if resampled.is_empty() {
-                continue;
-            }
             let volume = event.volume.clamp(0.0, 1.0);
-            write_into(&mut master, start, &resampled, volume);
+            match event.pitch_mode {
+                PitchMode::Varispeed => {
+                    // Resample only as many samples as can land in the master
+                    // from `start`: anything past the end is discarded by
+                    // write_into anyway, and bounding here stops a subnormal
+                    // pitch_multiplier from inflating the output length to
+                    // usize::MAX (capacity-overflow panic / OOM) before a
+                    // single sample is written.
+                    let resampled = resample_linear(source, event.pitch_multiplier, max_out);
+                    if resampled.is_empty() {
+                        continue;
+                    }
+                    write_into(&mut master, start, &resampled, volume);
+                }
+                PitchMode::TimePreserving => {
+                    // The source was baked at the target pitch and the event's
+                    // full gate+release length — no resampling.  write_into
+                    // clips whatever runs past the master end.
+                    write_into(&mut master, start, source, volume);
+                }
+            }
         }
     }
 
@@ -276,12 +325,34 @@ fn duration_to_samples(beats: f32, beat_secs: f32, sample_rate: u32) -> usize {
 }
 
 #[inline]
-fn bake_key(event: &Event) -> (String, u32, u32) {
+fn bake_key(event: &Event) -> (String, u32, u32, u32) {
+    // Varispeed bakes once at native pitch (all its pitches share one bake),
+    // so it uses a fixed `1.0` sentinel; TimePreserving keys on the actual
+    // multiplier so each retuned pitch is cached separately.  A
+    // TimePreserving event at exactly 1.0 collides with the sentinel, which
+    // is harmless: retuning by 1.0 is the native bake either way.
+    let pitch_bits = match event.pitch_mode {
+        PitchMode::Varispeed => 1.0_f32.to_bits(),
+        PitchMode::TimePreserving => event.pitch_multiplier.to_bits(),
+    };
     (
         event.instrument_id.clone(),
         event.gate_beats.to_bits(),
         event.release_beats.to_bits(),
+        pitch_bits,
     )
+}
+
+/// Clone `patch` with every oscillator's pitch scaled by `mult` — the
+/// synthesis-time transposition behind [`PitchMode::TimePreserving`].  See
+/// [`crate::node::NodeKind::scale_pitch`] for which nodes are (and are not)
+/// pitched.
+fn retuned_patch(patch: &AudioPatch, mult: f32) -> AudioPatch {
+    let mut retuned = patch.clone();
+    for node in &mut retuned.graph.nodes {
+        node.kind.scale_pitch(mult);
+    }
+    retuned
 }
 
 /// Linear-interpolation resampler.  Output length is approximately

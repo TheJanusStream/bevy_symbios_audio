@@ -14,8 +14,8 @@
 use std::collections::BTreeMap;
 
 use bevy_symbios_audio::{
-    AudioPatch, GraphNode, NodeGraph, NodeId, NodeKind, SawPolarity, SawtoothOsc, SineOsc,
-    SquareOsc, TriangleOsc, bake,
+    AntiAlias, AudioPatch, GraphNode, NodeGraph, NodeId, NodeKind, SawPolarity, SawtoothOsc,
+    SineOsc, SquareOsc, TriangleOsc, bake,
 };
 
 // --- FFT helper -------------------------------------------------------------
@@ -179,6 +179,7 @@ fn square_at_440hz_peaks_at_bin_440() {
         freq_hz: 440.0,
         duty: 0.5,
         amplitude: 1.0,
+        anti_alias: AntiAlias::Naive,
     };
     let p = patch_with(NodeKind::Square(osc));
     let buf = bake(&p, SR, 1.0);
@@ -191,6 +192,7 @@ fn sawtooth_up_at_440hz_peaks_at_bin_440() {
         freq_hz: 440.0,
         polarity: SawPolarity::Up,
         amplitude: 1.0,
+        anti_alias: AntiAlias::Naive,
     };
     let p = patch_with(NodeKind::Sawtooth(osc));
     let buf = bake(&p, SR, 1.0);
@@ -203,6 +205,7 @@ fn sawtooth_down_at_440hz_peaks_at_bin_440() {
         freq_hz: 440.0,
         polarity: SawPolarity::Down,
         amplitude: 1.0,
+        anti_alias: AntiAlias::Naive,
     };
     let p = patch_with(NodeKind::Sawtooth(osc));
     let buf = bake(&p, SR, 1.0);
@@ -214,6 +217,7 @@ fn triangle_at_440hz_peaks_at_bin_440() {
     let osc = TriangleOsc {
         freq_hz: 440.0,
         amplitude: 1.0,
+        anti_alias: AntiAlias::Naive,
     };
     let p = patch_with(NodeKind::Triangle(osc));
     let buf = bake(&p, SR, 1.0);
@@ -232,6 +236,104 @@ fn sine_at_220hz_peaks_at_bin_220() {
     let p = patch_with(NodeKind::Sine(osc));
     let buf = bake(&p, SR, 1.0);
     assert_eq!(dominant_bin(&buf), 220);
+}
+
+// --- Anti-aliasing acceptance ----------------------------------------------
+
+/// Forward-FFT magnitude spectrum over the lower (sub-Nyquist) half.
+fn magnitude_spectrum(samples: &[f32]) -> Vec<f32> {
+    let mut buf: Vec<Complex> = samples.iter().copied().map(Complex::from_real).collect();
+    let n = samples.len().next_power_of_two();
+    buf.resize(n, Complex::ZERO);
+    fft(&mut buf);
+    buf.iter().take(n / 2).map(|c| c.magnitude()).collect()
+}
+
+/// Sum of spectral magnitude in bins that are *not* a harmonic of
+/// `fund_bin` (further than `guard` bins from the nearest multiple) — the
+/// inharmonic, folded-back energy a band-limited oscillator should not
+/// produce.  `fund_bin` equals the fundamental in Hz because `SR` is a
+/// power of two over a 1 s bake, so bin spacing is exactly 1 Hz.
+fn aliased_energy(spectrum: &[f32], fund_bin: usize, guard: usize) -> f32 {
+    spectrum
+        .iter()
+        .enumerate()
+        .skip(1) // skip DC
+        .filter(|(k, _)| {
+            let rem = k % fund_bin;
+            let dist = rem.min(fund_bin - rem); // distance to nearest harmonic
+            dist > guard
+        })
+        .map(|(_, m)| *m)
+        .sum()
+}
+
+fn aliased_energy_of(kind_naive: NodeKind, kind_blep: NodeKind, fund: usize) -> (f32, f32) {
+    let naive = bake(&patch_with(kind_naive), SR, 1.0);
+    let blep = bake(&patch_with(kind_blep), SR, 1.0);
+    // Both must still pin the fundamental — band-limiting kills aliases, not
+    // the tone itself.
+    assert_eq!(dominant_bin(&naive), fund);
+    assert_eq!(dominant_bin(&blep), fund);
+    (
+        aliased_energy(&magnitude_spectrum(&naive), fund, 1),
+        aliased_energy(&magnitude_spectrum(&blep), fund, 1),
+    )
+}
+
+#[test]
+fn polyblep_sawtooth_cuts_aliasing() {
+    // A 3 kHz saw at 32_768 Hz folds its 6th harmonic (18 kHz) and up back
+    // below Nyquist as inharmonic alias tones.  PolyBLEP must slash the
+    // energy landing in those non-harmonic bins.
+    let saw = |aa| {
+        NodeKind::Sawtooth(SawtoothOsc {
+            freq_hz: 3000.0,
+            polarity: SawPolarity::Up,
+            amplitude: 1.0,
+            anti_alias: aa,
+        })
+    };
+    let (naive, blep) = aliased_energy_of(saw(AntiAlias::Naive), saw(AntiAlias::PolyBlep), 3000);
+    assert!(
+        blep < naive * 0.5,
+        "PolyBLEP saw aliasing {blep} not < half of naive {naive}"
+    );
+}
+
+#[test]
+fn polyblep_square_cuts_aliasing() {
+    let sq = |aa| {
+        NodeKind::Square(SquareOsc {
+            freq_hz: 3000.0,
+            duty: 0.5,
+            amplitude: 1.0,
+            anti_alias: aa,
+        })
+    };
+    let (naive, blep) = aliased_energy_of(sq(AntiAlias::Naive), sq(AntiAlias::PolyBlep), 3000);
+    assert!(
+        blep < naive * 0.5,
+        "PolyBLEP square aliasing {blep} not < half of naive {naive}"
+    );
+}
+
+#[test]
+fn polyblamp_triangle_cuts_aliasing() {
+    // Triangle harmonics fall off as 1/n², so its aliasing is gentler than
+    // saw/square — but polyBLAMP must still measurably reduce it.
+    let tri = |aa| {
+        NodeKind::Triangle(TriangleOsc {
+            freq_hz: 3000.0,
+            amplitude: 1.0,
+            anti_alias: aa,
+        })
+    };
+    let (naive, blep) = aliased_energy_of(tri(AntiAlias::Naive), tri(AntiAlias::PolyBlep), 3000);
+    assert!(
+        blep < naive * 0.75,
+        "polyBLAMP triangle aliasing {blep} not < 0.75 × naive {naive}"
+    );
 }
 
 #[test]

@@ -100,6 +100,7 @@ fn realistic_recipe() -> SequenceRecipe {
                         volume: 0.7,
                         gate_beats: 16.0,
                         release_beats: 0.0,
+                        ..Default::default()
                     },
                     Event {
                         time_beats: 8.0,
@@ -108,6 +109,7 @@ fn realistic_recipe() -> SequenceRecipe {
                         volume: 0.5,
                         gate_beats: 8.0,
                         release_beats: 0.0,
+                        ..Default::default()
                     },
                 ],
             },
@@ -121,6 +123,7 @@ fn realistic_recipe() -> SequenceRecipe {
                         volume: 0.9,
                         gate_beats: 1.0,
                         release_beats: 0.0,
+                        ..Default::default()
                     },
                     Event {
                         time_beats: 4.0,
@@ -129,6 +132,7 @@ fn realistic_recipe() -> SequenceRecipe {
                         volume: 0.7,
                         gate_beats: 1.0,
                         release_beats: 0.0,
+                        ..Default::default()
                     },
                 ],
             },

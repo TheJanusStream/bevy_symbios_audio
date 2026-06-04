@@ -95,6 +95,7 @@ fn looping_ringing_recipe(loop_crossfade_beats: f32) -> SequenceRecipe {
                     volume: 0.5,
                     gate_beats: 0.5,
                     release_beats: 0.5,
+                    ..Default::default()
                 },
                 // Trailing event whose ring-out extends past
                 // duration_beats — the gate closes at beat 3.75 and the
@@ -108,6 +109,7 @@ fn looping_ringing_recipe(loop_crossfade_beats: f32) -> SequenceRecipe {
                     volume: 0.5,
                     gate_beats: 0.25,
                     release_beats: 0.75,
+                    ..Default::default()
                 },
             ],
         }],

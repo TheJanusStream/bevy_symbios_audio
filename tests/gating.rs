@@ -91,6 +91,7 @@ fn one_note_recipe(gate_beats: f32, release_beats: f32) -> SequenceRecipe {
                 volume: 1.0,
                 gate_beats,
                 release_beats,
+                ..Default::default()
             }],
         }],
     }
