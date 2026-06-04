@@ -44,6 +44,8 @@ use crate::oscillator::SineOsc;
 use crate::patch::{AudioPatch, Connection, GraphNode, NodeId, topo_sort};
 
 use super::EditorResponse;
+use super::evolve::{fresh_rng, mutate_node_kind, mutate_patch, randomize_seed};
+use super::io::json_io;
 use super::node::{node_kind_editor, node_kind_label};
 
 const NODE_WIDTH: f32 = 210.0;
@@ -67,6 +69,10 @@ pub struct PatchEditorState {
     scene_rect: Rect,
     /// Selected node (delete target + highlight).
     selected: Option<NodeId>,
+    /// Mutation rate for the "🎲 Mutate" buttons.
+    mutate_rate: f32,
+    /// Buffer + last error for the JSON import/export section.
+    json: super::JsonIoState,
 }
 
 impl Default for PatchEditorState {
@@ -75,6 +81,8 @@ impl Default for PatchEditorState {
             positions: HashMap::new(),
             scene_rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0)),
             selected: None,
+            mutate_rate: 0.3,
+            json: super::JsonIoState::default(),
         }
     }
 }
@@ -216,6 +224,7 @@ pub fn audio_patch_canvas(
 ) -> EditorResponse {
     let mut res = EditorResponse::NONE;
     res.merge(toolbar(ui, patch, state));
+    res.merge(json_io(ui, patch, &mut state.json, id.with("patch_json")));
     state.ensure_layout(patch);
 
     let mut scene_rect = state.scene_rect;
@@ -298,6 +307,28 @@ fn toolbar(
         }
     });
 
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .button("\u{1F3B2} Mutate")
+            .on_hover_text("Nudge every node's parameters via symbios-genetics")
+            .clicked()
+        {
+            mutate_patch(patch, &mut fresh_rng(), state.mutate_rate);
+            res.changed = true;
+            res.rebake = true;
+        }
+        ui.add(egui::Slider::new(&mut state.mutate_rate, 0.0..=1.0).text("rate"));
+        if ui
+            .button(format!("\u{1F3B2} seed {}", patch.seed))
+            .on_hover_text("Reroll the patch seed (re-randomises noise / random LFOs)")
+            .clicked()
+        {
+            randomize_seed(patch, &mut fresh_rng());
+            res.changed = true;
+            res.rebake = true;
+        }
+    });
+
     match topo_sort(&patch.graph) {
         Ok(order) => {
             ui.colored_label(
@@ -329,6 +360,7 @@ fn canvas_contents(
 
     let output_id = patch.graph.output;
     let selected = state.selected;
+    let mutate_rate = state.mutate_rate;
 
     // Reserve a shape slot up front; we backfill it with the wires after node
     // rects are known, so wires render *behind* the node boxes.
@@ -365,18 +397,29 @@ fn canvas_contents(
             .stroke(stroke);
         let fr = frame.show(&mut child, |ui| {
             ui.set_width(NODE_WIDTH);
-            // Title bar: drag to move, click to select.
-            let title = format!("#{}  {}", nid.0, node_kind_label(&node.kind));
-            let title_resp = ui.add(
-                egui::Label::new(egui::RichText::new(title).strong())
-                    .sense(Sense::click_and_drag()),
-            );
-            if title_resp.dragged() {
-                actions.push(Action::Move(nid, title_resp.drag_delta()));
-            }
-            if title_resp.clicked() {
-                actions.push(Action::Select(nid));
-            }
+            // Title bar: drag to move, click to select, 🎲 to mutate this node.
+            ui.horizontal(|ui| {
+                let title = format!("#{}  {}", nid.0, node_kind_label(&node.kind));
+                let title_resp = ui.add(
+                    egui::Label::new(egui::RichText::new(title).strong())
+                        .sense(Sense::click_and_drag()),
+                );
+                if title_resp.dragged() {
+                    actions.push(Action::Move(nid, title_resp.drag_delta()));
+                }
+                if title_resp.clicked() {
+                    actions.push(Action::Select(nid));
+                }
+                if ui
+                    .small_button("\u{1F3B2}")
+                    .on_hover_text("Mutate this node")
+                    .clicked()
+                {
+                    mutate_node_kind(&mut node.kind, &mut fresh_rng(), mutate_rate);
+                    res.changed = true;
+                    res.rebake = true;
+                }
+            });
             ui.separator();
             res.merge(node_kind_editor(ui, &mut node.kind, Id::new(("nk", nid.0))));
             res.merge(connection_editor(ui, node));

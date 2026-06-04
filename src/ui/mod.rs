@@ -23,6 +23,9 @@
 //!   instruments, draggable track/event lanes) for a whole
 //!   [`crate::sequence::SequenceRecipe`], with [`sequence::active_instrument_canvas`]
 //!   opening any instrument's patch in the [`graph`] canvas.
+//! - [`evolve`] / [`io`] — cross-cutting polish wired into the editors above:
+//!   `symbios_genetics`-backed "🎲 Mutate" / reseed helpers ([`evolve`]) and a
+//!   reusable JSON copy/paste section ([`io::json_io`]).
 //!
 //! Every editor composes the same [`EditorResponse`] contract.
 //!
@@ -46,12 +49,16 @@
 
 use bevy_egui::egui;
 
+pub mod evolve;
 pub mod graph;
+pub mod io;
 pub mod node;
 pub mod preview;
 pub mod sequence;
 
+pub use evolve::{mutate_node_kind, mutate_patch, randomize_seed};
 pub use graph::{PatchEditorState, audio_patch_canvas};
+pub use io::{JsonIoState, json_io};
 pub use node::{
     adsr_envelope_editor, biquad_bandpass_editor, biquad_highpass_editor, biquad_lowpass_editor,
     brown_noise_editor, gain_editor, gate_editor, lfo_editor, mix_editor, node_kind_body,

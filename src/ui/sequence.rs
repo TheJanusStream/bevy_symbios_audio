@@ -26,11 +26,16 @@ use std::collections::HashMap;
 
 use bevy_egui::egui::{self, Align2, Color32, Id, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
+use symbios_genetics::Genotype;
+
 use crate::patch::AudioPatch;
 use crate::sequence::{Event, Instrument, SequenceRecipe, Track};
 
+use super::evolve::fresh_rng;
+use super::io::json_io;
 use super::{
-    EditorResponse, PatchEditorState, audio_patch_canvas, drag_debounced, slider_debounced,
+    EditorResponse, JsonIoState, PatchEditorState, audio_patch_canvas, drag_debounced,
+    slider_debounced,
 };
 
 const RULER_H: f32 = 22.0;
@@ -66,6 +71,10 @@ pub struct SequenceEditorState {
     px_per_beat: f32,
     /// Move-vs-resize for the active block drag.
     drag_mode: DragMode,
+    /// Mutation rate for the "🎲 Mutate recipe" button.
+    mutate_rate: f32,
+    /// Buffer + last error for the JSON import/export section.
+    json: JsonIoState,
 }
 
 impl Default for SequenceEditorState {
@@ -76,6 +85,8 @@ impl Default for SequenceEditorState {
             selected_event: None,
             px_per_beat: DEFAULT_PPB,
             drag_mode: DragMode::Move,
+            mutate_rate: 0.3,
+            json: JsonIoState::default(),
         }
     }
 }
@@ -121,6 +132,20 @@ pub fn sequence_recipe_editor(
     egui::CollapsingHeader::new("Transport")
         .default_open(true)
         .show(ui, |ui| res.merge(transport(ui, recipe)));
+
+    ui.horizontal(|ui| {
+        if ui
+            .button("\u{1F3B2} Mutate recipe")
+            .on_hover_text("Nudge BPM and event volumes via symbios-genetics")
+            .clicked()
+        {
+            recipe.mutate(&mut fresh_rng(), state.mutate_rate);
+            res.changed = true;
+            res.rebake = true;
+        }
+        ui.add(egui::Slider::new(&mut state.mutate_rate, 0.0..=1.0).text("rate"));
+    });
+    res.merge(json_io(ui, recipe, &mut state.json, id.with("recipe_json")));
 
     ui.separator();
     res.merge(instruments_panel(ui, recipe, state));
