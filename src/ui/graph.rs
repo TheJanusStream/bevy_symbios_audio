@@ -129,6 +129,7 @@ fn input_ports(kind: &NodeKind) -> &'static [&'static str] {
         NodeKind::BiquadBandpass(_) => &["in", "center_hz", "q"],
         NodeKind::Mix(_) => &["a", "b", "c", "d"],
         NodeKind::Gain(_) => &["in", "gain"],
+        NodeKind::Chorus(_) | NodeKind::Reverb(_) => &["in"],
         NodeKind::Silence
         | NodeKind::WhiteNoise(_)
         | NodeKind::PinkNoise(_)

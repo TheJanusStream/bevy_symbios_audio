@@ -17,12 +17,14 @@ use rand_chacha::ChaCha8Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::adsr::AdsrEnvelope;
+use crate::chorus::Chorus;
 use crate::filter::{BiquadBandpass, BiquadHighpass, BiquadLowpass};
 use crate::gate::Gate;
 use crate::lfo::Lfo;
 use crate::mix::{Gain, Mix};
 use crate::noise::{BrownNoise, PinkNoise, WhiteNoise};
 use crate::oscillator::{SawtoothOsc, SineOsc, SquareOsc, TriangleOsc};
+use crate::reverb::Reverb;
 
 /// Closed enum of every built-in node kind that can appear in a patch.
 ///
@@ -73,6 +75,10 @@ pub enum NodeKind {
     /// Note-gate signal driven by the sequencer's gate window.  See
     /// [`Gate`].
     Gate(Gate),
+    /// Internally-modulated chorus (delay-line) effect — see [`Chorus`].
+    Chorus(Chorus),
+    /// Mono Freeverb-style algorithmic reverb — see [`Reverb`].
+    Reverb(Reverb),
 }
 
 /// Per-sample context handed to every [`Node::sample`] invocation.
@@ -247,6 +253,8 @@ impl Node for NodeKind {
             NodeKind::Mix(m) => m.sample(ctx),
             NodeKind::Gain(g) => g.sample(ctx),
             NodeKind::Gate(g) => g.sample(ctx),
+            NodeKind::Chorus(c) => c.sample(ctx),
+            NodeKind::Reverb(r) => r.sample(ctx),
         }
     }
 
@@ -263,6 +271,8 @@ impl Node for NodeKind {
             NodeKind::BiquadHighpass(f) => f.init_state(),
             NodeKind::BiquadBandpass(f) => f.init_state(),
             NodeKind::Lfo(l) => l.init_state(),
+            NodeKind::Chorus(c) => c.init_state(),
+            NodeKind::Reverb(r) => r.init_state(),
             _ => None,
         }
     }

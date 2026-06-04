@@ -3,9 +3,10 @@
 //! A DAG-of-nodes synth (sine / square / sawtooth / triangle oscillators,
 //! white / pink / brown noise, ADSR envelopes, biquad LP/HP/BP filters,
 //! LFOs, [`Mix`] / [`Gain`] (VCA) combiners, a sequencer-driven [`Gate`],
-//! and cross-node modulation routing) producing deterministic `Vec<f32>`
-//! buffers off the main thread via a private rayon pool, with an optional
-//! content-addressed [`PatchCache`] (memory + on-disk WAV).
+//! [`Chorus`] and [`Reverb`] delay-line effects, and cross-node modulation
+//! routing) producing deterministic `Vec<f32>` buffers off the main thread
+//! via a private rayon pool, with an optional content-addressed
+//! [`PatchCache`] (memory + on-disk WAV).
 //!
 //! # Architecture
 //!
@@ -16,7 +17,8 @@
 //! - [`node`] — `Node` trait + `BakeContext` + the closed `NodeKind`
 //!   enum that all built-in nodes plug into.
 //! - [`oscillator`], [`noise`], [`adsr`], [`filter`], [`lfo`], [`mix`]
-//!   (Mix/Gain), [`gate`] — the built-in node implementations.
+//!   (Mix/Gain), [`gate`], [`chorus`], [`reverb`] — the built-in node
+//!   implementations.
 //! - [`mod@bake`] — turns one [`AudioPatch`] into `Vec<f32>`.
 //! - [`sequence`] + [`mixdown`] — the timeline-of-events layer and the
 //!   seamless-loop-aware [`bake_sequence`].
@@ -115,6 +117,7 @@ pub mod async_gen;
 pub mod audio_source;
 pub mod bake;
 pub mod cache;
+pub mod chorus;
 pub mod filter;
 pub mod gate;
 pub mod genetics;
@@ -125,6 +128,7 @@ pub mod node;
 pub mod noise;
 pub mod oscillator;
 pub mod patch;
+pub mod reverb;
 pub mod sequence;
 
 // Egui editor widgets for the patch schema, behind the `egui` Cargo
@@ -145,6 +149,7 @@ pub use cache::{
     DEFAULT_MEMORY_CACHE_ENTRIES, FileStore, MemoryStore, PatchCache, PatchCacheKey,
     PatchCacheStore,
 };
+pub use chorus::Chorus;
 pub use filter::{BiquadBandpass, BiquadHighpass, BiquadLowpass, BiquadState};
 pub use gate::Gate;
 pub use lfo::{Lfo, LfoShape};
@@ -154,6 +159,7 @@ pub use node::{BakeContext, Node, NodeKind};
 pub use noise::{BrownNoise, PinkNoise, WhiteNoise};
 pub use oscillator::{OscPhase, SawPolarity, SawtoothOsc, SineOsc, SquareOsc, TriangleOsc};
 pub use patch::{AudioPatch, Connection, GraphError, GraphNode, NodeGraph, NodeId, topo_sort};
+pub use reverb::Reverb;
 pub use sequence::{Event, Instrument, SequenceRecipe, Track};
 
 use bevy::prelude::*;

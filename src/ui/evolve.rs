@@ -44,6 +44,8 @@ pub fn mutate_node_kind(kind: &mut NodeKind, rng: &mut impl Rng, rate: f32) {
         NodeKind::Mix(m) => m.mutate(rng, rate),
         NodeKind::Gain(g) => g.mutate(rng, rate),
         NodeKind::Gate(g) => g.mutate(rng, rate),
+        NodeKind::Chorus(c) => c.mutate(rng, rate),
+        NodeKind::Reverb(r) => r.mutate(rng, rate),
     }
 }
 

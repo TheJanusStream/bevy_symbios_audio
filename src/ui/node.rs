@@ -20,6 +20,7 @@
 use bevy_egui::egui;
 
 use crate::adsr::{AdsrCurve, AdsrEnvelope};
+use crate::chorus::Chorus;
 use crate::filter::{BiquadBandpass, BiquadHighpass, BiquadLowpass};
 use crate::gate::Gate;
 use crate::lfo::{Lfo, LfoShape};
@@ -27,6 +28,7 @@ use crate::mix::{Gain, Mix};
 use crate::node::NodeKind;
 use crate::noise::{BrownNoise, PinkNoise, WhiteNoise};
 use crate::oscillator::{SawPolarity, SawtoothOsc, SineOsc, SquareOsc, TriangleOsc};
+use crate::reverb::Reverb;
 
 use super::{EditorResponse, bool_instant, drag_debounced, slider_debounced};
 
@@ -241,12 +243,33 @@ impl_node_editor!(
     }
 );
 
+impl_node_editor!(
+    /// Editor for a [`Chorus`] effect.  Rate uses a logarithmic slider (it
+    /// mutates multiplicatively); the rest are linear.
+    fn chorus_editor, Chorus => {
+        slider_log("Rate (Hz)", rate_hz, 0.05..=12.0),
+        slider("Depth (ms)", depth_ms, 0.0..=20.0),
+        slider("Base delay (ms)", base_delay_ms, 1.0..=40.0),
+        slider("Feedback", feedback, 0.0..=0.95),
+        slider("Mix", mix, 0.0..=1.0),
+    }
+);
+
+impl_node_editor!(
+    /// Editor for a [`Reverb`] effect (mono Freeverb).
+    fn reverb_editor, Reverb => {
+        slider("Room size", room_size, 0.0..=1.0),
+        slider("Damping", damping, 0.0..=1.0),
+        slider("Mix", mix, 0.0..=1.0),
+    }
+);
+
 // ---------------------------------------------------------------------------
 // NodeKind-level editor (kind picker + body)
 // ---------------------------------------------------------------------------
 
 /// Node kinds in display order for the picker dropdown.
-const KIND_LABELS: [&str; 16] = [
+const KIND_LABELS: [&str; 18] = [
     "Silence",
     "Sine",
     "Square",
@@ -263,6 +286,8 @@ const KIND_LABELS: [&str; 16] = [
     "Mix",
     "Gain",
     "Gate",
+    "Chorus",
+    "Reverb",
 ];
 
 /// Human-readable label for a node kind — used by the kind picker and (in
@@ -285,6 +310,8 @@ pub fn node_kind_label(kind: &NodeKind) -> &'static str {
         NodeKind::Mix(_) => "Mix",
         NodeKind::Gain(_) => "Gain",
         NodeKind::Gate(_) => "Gate",
+        NodeKind::Chorus(_) => "Chorus",
+        NodeKind::Reverb(_) => "Reverb",
     }
 }
 
@@ -307,6 +334,8 @@ fn default_kind_for(label: &str) -> NodeKind {
         "Mix" => NodeKind::Mix(Mix::default()),
         "Gain" => NodeKind::Gain(Gain::default()),
         "Gate" => NodeKind::Gate(Gate::default()),
+        "Chorus" => NodeKind::Chorus(Chorus::default()),
+        "Reverb" => NodeKind::Reverb(Reverb::default()),
         _ => NodeKind::Silence,
     }
 }
@@ -336,6 +365,8 @@ pub fn node_kind_body(ui: &mut egui::Ui, kind: &mut NodeKind) -> EditorResponse 
         NodeKind::Mix(m) => mix_editor(ui, m),
         NodeKind::Gain(g) => gain_editor(ui, g),
         NodeKind::Gate(g) => gate_editor(ui, g),
+        NodeKind::Chorus(c) => chorus_editor(ui, c),
+        NodeKind::Reverb(r) => reverb_editor(ui, r),
     }
 }
 
@@ -410,6 +441,8 @@ mod tests {
             NodeKind::Mix(Mix::default()),
             NodeKind::Gain(Gain::default()),
             NodeKind::Gate(Gate::default()),
+            NodeKind::Chorus(Chorus::default()),
+            NodeKind::Reverb(Reverb::default()),
         ];
         for kind in &all {
             assert!(

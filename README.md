@@ -3,8 +3,9 @@
 Algorithmic audio generator for Bevy — a DAG-of-nodes synth (sine /
 square / sawtooth / triangle oscillators, white / pink / brown noise,
 ADSR envelopes, biquad LP/HP/BP filters, LFOs, `Mix` / `Gain` (VCA)
-combiners, a sequencer-driven `Gate`, and cross-node modulation routing
-where several sources can feed one input port and are summed) that bakes
+combiners, a sequencer-driven `Gate`, `Chorus` / `Reverb` delay-line
+effects, and cross-node modulation routing where several sources can feed
+one input port and are summed) that bakes
 deterministic `Vec<f32>` buffers off the main thread via a private
 [`rayon`](https://crates.io/crates/rayon) pool, with an optional
 content-addressed `PatchCache` (memory + on-disk WAV) so DID-seeded
