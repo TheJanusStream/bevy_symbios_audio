@@ -4,8 +4,8 @@
 //! Phase 3 ticket #12.  Intended for the Janus Stream video pipeline
 //! and for sound-design iteration outside the Bevy app.  Mono WAV only
 //! (IEEE float, the same encoding the in-Bevy `AudioSource` bridge
-//! produces) — Ogg Vorbis / Opus are deliberately out of scope for
-//! v0.1.0 because the pure-Rust encoder ecosystem is still rough.
+//! produces) — Ogg Vorbis / Opus are deliberately out of scope
+//! because the pure-Rust encoder ecosystem is still rough.
 //!
 //! # Example
 //!

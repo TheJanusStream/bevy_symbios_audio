@@ -31,6 +31,8 @@
 //! - [`cache`] — Bevy `Resource` wrapper over the cache backends.
 //! - [`async_gen`] — `PendingAudioPatch`/`AudioPatchReady` ECS handover.
 //! - [`SymbiosAudioPlugin`] — the plugin entry point.
+//! - `ui` — optional `bevy_egui` patch / sequence editor widgets, behind
+//!   the `egui` Cargo feature.
 //!
 //! Every config type implements [`symbios_genetics::Genotype`] via the
 //! [`impl_genotype!`] declarative macro, so the entire DSP language plugs
@@ -45,6 +47,9 @@
 //! [`PendingAudioPatch`] onto an entity, and the polling system attaches
 //! an [`AudioPatchReady`] with a `Handle<AudioSource>` once the bake
 //! completes.  Use [`SymbiosAudioPlugin`] to register the poller.
+//!
+//! For a Bevy-free `Vec<f32>` (unit tests, CLI, offline tooling) skip the
+//! ECS entirely and call [`bake()`] / [`try_bake`] on the patch directly.
 //!
 //! ```rust,ignore
 //! use bevy::prelude::*;
@@ -122,9 +127,10 @@ pub mod oscillator;
 pub mod patch;
 pub mod sequence;
 
-/// Egui editor widgets for the patch schema.  Enabled by the `egui` Cargo
-/// feature; mirrors the sibling `bevy_symbios_texture::ui` convention so a
-/// `bevy_egui` host (Overlands) can embed audio-patch editing.
+// Egui editor widgets for the patch schema, behind the `egui` Cargo
+// feature.  The module documents itself via its own `//!` header (see
+// `ui/mod.rs`); keeping the description there — rather than in an outer
+// `///` here — means its intra-doc links resolve in the `ui` scope.
 #[cfg(feature = "egui")]
 pub mod ui;
 

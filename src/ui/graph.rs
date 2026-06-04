@@ -25,7 +25,7 @@
 //!   value) and removes connections.
 //! - **Add / remove nodes, set output:** the toolbar above the canvas.
 //!
-//! Structural edits are collected as deferred [`Action`]s while the node loop
+//! Structural edits are collected as deferred `Action`s while the node loop
 //! holds `&mut patch.graph.nodes`, then applied once the loop's borrow ends —
 //! the standard way to keep an immediate-mode graph editor borrow-clean.
 //!

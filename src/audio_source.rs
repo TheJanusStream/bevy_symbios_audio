@@ -13,8 +13,8 @@
 //! - PCM container: RIFF / WAVE.
 //! - Codec: IEEE float, 32-bit little-endian.
 //! - Channels: mono only.  Both [`crate::bake::bake`] and
-//!   [`crate::mixdown::bake_sequence`] produce mono buffers as of
-//!   v0.1.0; stereo and multichannel routing remain out of scope.
+//!   [`crate::mixdown::bake_sequence`] produce mono buffers; stereo
+//!   and multichannel routing remain out of scope.
 //! - Includes a `fact` chunk so strict decoders (which require it for
 //!   non-PCM formats per the WAV spec) accept the blob without warning.
 //! - Header size: 12 (RIFF) + 8 + 16 (fmt) + 8 + 4 (fact) + 8 (data) = 56
@@ -52,7 +52,7 @@ const HEADER_BYTES: u32 = 4 + 8 + 16 + 8 + 4 + 8;
 /// the 32-bit RIFF size fields: `(u32::MAX − header) / bytes-per-sample`
 /// ≈ 1.07 G samples (~6.7 h at 44.1 kHz).  [`samples_to_wav_bytes`] panics
 /// above this rather than emit a silently-wrapped header; callers that build
-/// buffers from untrusted sizes (the [`crate::bake`] / [`crate::mixdown`]
+/// buffers from untrusted sizes (the [`mod@crate::bake`] / [`crate::mixdown`]
 /// paths) clamp their allocations to it so an absurd request can't drive a
 /// `usize::MAX` allocation.
 pub const MAX_WAV_SAMPLES: usize = ((u32::MAX - HEADER_BYTES) / (BLOCK_ALIGN as u32)) as usize;

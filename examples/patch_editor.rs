@@ -8,8 +8,8 @@
 //!
 //! Pan by dragging empty canvas; zoom with the scroll wheel.
 //!
-//! Audio audition (a bake-and-play monitor + waveform) arrives in a later
-//! phase — this example proves the canvas edits a real `AudioPatch`.
+//! A bake-and-play monitor sits across the top: "▶ Bake & Play" bakes the
+//! edited patch and loops it through a waveform display, "⏹ Stop" halts it.
 //!
 //! Run with:
 //!   cargo run --example patch_editor --features egui

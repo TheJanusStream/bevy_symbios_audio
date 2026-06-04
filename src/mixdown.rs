@@ -49,8 +49,8 @@
 //! Resampling-based pitch shift means a pitch-up event finishes
 //! sooner than its gate length and a pitch-down event hangs past
 //! it.  True time-preserving pitch shift (PSOLA, phase vocoder) is
-//! out of scope for v0.1.0 — flag the limitation here and revisit
-//! if users's sound design surfaces a need.
+//! out of scope for now — flag the limitation here and revisit
+//! if users' sound design surfaces a need.
 //!
 //! # Dangling references and bad graphs
 //!

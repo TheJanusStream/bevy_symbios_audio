@@ -12,7 +12,7 @@
 //! cargo run --release --example wind_demo
 //! ```
 //!
-//! The output WAV is ~4 s long at 44.1 kHz, plays as a seamless loop
+//! The output WAV is ~5 s long at 44.1 kHz, plays as a seamless loop
 //! when imported into any DAW (the loop_start_beats + crossfade are
 //! configured so the buffer's tail is pre-mixed back into the loop
 //! start).

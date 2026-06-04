@@ -159,8 +159,34 @@ cargo run --release --bin symbios-audio-cli -- bake \
 `patch.json` is the serde-JSON form of [`AudioPatch`](src/patch.rs).
 The output is a mono IEEE-float WAV file — playable in every video
 editor and DAW.  Ogg Vorbis / Opus exports are deliberately out of
-scope for v0.1.0 because the pure-Rust encoder ecosystem is still
-rough.
+scope because the pure-Rust encoder ecosystem is still rough.
+
+## Editor (`egui` feature)
+
+Enable the `egui` feature to pull in
+[`bevy_egui`](https://crates.io/crates/bevy_egui) and the `ui` module — a
+set of composable editor widgets any `bevy_egui` host (Overlands) can
+embed:
+
+- per-node config editors (one widget group per `NodeKind`) plus a kind
+  picker (`node_kind_editor`),
+- a pannable / zoomable node-graph canvas (`audio_patch_canvas`) that
+  edits a whole `AudioPatch` — drag nodes, wire ports, choose the output,
+- a DAW-style sequence-recipe timeline (`sequence_recipe_editor`) with
+  transport, instruments, and draggable track / event lanes,
+- a pure-egui `waveform` widget plus a Bevy bake-and-play monitor
+  (`AudioEditorPlugin`) for auditioning edits,
+- `symbios_genetics`-backed "🎲 Mutate" / reseed helpers (`mutate_patch`,
+  `randomize_seed`) and a reusable JSON copy/paste section (`json_io`).
+
+Every editor returns an `EditorResponse { changed, rebake }` so a host
+can persist mid-drag edits (`changed`) but only re-bake on commit
+(`rebake`).  Two runnable examples drive the widgets end to end:
+
+```sh
+cargo run --example patch_editor --features egui
+cargo run --example sequence_editor --features egui
+```
 
 ## Determinism
 
@@ -182,9 +208,10 @@ integration relies on — one stable ambient track per room seed.
 
 ## Features
 
-| Feature | Default | What it does                                   |
-|---------|---------|------------------------------------------------|
-| `egui`  | off     | `bevy_egui` for a planned editor UI; unused.   |
+- **`egui`** (off by default) — pulls in
+  [`bevy_egui`](https://crates.io/crates/bevy_egui) and the `ui` module:
+  composable patch / sequence editor widgets you can embed in a
+  `bevy_egui` host.  See [Editor](#editor-egui-feature).
 
 The crate's own `bevy` dependency enables Bevy's `wav` feature so
 downstream users don't need to enable it on their own `bevy = ...`
@@ -194,8 +221,7 @@ produces.
 ## Limitations
 
 - **Mono only.**  Both `bake` and `bake_sequence` produce a single
-  channel.  Stereo / multichannel routing is out of scope for
-  v0.1.0.
+  channel.  Stereo / multichannel routing is out of scope.
 - **Naïve oscillators.**  Square / saw / triangle don't band-limit;
   the audible aliasing is part of the aesthetic.  Add PolyBLEP /
   BLIT variants as new `NodeKind`s if you need them.
