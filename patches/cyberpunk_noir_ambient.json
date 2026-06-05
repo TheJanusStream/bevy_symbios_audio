@@ -1,0 +1,480 @@
+{
+  "seed": 42,
+  "graph": {
+    "nodes": [
+      {
+        "id": 0,
+        "kind": {
+          "kind": "Sawtooth",
+          "freq_hz": 55.0,
+          "polarity": "Up",
+          "amplitude": 0.5,
+          "anti_alias": "PolyBlep"
+        },
+        "inputs": {}
+      },
+      {
+        "id": 1,
+        "kind": {
+          "kind": "Sawtooth",
+          "freq_hz": 55.35,
+          "polarity": "Up",
+          "amplitude": 0.5,
+          "anti_alias": "PolyBlep"
+        },
+        "inputs": {}
+      },
+      {
+        "id": 2,
+        "kind": {
+          "kind": "Sine",
+          "freq_hz": 27.5,
+          "phase_offset": 0.0,
+          "amplitude": 0.6
+        },
+        "inputs": {}
+      },
+      {
+        "id": 3,
+        "kind": {
+          "kind": "Mix",
+          "gain": 1.0
+        },
+        "inputs": {
+          "a": [
+            {
+              "source": "node",
+              "id": 0,
+              "amount": 0.5
+            }
+          ],
+          "b": [
+            {
+              "source": "node",
+              "id": 1,
+              "amount": 0.5
+            }
+          ],
+          "sub": [
+            {
+              "source": "node",
+              "id": 2,
+              "amount": 0.7
+            }
+          ]
+        }
+      },
+      {
+        "id": 4,
+        "kind": {
+          "kind": "Lfo",
+          "rate_hz": 0.06,
+          "shape": "Sine",
+          "depth": 525.0,
+          "offset": 375.0
+        },
+        "inputs": {}
+      },
+      {
+        "id": 5,
+        "kind": {
+          "kind": "BiquadLowpass",
+          "cutoff_hz": 300.0,
+          "q": 3.0
+        },
+        "inputs": {
+          "cutoff_hz": [
+            {
+              "source": "node",
+              "id": 4,
+              "amount": 1.0
+            }
+          ],
+          "in": [
+            {
+              "source": "node",
+              "id": 3,
+              "amount": 1.0
+            }
+          ]
+        }
+      },
+      {
+        "id": 6,
+        "kind": {
+          "kind": "Triangle",
+          "freq_hz": 220.0,
+          "amplitude": 0.3,
+          "anti_alias": "Naive"
+        },
+        "inputs": {}
+      },
+      {
+        "id": 7,
+        "kind": {
+          "kind": "Triangle",
+          "freq_hz": 311.13,
+          "amplitude": 0.22,
+          "anti_alias": "Naive"
+        },
+        "inputs": {}
+      },
+      {
+        "id": 8,
+        "kind": {
+          "kind": "Sine",
+          "freq_hz": 660.0,
+          "phase_offset": 0.0,
+          "amplitude": 0.12
+        },
+        "inputs": {}
+      },
+      {
+        "id": 9,
+        "kind": {
+          "kind": "Mix",
+          "gain": 1.0
+        },
+        "inputs": {
+          "a": [
+            {
+              "source": "node",
+              "id": 6,
+              "amount": 0.5
+            }
+          ],
+          "b": [
+            {
+              "source": "node",
+              "id": 7,
+              "amount": 0.5
+            }
+          ],
+          "c": [
+            {
+              "source": "node",
+              "id": 8,
+              "amount": 0.5
+            }
+          ]
+        }
+      },
+      {
+        "id": 10,
+        "kind": {
+          "kind": "Lfo",
+          "rate_hz": 0.15,
+          "shape": "Sine",
+          "depth": 0.35,
+          "offset": 0.6
+        },
+        "inputs": {}
+      },
+      {
+        "id": 11,
+        "kind": {
+          "kind": "Gain",
+          "gain": 0.0
+        },
+        "inputs": {
+          "gain": [
+            {
+              "source": "node",
+              "id": 10,
+              "amount": 1.0
+            }
+          ],
+          "in": [
+            {
+              "source": "node",
+              "id": 9,
+              "amount": 1.0
+            }
+          ]
+        }
+      },
+      {
+        "id": 12,
+        "kind": {
+          "kind": "BiquadLowpass",
+          "cutoff_hz": 1800.0,
+          "q": 1.0
+        },
+        "inputs": {
+          "in": [
+            {
+              "source": "node",
+              "id": 11,
+              "amount": 1.0
+            }
+          ]
+        }
+      },
+      {
+        "id": 13,
+        "kind": {
+          "kind": "Chorus",
+          "rate_hz": 0.4,
+          "depth_ms": 4.0,
+          "base_delay_ms": 14.0,
+          "feedback": 0.2,
+          "mix": 0.5
+        },
+        "inputs": {
+          "in": [
+            {
+              "source": "node",
+              "id": 12,
+              "amount": 1.0
+            }
+          ]
+        }
+      },
+      {
+        "id": 14,
+        "kind": {
+          "kind": "PinkNoise",
+          "amplitude": 0.5
+        },
+        "inputs": {}
+      },
+      {
+        "id": 15,
+        "kind": {
+          "kind": "Lfo",
+          "rate_hz": 0.08,
+          "shape": "Sine",
+          "depth": 500.0,
+          "offset": 700.0
+        },
+        "inputs": {}
+      },
+      {
+        "id": 16,
+        "kind": {
+          "kind": "BiquadLowpass",
+          "cutoff_hz": 800.0,
+          "q": 0.7
+        },
+        "inputs": {
+          "cutoff_hz": [
+            {
+              "source": "node",
+              "id": 15,
+              "amount": 1.0
+            }
+          ],
+          "in": [
+            {
+              "source": "node",
+              "id": 14,
+              "amount": 1.0
+            }
+          ]
+        }
+      },
+      {
+        "id": 17,
+        "kind": {
+          "kind": "BrownNoise",
+          "amplitude": 0.5
+        },
+        "inputs": {}
+      },
+      {
+        "id": 18,
+        "kind": {
+          "kind": "BiquadLowpass",
+          "cutoff_hz": 120.0,
+          "q": 0.7
+        },
+        "inputs": {
+          "in": [
+            {
+              "source": "node",
+              "id": 17,
+              "amount": 1.0
+            }
+          ]
+        }
+      },
+      {
+        "id": 19,
+        "kind": {
+          "kind": "Lfo",
+          "rate_hz": 0.18,
+          "shape": "Square",
+          "depth": 0.5,
+          "offset": 0.5
+        },
+        "inputs": {}
+      },
+      {
+        "id": 20,
+        "kind": {
+          "kind": "Adsr",
+          "attack_s": 0.005,
+          "decay_s": 1.2,
+          "sustain_level": 0.0,
+          "release_s": 0.5,
+          "curve": "Exponential"
+        },
+        "inputs": {
+          "gate": [
+            {
+              "source": "node",
+              "id": 19,
+              "amount": 1.0
+            }
+          ]
+        }
+      },
+      {
+        "id": 21,
+        "kind": {
+          "kind": "Sine",
+          "freq_hz": 880.0,
+          "phase_offset": 0.0,
+          "amplitude": 0.5
+        },
+        "inputs": {}
+      },
+      {
+        "id": 22,
+        "kind": {
+          "kind": "Sine",
+          "freq_hz": 1318.0,
+          "phase_offset": 0.0,
+          "amplitude": 0.2
+        },
+        "inputs": {}
+      },
+      {
+        "id": 23,
+        "kind": {
+          "kind": "Mix",
+          "gain": 1.0
+        },
+        "inputs": {
+          "a": [
+            {
+              "source": "node",
+              "id": 21,
+              "amount": 0.6
+            }
+          ],
+          "b": [
+            {
+              "source": "node",
+              "id": 22,
+              "amount": 0.4
+            }
+          ]
+        }
+      },
+      {
+        "id": 24,
+        "kind": {
+          "kind": "Gain",
+          "gain": 0.0
+        },
+        "inputs": {
+          "gain": [
+            {
+              "source": "node",
+              "id": 20,
+              "amount": 1.0
+            }
+          ],
+          "in": [
+            {
+              "source": "node",
+              "id": 23,
+              "amount": 1.0
+            }
+          ]
+        }
+      },
+      {
+        "id": 25,
+        "kind": {
+          "kind": "Mix",
+          "gain": 1.3949797
+        },
+        "inputs": {
+          "drone": [
+            {
+              "source": "node",
+              "id": 5,
+              "amount": 0.6
+            }
+          ],
+          "pad": [
+            {
+              "source": "node",
+              "id": 13,
+              "amount": 0.5
+            }
+          ],
+          "ping": [
+            {
+              "source": "node",
+              "id": 24,
+              "amount": 0.5
+            }
+          ],
+          "rain": [
+            {
+              "source": "node",
+              "id": 16,
+              "amount": 0.5
+            }
+          ],
+          "rumble": [
+            {
+              "source": "node",
+              "id": 18,
+              "amount": 0.5
+            }
+          ]
+        }
+      },
+      {
+        "id": 26,
+        "kind": {
+          "kind": "Reverb",
+          "room_size": 0.85,
+          "damping": 0.45,
+          "mix": 0.45
+        },
+        "inputs": {
+          "in": [
+            {
+              "source": "node",
+              "id": 25,
+              "amount": 1.0
+            }
+          ]
+        }
+      },
+      {
+        "id": 27,
+        "kind": {
+          "kind": "BiquadHighpass",
+          "cutoff_hz": 30.0,
+          "q": 0.7
+        },
+        "inputs": {
+          "in": [
+            {
+              "source": "node",
+              "id": 26,
+              "amount": 1.0
+            }
+          ]
+        }
+      }
+    ],
+    "output": 27
+  }
+}

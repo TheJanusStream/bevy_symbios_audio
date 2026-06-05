@@ -1,0 +1,260 @@
+{
+  "bpm": 120.0,
+  "sample_rate": 44100,
+  "duration_beats": 4.0,
+  "loop_start_beats": null,
+  "loop_crossfade_beats": 0.0,
+  "instruments": [
+    {
+      "id": "caw",
+      "patch": {
+        "seed": 7,
+        "graph": {
+          "nodes": [
+            {
+              "id": 0,
+              "kind": {
+                "kind": "Gate",
+                "invert": false
+              },
+              "inputs": {}
+            },
+            {
+              "id": 1,
+              "kind": {
+                "kind": "Adsr",
+                "attack_s": 0.008,
+                "decay_s": 0.1,
+                "sustain_level": 0.5,
+                "release_s": 0.18,
+                "curve": "Exponential"
+              },
+              "inputs": {
+                "gate": [
+                  {
+                    "source": "node",
+                    "id": 0,
+                    "amount": 1.0
+                  }
+                ]
+              }
+            },
+            {
+              "id": 2,
+              "kind": {
+                "kind": "Adsr",
+                "attack_s": 0.001,
+                "decay_s": 0.16,
+                "sustain_level": 0.0,
+                "release_s": 0.05,
+                "curve": "Linear"
+              },
+              "inputs": {
+                "gate": [
+                  {
+                    "source": "node",
+                    "id": 0,
+                    "amount": 1.0
+                  }
+                ]
+              }
+            },
+            {
+              "id": 3,
+              "kind": {
+                "kind": "Sawtooth",
+                "freq_hz": 540.0,
+                "polarity": "Up",
+                "amplitude": 1.0,
+                "anti_alias": "Naive"
+              },
+              "inputs": {
+                "freq": [
+                  {
+                    "source": "node",
+                    "id": 2,
+                    "amount": 200.0
+                  }
+                ]
+              }
+            },
+            {
+              "id": 4,
+              "kind": {
+                "kind": "BiquadBandpass",
+                "center_hz": 1200.0,
+                "q": 2.2
+              },
+              "inputs": {
+                "in": [
+                  {
+                    "source": "node",
+                    "id": 3,
+                    "amount": 1.0
+                  }
+                ]
+              }
+            },
+            {
+              "id": 5,
+              "kind": {
+                "kind": "WhiteNoise",
+                "amplitude": 0.6
+              },
+              "inputs": {}
+            },
+            {
+              "id": 6,
+              "kind": {
+                "kind": "BiquadBandpass",
+                "center_hz": 2600.0,
+                "q": 1.4
+              },
+              "inputs": {
+                "in": [
+                  {
+                    "source": "node",
+                    "id": 5,
+                    "amount": 1.0
+                  }
+                ]
+              }
+            },
+            {
+              "id": 7,
+              "kind": {
+                "kind": "Mix",
+                "gain": 2.2
+              },
+              "inputs": {
+                "rasp": [
+                  {
+                    "source": "node",
+                    "id": 6,
+                    "amount": 0.25
+                  }
+                ],
+                "tone": [
+                  {
+                    "source": "node",
+                    "id": 4,
+                    "amount": 0.95
+                  }
+                ]
+              }
+            },
+            {
+              "id": 8,
+              "kind": {
+                "kind": "Lfo",
+                "rate_hz": 80.0,
+                "shape": "Sine",
+                "depth": 0.3,
+                "offset": 0.7
+              },
+              "inputs": {}
+            },
+            {
+              "id": 9,
+              "kind": {
+                "kind": "Gain",
+                "gain": 0.0
+              },
+              "inputs": {
+                "gain": [
+                  {
+                    "source": "node",
+                    "id": 8,
+                    "amount": 1.0
+                  }
+                ],
+                "in": [
+                  {
+                    "source": "node",
+                    "id": 7,
+                    "amount": 1.0
+                  }
+                ]
+              }
+            },
+            {
+              "id": 10,
+              "kind": {
+                "kind": "Gain",
+                "gain": 0.0
+              },
+              "inputs": {
+                "gain": [
+                  {
+                    "source": "node",
+                    "id": 1,
+                    "amount": 1.0
+                  }
+                ],
+                "in": [
+                  {
+                    "source": "node",
+                    "id": 9,
+                    "amount": 1.0
+                  }
+                ]
+              }
+            },
+            {
+              "id": 11,
+              "kind": {
+                "kind": "Reverb",
+                "room_size": 0.3,
+                "damping": 0.5,
+                "mix": 0.2
+              },
+              "inputs": {
+                "in": [
+                  {
+                    "source": "node",
+                    "id": 10,
+                    "amount": 1.0
+                  }
+                ]
+              }
+            }
+          ],
+          "output": 11
+        }
+      }
+    }
+  ],
+  "tracks": [
+    {
+      "events": [
+        {
+          "time_beats": 0.0,
+          "instrument_id": "caw",
+          "pitch_multiplier": 1.0,
+          "volume": 0.9,
+          "gate_beats": 0.35,
+          "release_beats": 0.9,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 1.0,
+          "instrument_id": "caw",
+          "pitch_multiplier": 1.06,
+          "volume": 0.85,
+          "gate_beats": 0.35,
+          "release_beats": 0.9,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 2.0,
+          "instrument_id": "caw",
+          "pitch_multiplier": 0.96,
+          "volume": 0.9,
+          "gate_beats": 0.4,
+          "release_beats": 1.2,
+          "pitch_mode": "Varispeed"
+        }
+      ]
+    }
+  ]
+}

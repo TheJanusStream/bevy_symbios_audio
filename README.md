@@ -146,7 +146,11 @@ to opt out of cache writes for one-off bakes.
 
 A `symbios-audio-cli` binary ships with the crate for offline baking
 outside the Bevy app — handy for video pipelines and sound-design
-iteration:
+iteration.  It has two subcommands.
+
+`bake` renders a single [`AudioPatch`](src/patch.rs); the patch is
+rate- and length-agnostic, so the rate and duration are chosen on the
+command line:
 
 ```sh
 # Bake `patch.json` to `out.wav` at default 44.1 kHz / 1.0 s.
@@ -157,10 +161,27 @@ cargo run --release --bin symbios-audio-cli -- bake \
     --sample-rate 48000 --duration 5.0 patch.json out.wav
 ```
 
-`patch.json` is the serde-JSON form of [`AudioPatch`](src/patch.rs).
-The output is a mono IEEE-float WAV file — playable in every video
-editor and DAW.  Ogg Vorbis / Opus exports are deliberately out of
-scope because the pure-Rust encoder ecosystem is still rough.
+`bake-sequence` renders a [`SequenceRecipe`](src/sequence.rs) through
+[`bake_sequence`](src/mixdown.rs) — multi-instrument, event-timed
+tracks with `tanh` soft-clipping and seamless-loop crossfades.  The
+sample rate and length live *inside* the recipe (`sample_rate`, `bpm`,
+`duration_beats`), so the subcommand takes only the input and output
+paths:
+
+```sh
+cargo run --release --bin symbios-audio-cli -- bake-sequence recipe.json out.wav
+```
+
+Both `patch.json` and `recipe.json` are the serde-JSON form of their
+respective types.  The output is a mono IEEE-float WAV file — playable
+in every video editor and DAW.  Ogg Vorbis / Opus exports are
+deliberately out of scope because the pure-Rust encoder ecosystem is
+still rough.
+
+Ready-made example patches for both subcommands live in
+[`patches/`](patches/) (a crow caw, a rock groove, and a cyberpunk-noir
+ambient bed, each in single-graph and sequenced form); regenerate them
+with `cargo run --example demo_patches`.
 
 ## Editor (`egui` feature)
 

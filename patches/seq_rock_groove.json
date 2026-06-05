@@ -1,0 +1,1436 @@
+{
+  "bpm": 120.0,
+  "sample_rate": 44100,
+  "duration_beats": 16.5,
+  "loop_start_beats": null,
+  "loop_crossfade_beats": 0.0,
+  "instruments": [
+    {
+      "id": "kick",
+      "patch": {
+        "seed": 1,
+        "graph": {
+          "nodes": [
+            {
+              "id": 0,
+              "kind": {
+                "kind": "Gate",
+                "invert": false
+              },
+              "inputs": {}
+            },
+            {
+              "id": 1,
+              "kind": {
+                "kind": "Adsr",
+                "attack_s": 0.002,
+                "decay_s": 0.18,
+                "sustain_level": 0.0,
+                "release_s": 0.02,
+                "curve": "Linear"
+              },
+              "inputs": {
+                "gate": [
+                  {
+                    "source": "node",
+                    "id": 0,
+                    "amount": 1.0
+                  }
+                ]
+              }
+            },
+            {
+              "id": 2,
+              "kind": {
+                "kind": "Adsr",
+                "attack_s": 0.001,
+                "decay_s": 0.05,
+                "sustain_level": 0.0,
+                "release_s": 0.01,
+                "curve": "Linear"
+              },
+              "inputs": {
+                "gate": [
+                  {
+                    "source": "node",
+                    "id": 0,
+                    "amount": 1.0
+                  }
+                ]
+              }
+            },
+            {
+              "id": 3,
+              "kind": {
+                "kind": "Sine",
+                "freq_hz": 50.0,
+                "phase_offset": 0.0,
+                "amplitude": 1.0
+              },
+              "inputs": {
+                "freq": [
+                  {
+                    "source": "node",
+                    "id": 2,
+                    "amount": 95.0
+                  }
+                ]
+              }
+            },
+            {
+              "id": 4,
+              "kind": {
+                "kind": "Gain",
+                "gain": 0.0
+              },
+              "inputs": {
+                "gain": [
+                  {
+                    "source": "node",
+                    "id": 1,
+                    "amount": 1.0
+                  }
+                ],
+                "in": [
+                  {
+                    "source": "node",
+                    "id": 3,
+                    "amount": 1.0
+                  }
+                ]
+              }
+            }
+          ],
+          "output": 4
+        }
+      }
+    },
+    {
+      "id": "snare",
+      "patch": {
+        "seed": 2,
+        "graph": {
+          "nodes": [
+            {
+              "id": 0,
+              "kind": {
+                "kind": "Gate",
+                "invert": false
+              },
+              "inputs": {}
+            },
+            {
+              "id": 1,
+              "kind": {
+                "kind": "Adsr",
+                "attack_s": 0.001,
+                "decay_s": 0.13,
+                "sustain_level": 0.0,
+                "release_s": 0.02,
+                "curve": "Linear"
+              },
+              "inputs": {
+                "gate": [
+                  {
+                    "source": "node",
+                    "id": 0,
+                    "amount": 1.0
+                  }
+                ]
+              }
+            },
+            {
+              "id": 2,
+              "kind": {
+                "kind": "WhiteNoise",
+                "amplitude": 0.8
+              },
+              "inputs": {}
+            },
+            {
+              "id": 3,
+              "kind": {
+                "kind": "BiquadHighpass",
+                "cutoff_hz": 1400.0,
+                "q": 0.8
+              },
+              "inputs": {
+                "in": [
+                  {
+                    "source": "node",
+                    "id": 2,
+                    "amount": 1.0
+                  }
+                ]
+              }
+            },
+            {
+              "id": 4,
+              "kind": {
+                "kind": "Triangle",
+                "freq_hz": 190.0,
+                "amplitude": 0.6,
+                "anti_alias": "Naive"
+              },
+              "inputs": {}
+            },
+            {
+              "id": 5,
+              "kind": {
+                "kind": "Mix",
+                "gain": 1.0
+              },
+              "inputs": {
+                "body": [
+                  {
+                    "source": "node",
+                    "id": 4,
+                    "amount": 0.5
+                  }
+                ],
+                "noise": [
+                  {
+                    "source": "node",
+                    "id": 3,
+                    "amount": 0.7
+                  }
+                ]
+              }
+            },
+            {
+              "id": 6,
+              "kind": {
+                "kind": "Gain",
+                "gain": 0.0
+              },
+              "inputs": {
+                "gain": [
+                  {
+                    "source": "node",
+                    "id": 1,
+                    "amount": 1.0
+                  }
+                ],
+                "in": [
+                  {
+                    "source": "node",
+                    "id": 5,
+                    "amount": 1.0
+                  }
+                ]
+              }
+            }
+          ],
+          "output": 6
+        }
+      }
+    },
+    {
+      "id": "hat",
+      "patch": {
+        "seed": 3,
+        "graph": {
+          "nodes": [
+            {
+              "id": 0,
+              "kind": {
+                "kind": "Gate",
+                "invert": false
+              },
+              "inputs": {}
+            },
+            {
+              "id": 1,
+              "kind": {
+                "kind": "Adsr",
+                "attack_s": 0.001,
+                "decay_s": 0.03,
+                "sustain_level": 0.0,
+                "release_s": 0.005,
+                "curve": "Linear"
+              },
+              "inputs": {
+                "gate": [
+                  {
+                    "source": "node",
+                    "id": 0,
+                    "amount": 1.0
+                  }
+                ]
+              }
+            },
+            {
+              "id": 2,
+              "kind": {
+                "kind": "WhiteNoise",
+                "amplitude": 0.7
+              },
+              "inputs": {}
+            },
+            {
+              "id": 3,
+              "kind": {
+                "kind": "BiquadHighpass",
+                "cutoff_hz": 8000.0,
+                "q": 0.8
+              },
+              "inputs": {
+                "in": [
+                  {
+                    "source": "node",
+                    "id": 2,
+                    "amount": 1.0
+                  }
+                ]
+              }
+            },
+            {
+              "id": 4,
+              "kind": {
+                "kind": "Gain",
+                "gain": 0.0
+              },
+              "inputs": {
+                "gain": [
+                  {
+                    "source": "node",
+                    "id": 1,
+                    "amount": 1.0
+                  }
+                ],
+                "in": [
+                  {
+                    "source": "node",
+                    "id": 3,
+                    "amount": 1.0
+                  }
+                ]
+              }
+            }
+          ],
+          "output": 4
+        }
+      }
+    },
+    {
+      "id": "bass",
+      "patch": {
+        "seed": 1,
+        "graph": {
+          "nodes": [
+            {
+              "id": 0,
+              "kind": {
+                "kind": "Gate",
+                "invert": false
+              },
+              "inputs": {}
+            },
+            {
+              "id": 1,
+              "kind": {
+                "kind": "Adsr",
+                "attack_s": 0.004,
+                "decay_s": 0.1,
+                "sustain_level": 0.7,
+                "release_s": 0.06,
+                "curve": "Linear"
+              },
+              "inputs": {
+                "gate": [
+                  {
+                    "source": "node",
+                    "id": 0,
+                    "amount": 1.0
+                  }
+                ]
+              }
+            },
+            {
+              "id": 2,
+              "kind": {
+                "kind": "Sawtooth",
+                "freq_hz": 82.41,
+                "polarity": "Up",
+                "amplitude": 1.0,
+                "anti_alias": "PolyBlep"
+              },
+              "inputs": {}
+            },
+            {
+              "id": 3,
+              "kind": {
+                "kind": "BiquadLowpass",
+                "cutoff_hz": 500.0,
+                "q": 1.0
+              },
+              "inputs": {
+                "in": [
+                  {
+                    "source": "node",
+                    "id": 2,
+                    "amount": 1.0
+                  }
+                ]
+              }
+            },
+            {
+              "id": 4,
+              "kind": {
+                "kind": "Gain",
+                "gain": 0.0
+              },
+              "inputs": {
+                "gain": [
+                  {
+                    "source": "node",
+                    "id": 1,
+                    "amount": 1.0
+                  }
+                ],
+                "in": [
+                  {
+                    "source": "node",
+                    "id": 3,
+                    "amount": 1.0
+                  }
+                ]
+              }
+            }
+          ],
+          "output": 4
+        }
+      }
+    },
+    {
+      "id": "guitar",
+      "patch": {
+        "seed": 1,
+        "graph": {
+          "nodes": [
+            {
+              "id": 0,
+              "kind": {
+                "kind": "Gate",
+                "invert": false
+              },
+              "inputs": {}
+            },
+            {
+              "id": 1,
+              "kind": {
+                "kind": "Adsr",
+                "attack_s": 0.005,
+                "decay_s": 0.12,
+                "sustain_level": 0.6,
+                "release_s": 0.18,
+                "curve": "Linear"
+              },
+              "inputs": {
+                "gate": [
+                  {
+                    "source": "node",
+                    "id": 0,
+                    "amount": 1.0
+                  }
+                ]
+              }
+            },
+            {
+              "id": 2,
+              "kind": {
+                "kind": "Sawtooth",
+                "freq_hz": 164.81,
+                "polarity": "Up",
+                "amplitude": 0.5,
+                "anti_alias": "Naive"
+              },
+              "inputs": {}
+            },
+            {
+              "id": 3,
+              "kind": {
+                "kind": "Sawtooth",
+                "freq_hz": 246.94,
+                "polarity": "Up",
+                "amplitude": 0.5,
+                "anti_alias": "Naive"
+              },
+              "inputs": {}
+            },
+            {
+              "id": 4,
+              "kind": {
+                "kind": "Mix",
+                "gain": 1.0
+              },
+              "inputs": {
+                "fifth": [
+                  {
+                    "source": "node",
+                    "id": 3,
+                    "amount": 1.0
+                  }
+                ],
+                "root": [
+                  {
+                    "source": "node",
+                    "id": 2,
+                    "amount": 1.0
+                  }
+                ]
+              }
+            },
+            {
+              "id": 5,
+              "kind": {
+                "kind": "BiquadLowpass",
+                "cutoff_hz": 2400.0,
+                "q": 1.1
+              },
+              "inputs": {
+                "in": [
+                  {
+                    "source": "node",
+                    "id": 4,
+                    "amount": 1.0
+                  }
+                ]
+              }
+            },
+            {
+              "id": 6,
+              "kind": {
+                "kind": "Gain",
+                "gain": 0.0
+              },
+              "inputs": {
+                "gain": [
+                  {
+                    "source": "node",
+                    "id": 1,
+                    "amount": 1.0
+                  }
+                ],
+                "in": [
+                  {
+                    "source": "node",
+                    "id": 5,
+                    "amount": 1.0
+                  }
+                ]
+              }
+            },
+            {
+              "id": 7,
+              "kind": {
+                "kind": "Chorus",
+                "rate_hz": 0.6,
+                "depth_ms": 3.0,
+                "base_delay_ms": 9.0,
+                "feedback": 0.1,
+                "mix": 0.3
+              },
+              "inputs": {
+                "in": [
+                  {
+                    "source": "node",
+                    "id": 6,
+                    "amount": 1.0
+                  }
+                ]
+              }
+            }
+          ],
+          "output": 7
+        }
+      }
+    }
+  ],
+  "tracks": [
+    {
+      "events": [
+        {
+          "time_beats": 0.0,
+          "instrument_id": "kick",
+          "pitch_multiplier": 1.0,
+          "volume": 0.95,
+          "gate_beats": 0.25,
+          "release_beats": 0.05,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 2.0,
+          "instrument_id": "kick",
+          "pitch_multiplier": 1.0,
+          "volume": 0.95,
+          "gate_beats": 0.25,
+          "release_beats": 0.05,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 4.0,
+          "instrument_id": "kick",
+          "pitch_multiplier": 1.0,
+          "volume": 0.95,
+          "gate_beats": 0.25,
+          "release_beats": 0.05,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 6.0,
+          "instrument_id": "kick",
+          "pitch_multiplier": 1.0,
+          "volume": 0.95,
+          "gate_beats": 0.25,
+          "release_beats": 0.05,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 8.0,
+          "instrument_id": "kick",
+          "pitch_multiplier": 1.0,
+          "volume": 0.95,
+          "gate_beats": 0.25,
+          "release_beats": 0.05,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 10.0,
+          "instrument_id": "kick",
+          "pitch_multiplier": 1.0,
+          "volume": 0.95,
+          "gate_beats": 0.25,
+          "release_beats": 0.05,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 12.0,
+          "instrument_id": "kick",
+          "pitch_multiplier": 1.0,
+          "volume": 0.95,
+          "gate_beats": 0.25,
+          "release_beats": 0.05,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 14.0,
+          "instrument_id": "kick",
+          "pitch_multiplier": 1.0,
+          "volume": 0.95,
+          "gate_beats": 0.25,
+          "release_beats": 0.05,
+          "pitch_mode": "Varispeed"
+        }
+      ]
+    },
+    {
+      "events": [
+        {
+          "time_beats": 1.0,
+          "instrument_id": "snare",
+          "pitch_multiplier": 1.0,
+          "volume": 0.7,
+          "gate_beats": 0.25,
+          "release_beats": 0.05,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 3.0,
+          "instrument_id": "snare",
+          "pitch_multiplier": 1.0,
+          "volume": 0.7,
+          "gate_beats": 0.25,
+          "release_beats": 0.05,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 5.0,
+          "instrument_id": "snare",
+          "pitch_multiplier": 1.0,
+          "volume": 0.7,
+          "gate_beats": 0.25,
+          "release_beats": 0.05,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 7.0,
+          "instrument_id": "snare",
+          "pitch_multiplier": 1.0,
+          "volume": 0.7,
+          "gate_beats": 0.25,
+          "release_beats": 0.05,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 9.0,
+          "instrument_id": "snare",
+          "pitch_multiplier": 1.0,
+          "volume": 0.7,
+          "gate_beats": 0.25,
+          "release_beats": 0.05,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 11.0,
+          "instrument_id": "snare",
+          "pitch_multiplier": 1.0,
+          "volume": 0.7,
+          "gate_beats": 0.25,
+          "release_beats": 0.05,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 13.0,
+          "instrument_id": "snare",
+          "pitch_multiplier": 1.0,
+          "volume": 0.7,
+          "gate_beats": 0.25,
+          "release_beats": 0.05,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 15.0,
+          "instrument_id": "snare",
+          "pitch_multiplier": 1.0,
+          "volume": 0.7,
+          "gate_beats": 0.25,
+          "release_beats": 0.05,
+          "pitch_mode": "Varispeed"
+        }
+      ]
+    },
+    {
+      "events": [
+        {
+          "time_beats": 0.0,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 0.5,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 1.0,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 1.5,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 2.0,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 2.5,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 3.0,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 3.5,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 4.0,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 4.5,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 5.0,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 5.5,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 6.0,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 6.5,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 7.0,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 7.5,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 8.0,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 8.5,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 9.0,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 9.5,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 10.0,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 10.5,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 11.0,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 11.5,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 12.0,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 12.5,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 13.0,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 13.5,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 14.0,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 14.5,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 15.0,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        },
+        {
+          "time_beats": 15.5,
+          "instrument_id": "hat",
+          "pitch_multiplier": 1.0,
+          "volume": 0.4,
+          "gate_beats": 0.12,
+          "release_beats": 0.02,
+          "pitch_mode": "Varispeed"
+        }
+      ]
+    },
+    {
+      "events": [
+        {
+          "time_beats": 0.0,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.0,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 0.5,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.0,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 1.0,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.0,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 1.5,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.0,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 2.0,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.0,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 2.5,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.0,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 3.0,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.0,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 3.5,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.0,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 4.0,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.1892,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 4.5,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.1892,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 5.0,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.1892,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 5.5,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.1892,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 6.0,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.1892,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 6.5,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.1892,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 7.0,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.1892,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 7.5,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.1892,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 8.0,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.3348,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 8.5,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.3348,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 9.0,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.3348,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 9.5,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.3348,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 10.0,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.3348,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 10.5,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.3348,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 11.0,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.3348,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 11.5,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.3348,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 12.0,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.1892,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 12.5,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.1892,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 13.0,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.1892,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 13.5,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.1892,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 14.0,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.1892,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 14.5,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.1892,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 15.0,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.1892,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 15.5,
+          "instrument_id": "bass",
+          "pitch_multiplier": 1.1892,
+          "volume": 0.7,
+          "gate_beats": 0.45,
+          "release_beats": 0.05,
+          "pitch_mode": "TimePreserving"
+        }
+      ]
+    },
+    {
+      "events": [
+        {
+          "time_beats": 0.0,
+          "instrument_id": "guitar",
+          "pitch_multiplier": 1.0,
+          "volume": 0.55,
+          "gate_beats": 0.9,
+          "release_beats": 0.2,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 1.0,
+          "instrument_id": "guitar",
+          "pitch_multiplier": 1.0,
+          "volume": 0.55,
+          "gate_beats": 0.9,
+          "release_beats": 0.2,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 2.0,
+          "instrument_id": "guitar",
+          "pitch_multiplier": 1.0,
+          "volume": 0.55,
+          "gate_beats": 0.9,
+          "release_beats": 0.2,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 3.0,
+          "instrument_id": "guitar",
+          "pitch_multiplier": 1.0,
+          "volume": 0.55,
+          "gate_beats": 0.9,
+          "release_beats": 0.2,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 4.0,
+          "instrument_id": "guitar",
+          "pitch_multiplier": 1.1892,
+          "volume": 0.55,
+          "gate_beats": 0.9,
+          "release_beats": 0.2,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 5.0,
+          "instrument_id": "guitar",
+          "pitch_multiplier": 1.1892,
+          "volume": 0.55,
+          "gate_beats": 0.9,
+          "release_beats": 0.2,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 6.0,
+          "instrument_id": "guitar",
+          "pitch_multiplier": 1.1892,
+          "volume": 0.55,
+          "gate_beats": 0.9,
+          "release_beats": 0.2,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 7.0,
+          "instrument_id": "guitar",
+          "pitch_multiplier": 1.1892,
+          "volume": 0.55,
+          "gate_beats": 0.9,
+          "release_beats": 0.2,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 8.0,
+          "instrument_id": "guitar",
+          "pitch_multiplier": 1.3348,
+          "volume": 0.55,
+          "gate_beats": 0.9,
+          "release_beats": 0.2,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 9.0,
+          "instrument_id": "guitar",
+          "pitch_multiplier": 1.3348,
+          "volume": 0.55,
+          "gate_beats": 0.9,
+          "release_beats": 0.2,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 10.0,
+          "instrument_id": "guitar",
+          "pitch_multiplier": 1.3348,
+          "volume": 0.55,
+          "gate_beats": 0.9,
+          "release_beats": 0.2,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 11.0,
+          "instrument_id": "guitar",
+          "pitch_multiplier": 1.3348,
+          "volume": 0.55,
+          "gate_beats": 0.9,
+          "release_beats": 0.2,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 12.0,
+          "instrument_id": "guitar",
+          "pitch_multiplier": 1.1892,
+          "volume": 0.55,
+          "gate_beats": 0.9,
+          "release_beats": 0.2,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 13.0,
+          "instrument_id": "guitar",
+          "pitch_multiplier": 1.1892,
+          "volume": 0.55,
+          "gate_beats": 0.9,
+          "release_beats": 0.2,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 14.0,
+          "instrument_id": "guitar",
+          "pitch_multiplier": 1.1892,
+          "volume": 0.55,
+          "gate_beats": 0.9,
+          "release_beats": 0.2,
+          "pitch_mode": "TimePreserving"
+        },
+        {
+          "time_beats": 15.0,
+          "instrument_id": "guitar",
+          "pitch_multiplier": 1.1892,
+          "volume": 0.55,
+          "gate_beats": 0.9,
+          "release_beats": 0.2,
+          "pitch_mode": "TimePreserving"
+        }
+      ]
+    }
+  ]
+}
