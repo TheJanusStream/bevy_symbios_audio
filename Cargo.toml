@@ -1,6 +1,6 @@
 [package]
 name = "bevy_symbios_audio"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 authors = ["Janus"]
 description = "Algorithmic audio generator for Bevy."
@@ -12,7 +12,7 @@ categories = ["simulation", "game-development", "mathematics"]
 
 [features]
 default = []
-egui = ["dep:bevy_egui"]
+egui = ["dep:bevy_egui", "dep:web-time"]
 
 [dependencies]
 bevy = { version = "0.18", features = ["wav"] }
@@ -24,6 +24,10 @@ rayon = "1.11"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 symbios-genetics = "0.2"
+# Wall-clock seed source for the editor's "mutate" buttons; forwards to
+# `std` on native and to the browser clock on wasm (std::time panics on
+# wasm32-unknown-unknown). Only the egui editor needs it.
+web-time = { version = "1", optional = true }
 
 [dev-dependencies]
 tempfile = "3"

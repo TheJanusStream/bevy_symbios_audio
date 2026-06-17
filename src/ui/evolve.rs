@@ -16,9 +16,14 @@ use crate::patch::AudioPatch;
 /// A fresh RNG seeded from the wall clock — good enough for interactive,
 /// non-reproducible "mutate" / "randomize" button clicks (we deliberately
 /// don't thread a persistent editor RNG through every widget).
+///
+/// Uses `web_time::SystemTime`, which forwards to `std` on native and to
+/// the browser clock on `wasm32-unknown-unknown`. Plain `std::time`
+/// panics with "time not implemented on this platform" on that wasm
+/// target, which would crash the editor the moment a button is clicked.
 pub(crate) fn fresh_rng() -> ChaCha8Rng {
-    let seed = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
+    let seed = web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
     ChaCha8Rng::seed_from_u64(seed)
