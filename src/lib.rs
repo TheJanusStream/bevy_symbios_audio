@@ -112,24 +112,13 @@
 //! `..Default::default()` their way to a known empty starting point
 //! without enumerating every field.
 
-pub mod adsr;
+// Bevy-coupled modules kept in the wrapper.  The pure DSP language
+// (adsr, bake, chorus, filter, gate, genetics, lfo, mix, mixdown, node,
+// noise, oscillator, patch, reverb, sequence, wav) now lives in the
+// Bevy-free `symbios-audio` core crate and is re-exported below.
 pub mod async_gen;
 pub mod audio_source;
-pub mod bake;
 pub mod cache;
-pub mod chorus;
-pub mod filter;
-pub mod gate;
-pub mod genetics;
-pub mod lfo;
-pub mod mix;
-pub mod mixdown;
-pub mod node;
-pub mod noise;
-pub mod oscillator;
-pub mod patch;
-pub mod reverb;
-pub mod sequence;
 
 // Egui editor widgets for the patch schema, behind the `egui` Cargo
 // feature.  The module documents itself via its own `//!` header (see
@@ -138,31 +127,40 @@ pub mod sequence;
 #[cfg(feature = "egui")]
 pub mod ui;
 
-pub use adsr::{AdsrCurve, AdsrEnvelope};
+// Re-export the entire Bevy-free core so the public API
+// (`bevy_symbios_audio::adsr`, `::bake`, `::AudioPatch`, `::NodeKind`,
+// `::bake_sequence`, the `impl_genotype!` macro, …) is preserved
+// byte-for-byte.  This pulls in every pure module + the pure type/fn
+// re-exports the core's `lib.rs` declares.
+pub use symbios_audio::*;
+
+// `Event`, `Mix`, and `Node` also exist in `bevy::prelude` (glob-imported
+// below for the plugin's `App`/`Plugin`/system items).  Re-export the
+// audio ones explicitly so they win unambiguously over the prelude glob —
+// `bevy_symbios_audio::{Event, Mix, Node}` resolve to the audio types,
+// exactly as before the split.
+pub use symbios_audio::{Event, Mix, Node};
+
+// `impl_genotype!` is `#[macro_export]`ed from the core crate (so it lands
+// at `symbios_audio::impl_genotype`); glob re-exports don't cover macros,
+// so re-export it explicitly to keep `bevy_symbios_audio::impl_genotype!`
+// available exactly as before the split.
+pub use symbios_audio::impl_genotype;
+
+// Wrapper-only re-exports (the Bevy-coupled surface) — the async-bake
+// handover, the WAV→AudioSource bridge, and the `Resource` cache.  The
+// pure `samples_to_wav_bytes` / `MAX_WAV_SAMPLES` already arrive via the
+// `symbios_audio::*` glob above (and `audio_source` re-exports them too),
+// so they're intentionally omitted here to avoid an ambiguous glob.
 pub use async_gen::{
     AsyncAudioConfig, AudioPatchReady, CacheOrPending, DEFAULT_POOL_THREADS, PendingAudioPatch,
     bake_with_cache,
 };
-pub use audio_source::{MAX_WAV_SAMPLES, samples_to_audio_source, samples_to_wav_bytes};
-pub use bake::{bake, try_bake};
+pub use audio_source::samples_to_audio_source;
 pub use cache::{
     DEFAULT_MEMORY_CACHE_ENTRIES, FileStore, MemoryStore, PatchCache, PatchCacheKey,
     PatchCacheStore,
 };
-pub use chorus::Chorus;
-pub use filter::{BiquadBandpass, BiquadHighpass, BiquadLowpass, BiquadState};
-pub use gate::Gate;
-pub use lfo::{Lfo, LfoShape};
-pub use mix::{Gain, Mix};
-pub use mixdown::bake_sequence;
-pub use node::{BakeContext, Node, NodeKind};
-pub use noise::{BrownNoise, PinkNoise, WhiteNoise};
-pub use oscillator::{
-    AntiAlias, OscPhase, SawPolarity, SawtoothOsc, SineOsc, SquareOsc, TriangleOsc,
-};
-pub use patch::{AudioPatch, Connection, GraphError, GraphNode, NodeGraph, NodeId, topo_sort};
-pub use reverb::Reverb;
-pub use sequence::{Event, Instrument, PitchMode, SequenceRecipe, Track};
 
 use bevy::prelude::*;
 

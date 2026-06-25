@@ -51,6 +51,10 @@ pub fn mutate_node_kind(kind: &mut NodeKind, rng: &mut impl Rng, rate: f32) {
         NodeKind::Gate(g) => g.mutate(rng, rate),
         NodeKind::Chorus(c) => c.mutate(rng, rate),
         NodeKind::Reverb(r) => r.mutate(rng, rate),
+        // `NodeKind` is `#[non_exhaustive]` and now lives in the
+        // `symbios-audio` core crate; a future built-in kind this editor
+        // doesn't yet know how to mutate is left untouched.
+        _ => {}
     }
 }
 

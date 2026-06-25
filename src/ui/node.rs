@@ -324,6 +324,9 @@ pub fn node_kind_label(kind: &NodeKind) -> &'static str {
         NodeKind::Gate(_) => "Gate",
         NodeKind::Chorus(_) => "Chorus",
         NodeKind::Reverb(_) => "Reverb",
+        // `NodeKind` is `#[non_exhaustive]` (defined in the `symbios-audio`
+        // core crate); a not-yet-known kind has no label here.
+        _ => "Unknown",
     }
 }
 
@@ -379,6 +382,12 @@ pub fn node_kind_body(ui: &mut egui::Ui, kind: &mut NodeKind) -> EditorResponse 
         NodeKind::Gate(g) => gate_editor(ui, g),
         NodeKind::Chorus(c) => chorus_editor(ui, c),
         NodeKind::Reverb(r) => reverb_editor(ui, r),
+        // `NodeKind` is `#[non_exhaustive]` (defined in the `symbios-audio`
+        // core crate); a not-yet-known kind has no editor widget here.
+        _ => {
+            ui.label("No editor for this node kind.");
+            EditorResponse::NONE
+        }
     }
 }
 

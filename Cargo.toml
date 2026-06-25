@@ -1,6 +1,6 @@
 [package]
 name = "bevy_symbios_audio"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 authors = ["Janus"]
 description = "Algorithmic audio generator for Bevy."
@@ -23,6 +23,7 @@ rand_chacha = "0.9"
 rayon = "1.11"
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
+symbios-audio = "0.1"
 symbios-genetics = "0.2"
 # Wall-clock seed source for the editor's "mutate" buttons; forwards to
 # `std` on native and to the browser clock on wasm (std::time panics on

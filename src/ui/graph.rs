@@ -136,6 +136,9 @@ fn input_ports(kind: &NodeKind) -> &'static [&'static str] {
         | NodeKind::BrownNoise(_)
         | NodeKind::Lfo(_)
         | NodeKind::Gate(_) => &[],
+        // `NodeKind` is `#[non_exhaustive]` (defined in the `symbios-audio`
+        // core crate); a not-yet-known kind contributes no input ports here.
+        _ => &[],
     }
 }
 
