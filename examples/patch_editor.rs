@@ -127,8 +127,19 @@ fn render_ui(
         return;
     };
 
+    // egui 0.35 shows panels into a `Ui`, not a `Context`. A top-level layout
+    // draws into a screen-sized background layer (bevy_egui 0.41's side_panel
+    // example), adding panels outermost first and `CentralPanel` last.
+    let mut viewport_ui = egui::Ui::new(
+        ctx.clone(),
+        "viewport".into(),
+        egui::UiBuilder::new()
+            .layer_id(egui::LayerId::background())
+            .max_rect(ctx.viewport_rect()),
+    );
+
     // Monitor controls + waveform (top).
-    egui::TopBottomPanel::top("monitor").show(ctx, |ui| {
+    egui::Panel::top("monitor").show(&mut viewport_ui, |ui| {
         ui.horizontal(|ui| {
             if ui.button("\u{25B6} Bake & Play").clicked() {
                 requests.write(MonitorRequest::PlayPatch {
@@ -161,7 +172,7 @@ fn render_ui(
 
     // Node-graph canvas (fills the rest).
     let editor = editor.as_mut();
-    egui::CentralPanel::default().show(ctx, |ui| {
+    egui::CentralPanel::default().show(&mut viewport_ui, |ui| {
         audio_patch_canvas(
             ui,
             &mut editor.patch,

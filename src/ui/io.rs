@@ -98,8 +98,8 @@ mod tests {
         let ctx = egui::Context::default();
         let mut value = AudioPatch::default();
         let mut state = JsonIoState::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let _ = ctx.run_ui(egui::RawInput::default(), |root| {
+            egui::CentralPanel::default().show(root, |ui| {
                 json_io(ui, &mut value, &mut state, egui::Id::new("json"));
             });
         });

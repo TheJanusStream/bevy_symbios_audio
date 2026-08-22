@@ -588,7 +588,7 @@ fn connection_editor(ui: &mut egui::Ui, node: &mut GraphNode) -> EditorResponse 
     }
 
     // Remove highest indices first so earlier removals don't shift them.
-    to_delete.sort_by(|a, b| b.1.cmp(&a.1));
+    to_delete.sort_by_key(|entry| std::cmp::Reverse(entry.1));
     for (port, idx) in to_delete {
         if let Some(v) = node.inputs.get_mut(&port) {
             if idx < v.len() {
@@ -756,8 +756,8 @@ mod tests {
         let mut patch = three_node_patch();
         let mut state = PatchEditorState::default();
         for _ in 0..3 {
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = ctx.run_ui(egui::RawInput::default(), |root| {
+                egui::CentralPanel::default().show(root, |ui| {
                     audio_patch_canvas(ui, &mut patch, &mut state, egui::Id::new("smoke"));
                 });
             });
@@ -786,8 +786,8 @@ mod tests {
 
         let ctx = egui::Context::default();
         let mut state = PatchEditorState::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let _ = ctx.run_ui(egui::RawInput::default(), |root| {
+            egui::CentralPanel::default().show(root, |ui| {
                 audio_patch_canvas(ui, &mut patch, &mut state, egui::Id::new("smoke_bad"));
             });
         });

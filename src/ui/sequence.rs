@@ -758,11 +758,11 @@ mod tests {
 
         let ctx = egui::Context::default();
         for _ in 0..3 {
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                egui::SidePanel::left("seq").show(ctx, |ui| {
+            let _ = ctx.run_ui(egui::RawInput::default(), |root| {
+                egui::Panel::left("seq").show(root, |ui| {
                     sequence_recipe_editor(ui, &mut recipe, &mut state, Id::new("seq"));
                 });
-                egui::CentralPanel::default().show(ctx, |ui| {
+                egui::CentralPanel::default().show(root, |ui| {
                     active_instrument_canvas(ui, &mut recipe, &mut state, Id::new("seq_canvas"));
                 });
             });
@@ -774,8 +774,8 @@ mod tests {
         let mut recipe = SequenceRecipe::default();
         let mut state = SequenceEditorState::default();
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
+        let _ = ctx.run_ui(egui::RawInput::default(), |root| {
+            egui::CentralPanel::default().show(root, |ui| {
                 sequence_recipe_editor(ui, &mut recipe, &mut state, Id::new("seq"));
             });
         });

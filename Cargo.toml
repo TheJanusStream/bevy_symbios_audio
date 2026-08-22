@@ -1,6 +1,6 @@
 [package]
 name = "bevy_symbios_audio"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 authors = ["Janus"]
 description = "Algorithmic audio generator for Bevy."
@@ -15,8 +15,8 @@ default = []
 egui = ["dep:bevy_egui", "dep:web-time"]
 
 [dependencies]
-bevy = { version = "0.18", features = ["wav"] }
-bevy_egui = { version = "0.39", optional = true }
+bevy = { version = "0.19", features = ["wav"] }
+bevy_egui = { version = "0.41", optional = true }
 clap = { version = "4", features = ["derive"] }
 rand = "0.9"
 rand_chacha = "0.9"
@@ -33,7 +33,7 @@ web-time = { version = "1", optional = true }
 [dev-dependencies]
 tempfile = "3"
 criterion = "0.8"
-bevy_egui = "0.39"
+bevy_egui = "0.41"
 
 [[bin]]
 name = "symbios-audio-cli"

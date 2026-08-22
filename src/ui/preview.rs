@@ -269,8 +269,8 @@ mod tests {
         let ctx = egui::Context::default();
         let sine: Vec<f32> = (0..2000).map(|i| (i as f32 * 0.05).sin()).collect();
         for buf in [Vec::new(), sine] {
-            let _ = ctx.run(egui::RawInput::default(), |ctx| {
-                egui::CentralPanel::default().show(ctx, |ui| {
+            let _ = ctx.run_ui(egui::RawInput::default(), |root| {
+                egui::CentralPanel::default().show(root, |ui| {
                     waveform(ui, &buf);
                 });
             });

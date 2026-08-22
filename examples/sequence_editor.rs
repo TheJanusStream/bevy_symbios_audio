@@ -198,7 +198,18 @@ fn render_ui(
         return;
     };
 
-    egui::TopBottomPanel::top("monitor").show(ctx, |ui| {
+    // egui 0.35 shows panels into a `Ui`, not a `Context`. A top-level layout
+    // draws into a screen-sized background layer (bevy_egui 0.41's side_panel
+    // example), adding panels outermost first and `CentralPanel` last.
+    let mut viewport_ui = egui::Ui::new(
+        ctx.clone(),
+        "viewport".into(),
+        egui::UiBuilder::new()
+            .layer_id(egui::LayerId::background())
+            .max_rect(ctx.viewport_rect()),
+    );
+
+    egui::Panel::top("monitor").show(&mut viewport_ui, |ui| {
         ui.horizontal(|ui| {
             if ui.button("\u{25B6} Bake & Play").clicked() {
                 requests.write(MonitorRequest::PlaySequence {
@@ -228,9 +239,9 @@ fn render_ui(
     });
 
     let editor = editor.as_mut();
-    egui::SidePanel::left("sequence")
-        .default_width(420.0)
-        .show(ctx, |ui| {
+    egui::Panel::left("sequence")
+        .default_size(420.0)
+        .show(&mut viewport_ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
                 sequence_recipe_editor(
                     ui,
@@ -241,7 +252,7 @@ fn render_ui(
             });
         });
 
-    egui::CentralPanel::default().show(ctx, |ui| {
+    egui::CentralPanel::default().show(&mut viewport_ui, |ui| {
         active_instrument_canvas(
             ui,
             &mut editor.recipe,
