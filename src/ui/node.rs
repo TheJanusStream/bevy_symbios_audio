@@ -36,6 +36,18 @@ use super::{EditorResponse, bool_instant, drag_debounced, slider_debounced};
 // Editor-generating macro
 // ---------------------------------------------------------------------------
 
+/// One config's parameter widgets, reachable from the config *type*.
+///
+/// Every node config implements this, generated alongside its `*_editor`
+/// function by `impl_node_editor!` below. It exists so `node_kind_body` can
+/// be generated from `symbios_audio::for_each_node_kind!`: the roster names
+/// each variant's config type, not the name of the function that edits it,
+/// so a type-dispatched call is the only handle it can offer. Private —
+/// callers use the `*_editor` functions or `node_kind_body`.
+trait NodeConfigEditor {
+    fn edit(&mut self, ui: &mut egui::Ui) -> EditorResponse;
+}
+
 /// Generate a per-node editor function from a concise field description.
 ///
 /// Widget kinds:
@@ -59,6 +71,12 @@ macro_rules! impl_node_editor {
             let mut res = EditorResponse::NONE;
             $( impl_node_editor!(@w ui, cfg, res, $w $args); )*
             res
+        }
+
+        impl NodeConfigEditor for $Config {
+            fn edit(&mut self, ui: &mut egui::Ui) -> EditorResponse {
+                $fn_name(ui, self)
+            }
         }
     };
 
@@ -280,115 +298,86 @@ impl_node_editor!(
 // NodeKind-level editor (kind picker + body)
 // ---------------------------------------------------------------------------
 
-/// Node kinds in display order for the picker dropdown.
-const KIND_LABELS: [&str; 18] = [
-    "Silence",
-    "Sine",
-    "Square",
-    "Sawtooth",
-    "Triangle",
-    "White Noise",
-    "Pink Noise",
-    "Brown Noise",
-    "ADSR",
-    "Lowpass",
-    "Highpass",
-    "Bandpass",
-    "LFO",
-    "Mix",
-    "Gain",
-    "Gate",
-    "Chorus",
-    "Reverb",
-];
-
-/// Human-readable label for a node kind — used by the kind picker and (in
-/// later phases) by canvas node-box headers.
-pub fn node_kind_label(kind: &NodeKind) -> &'static str {
-    match kind {
-        NodeKind::Silence => "Silence",
-        NodeKind::Sine(_) => "Sine",
-        NodeKind::Square(_) => "Square",
-        NodeKind::Sawtooth(_) => "Sawtooth",
-        NodeKind::Triangle(_) => "Triangle",
-        NodeKind::WhiteNoise(_) => "White Noise",
-        NodeKind::PinkNoise(_) => "Pink Noise",
-        NodeKind::BrownNoise(_) => "Brown Noise",
-        NodeKind::Adsr(_) => "ADSR",
-        NodeKind::BiquadLowpass(_) => "Lowpass",
-        NodeKind::BiquadHighpass(_) => "Highpass",
-        NodeKind::BiquadBandpass(_) => "Bandpass",
-        NodeKind::Lfo(_) => "LFO",
-        NodeKind::Mix(_) => "Mix",
-        NodeKind::Gain(_) => "Gain",
-        NodeKind::Gate(_) => "Gate",
-        NodeKind::Chorus(_) => "Chorus",
-        NodeKind::Reverb(_) => "Reverb",
-        // `NodeKind` is `#[non_exhaustive]` (defined in the `symbios-audio`
-        // core crate); a not-yet-known kind has no label here.
-        _ => "Unknown",
-    }
-}
-
-/// Build a default node of the kind named by `label` (the inverse of
-/// [`node_kind_label`]).  Unknown labels fall back to [`NodeKind::Silence`].
-fn default_kind_for(label: &str) -> NodeKind {
-    match label {
-        "Sine" => NodeKind::Sine(SineOsc::default()),
-        "Square" => NodeKind::Square(SquareOsc::default()),
-        "Sawtooth" => NodeKind::Sawtooth(SawtoothOsc::default()),
-        "Triangle" => NodeKind::Triangle(TriangleOsc::default()),
-        "White Noise" => NodeKind::WhiteNoise(WhiteNoise::default()),
-        "Pink Noise" => NodeKind::PinkNoise(PinkNoise::default()),
-        "Brown Noise" => NodeKind::BrownNoise(BrownNoise::default()),
-        "ADSR" => NodeKind::Adsr(AdsrEnvelope::default()),
-        "Lowpass" => NodeKind::BiquadLowpass(BiquadLowpass::default()),
-        "Highpass" => NodeKind::BiquadHighpass(BiquadHighpass::default()),
-        "Bandpass" => NodeKind::BiquadBandpass(BiquadBandpass::default()),
-        "LFO" => NodeKind::Lfo(Lfo::default()),
-        "Mix" => NodeKind::Mix(Mix::default()),
-        "Gain" => NodeKind::Gain(Gain::default()),
-        "Gate" => NodeKind::Gate(Gate::default()),
-        "Chorus" => NodeKind::Chorus(Chorus::default()),
-        "Reverb" => NodeKind::Reverb(Reverb::default()),
-        _ => NodeKind::Silence,
-    }
-}
-
-/// Render only the parameter widgets for `kind` — no kind picker, no header.
+/// The picker, the labels and the per-kind body, all generated from
+/// `symbios_audio::for_each_node_kind!`.
 ///
-/// Use this when the surrounding UI already conveys the node's type (e.g. a
-/// canvas node box that paints the kind name in its title bar).
-pub fn node_kind_body(ui: &mut egui::Ui, kind: &mut NodeKind) -> EditorResponse {
-    match kind {
-        NodeKind::Silence => {
-            ui.label("No parameters.");
-            EditorResponse::NONE
+/// These three used to be hand-written lists, and the roster they encoded was
+/// the *fourth* copy of the node vocabulary in the family — after
+/// `symbios-audio`'s own enum and Overlands' two mirror rosters. `NodeKind` is
+/// `#[non_exhaustive]`, so nothing here could ever be checked against it: a
+/// kind added upstream simply never appeared in the dropdown, and the tests
+/// below passed because they compared these lists against each other.
+/// Generating them means a kind added upstream arrives in the picker, with a
+/// default and an editor body, on the version bump alone.
+macro_rules! define_kind_picker {
+    (
+        unit: { $(($uv:ident, $ul:literal)),* $(,)? }
+        data: { $(($dv:ident, $dt:ty, $dl:literal)),* $(,)? }
+    ) => {
+        /// Node kinds in display order for the picker dropdown — upstream's
+        /// roster order.
+        const KIND_LABELS: &[&str] = &[ $( $ul, )* $( $dl, )* ];
+
+        /// Build a default node of the kind named by `label` (the inverse of
+        /// [`node_kind_label`]).  Unknown labels fall back to
+        /// [`NodeKind::Silence`].
+        fn default_kind_for(label: &str) -> NodeKind {
+            match label {
+                $( $ul => NodeKind::$uv, )*
+                $( $dl => NodeKind::$dv(<$dt>::default()), )*
+                _ => NodeKind::Silence,
+            }
         }
-        NodeKind::Sine(o) => sine_osc_editor(ui, o),
-        NodeKind::Square(o) => square_osc_editor(ui, o),
-        NodeKind::Sawtooth(o) => sawtooth_osc_editor(ui, o),
-        NodeKind::Triangle(o) => triangle_osc_editor(ui, o),
-        NodeKind::WhiteNoise(n) => white_noise_editor(ui, n),
-        NodeKind::PinkNoise(n) => pink_noise_editor(ui, n),
-        NodeKind::BrownNoise(n) => brown_noise_editor(ui, n),
-        NodeKind::Adsr(e) => adsr_envelope_editor(ui, e),
-        NodeKind::BiquadLowpass(f) => biquad_lowpass_editor(ui, f),
-        NodeKind::BiquadHighpass(f) => biquad_highpass_editor(ui, f),
-        NodeKind::BiquadBandpass(f) => biquad_bandpass_editor(ui, f),
-        NodeKind::Lfo(l) => lfo_editor(ui, l),
-        NodeKind::Mix(m) => mix_editor(ui, m),
-        NodeKind::Gain(g) => gain_editor(ui, g),
-        NodeKind::Gate(g) => gate_editor(ui, g),
-        NodeKind::Chorus(c) => chorus_editor(ui, c),
-        NodeKind::Reverb(r) => reverb_editor(ui, r),
-        // `NodeKind` is `#[non_exhaustive]` (defined in the `symbios-audio`
-        // core crate); a not-yet-known kind has no editor widget here.
-        _ => {
-            ui.label("No editor for this node kind.");
-            EditorResponse::NONE
+
+        /// Render only the parameter widgets for `kind` — no kind picker, no
+        /// header.
+        ///
+        /// Use this when the surrounding UI already conveys the node's type
+        /// (e.g. a canvas node box that paints the kind name in its title
+        /// bar).
+        pub fn node_kind_body(ui: &mut egui::Ui, kind: &mut NodeKind) -> EditorResponse {
+            match kind {
+                $(
+                    NodeKind::$uv => {
+                        ui.label("No parameters.");
+                        EditorResponse::NONE
+                    }
+                )*
+                // Dispatched by config type through the private
+                // `NodeConfigEditor` trait, which `impl_node_editor!`
+                // implements for each config — the roster names types, not
+                // function names.
+                $( NodeKind::$dv(config) => config.edit(ui), )*
+                // A patch written by a newer version of `symbios-audio`
+                // decodes its unrecognised nodes here. There is nothing to
+                // edit and nothing this build could safely write back
+                // (`NodeKind::Unknown` is `skip_serializing` upstream), so
+                // say so rather than showing an empty panel.
+                NodeKind::Unknown => {
+                    ui.label("This node was made by a newer version. It cannot be edited here, and saving this patch will be refused rather than overwrite it.");
+                    EditorResponse::NONE
+                }
+                // `NodeKind` is `#[non_exhaustive]`, so the compiler keeps
+                // this arm however complete the roster is.
+                _ => {
+                    ui.label("No editor for this node kind.");
+                    EditorResponse::NONE
+                }
+            }
         }
-    }
+    };
+}
+
+symbios_audio::for_each_node_kind!(define_kind_picker);
+
+/// Human-readable label for a node kind — used by the kind picker and by
+/// canvas node-box headers.
+///
+/// Delegates to `symbios-audio`'s own `NodeKind::label`, which is generated
+/// from the same roster the picker is, so there is exactly one table of node
+/// names in the family rather than one per crate.
+pub fn node_kind_label(kind: &NodeKind) -> &'static str {
+    kind.label()
 }
 
 /// Full editor for one [`NodeKind`]: a kind-picker combo box plus the selected
@@ -404,7 +393,7 @@ pub fn node_kind_editor(ui: &mut egui::Ui, kind: &mut NodeKind, id: egui::Id) ->
         egui::ComboBox::from_label("Kind")
             .selected_text(node_kind_label(kind))
             .show_ui(ui, |ui| {
-                for label in KIND_LABELS {
+                for label in KIND_LABELS.iter().copied() {
                     let selected = node_kind_label(kind) == label;
                     if ui.selectable_label(selected, label).clicked() && !selected {
                         *kind = default_kind_for(label);
@@ -426,7 +415,7 @@ mod tests {
     fn label_round_trips_through_default_kind() {
         // Every label maps to a kind whose label is itself — so the picker's
         // selected-text and the dropdown rows stay consistent.
-        for label in KIND_LABELS {
+        for label in KIND_LABELS.iter().copied() {
             let kind = default_kind_for(label);
             assert_eq!(
                 node_kind_label(&kind),
@@ -441,36 +430,46 @@ mod tests {
         assert!(matches!(default_kind_for("nonsense"), NodeKind::Silence));
     }
 
+    /// Every kind `symbios-audio` ships is offered by the picker, and the
+    /// picker offers nothing else.
+    ///
+    /// The list this used to walk was hand-written here, so it could only
+    /// ever agree with the hand-written `KIND_LABELS` beside it — both went
+    /// stale together the moment a kind was added upstream, and neither test
+    /// could notice. `NodeKind::defaults()` comes from the crate that
+    /// defines the kinds, which is the only place the roster can be
+    /// authoritative.
     #[test]
-    fn every_kind_label_is_listed_in_the_picker() {
-        // Guards against adding a NodeKind variant but forgetting the picker
-        // entry: each variant's label must appear in KIND_LABELS.
-        let all = [
-            NodeKind::Silence,
-            NodeKind::Sine(SineOsc::default()),
-            NodeKind::Square(SquareOsc::default()),
-            NodeKind::Sawtooth(SawtoothOsc::default()),
-            NodeKind::Triangle(TriangleOsc::default()),
-            NodeKind::WhiteNoise(WhiteNoise::default()),
-            NodeKind::PinkNoise(PinkNoise::default()),
-            NodeKind::BrownNoise(BrownNoise::default()),
-            NodeKind::Adsr(AdsrEnvelope::default()),
-            NodeKind::BiquadLowpass(BiquadLowpass::default()),
-            NodeKind::BiquadHighpass(BiquadHighpass::default()),
-            NodeKind::BiquadBandpass(BiquadBandpass::default()),
-            NodeKind::Lfo(Lfo::default()),
-            NodeKind::Mix(Mix::default()),
-            NodeKind::Gain(Gain::default()),
-            NodeKind::Gate(Gate::default()),
-            NodeKind::Chorus(Chorus::default()),
-            NodeKind::Reverb(Reverb::default()),
-        ];
-        for kind in &all {
+    fn the_picker_offers_exactly_the_kinds_upstream_ships() {
+        let upstream = NodeKind::defaults();
+        assert_eq!(
+            KIND_LABELS.len(),
+            upstream.len(),
+            "picker and upstream roster disagree on how many kinds there are"
+        );
+        for kind in &upstream {
             assert!(
                 KIND_LABELS.contains(&node_kind_label(kind)),
                 "{} missing from KIND_LABELS",
                 node_kind_label(kind)
             );
         }
+        for label in KIND_LABELS.iter().copied() {
+            assert!(
+                upstream.iter().any(|k| node_kind_label(k) == label),
+                "picker offers {label}, which upstream does not ship"
+            );
+        }
+    }
+
+    /// `Unknown` is a decode landing place, never an offer. Picking it would
+    /// build a node this build cannot edit and cannot write back.
+    #[test]
+    fn the_picker_never_offers_unknown() {
+        assert!(!KIND_LABELS.contains(&node_kind_label(&NodeKind::Unknown)));
+        assert!(!KIND_LABELS.contains(&"Unknown"));
+        // And the label for it is still the one the fallback text uses, so a
+        // node box that meets one is titled rather than blank.
+        assert_eq!(node_kind_label(&NodeKind::Unknown), "Unknown");
     }
 }
