@@ -50,6 +50,15 @@ name = "symbios-audio-cli"
 path = "src/bin/symbios_audio_cli.rs"
 required-features = ["cli"]
 
+# The integration suite execs the binary through `CARGO_BIN_EXE_...`, and
+# Cargo still sets that variable when the binary was skipped for want of its
+# features — pointing at a path that was never built. Without this line the
+# suite compiles and then fails at run time with a bare `NotFound`, on every
+# feature row that does not enable `cli`.
+[[test]]
+name = "cli"
+required-features = ["cli"]
+
 [[example]]
 name = "patch_editor"
 required-features = ["egui"]
