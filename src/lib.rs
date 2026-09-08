@@ -116,6 +116,11 @@
 // (adsr, bake, chorus, filter, gate, genetics, lfo, mix, mixdown, node,
 // noise, oscillator, patch, reverb, sequence, wav) now lives in the
 // Bevy-free `symbios-audio` core crate and is re-exported below.
+// docs.rs builds with `--cfg docsrs` on nightly, which is what puts the
+// "available on crate feature `egui`" badges on the gated items. Inert
+// everywhere else.
+#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+
 pub mod async_gen;
 pub mod audio_source;
 pub mod cache;

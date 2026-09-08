@@ -10,14 +10,24 @@ repository = "https://github.com/TheJanusStream/bevy_symbios_audio"
 keywords = ["audio", "procedural", "generative", "simulation"]
 categories = ["simulation", "game-development", "mathematics"]
 
+# docs.rs builds every feature, so the egui editor's widgets and the CLI are
+# documented whether or not a default build carries them.
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
 [features]
 default = []
 egui = ["dep:bevy_egui", "dep:web-time"]
+# The `symbios-audio-cli` binary only. `clap` was a hard dependency of the
+# library until 0.4 even though nothing outside `src/bin/` ever referenced
+# it, so every consumer compiled the argument parser to get the plugin.
+cli = ["dep:clap"]
 
 [dependencies]
 bevy = { version = "0.19", features = ["wav"] }
 bevy_egui = { version = "0.41", optional = true }
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }
 rand = "0.9"
 rand_chacha = "0.9"
 rayon = "1.11"
@@ -38,6 +48,7 @@ bevy_egui = "0.41"
 [[bin]]
 name = "symbios-audio-cli"
 path = "src/bin/symbios_audio_cli.rs"
+required-features = ["cli"]
 
 [[example]]
 name = "patch_editor"
@@ -53,3 +64,7 @@ harness = false
 
 [profile.bench]
 debug = true
+
+[lints.rust]
+# Set by docs.rs only; see the attribute at the top of `src/lib.rs`.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs)'] }
