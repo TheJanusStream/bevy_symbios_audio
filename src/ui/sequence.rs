@@ -175,7 +175,7 @@ pub fn active_instrument_canvas(
         .filter(|i| *i < recipe.instruments.len())
     else {
         state.active_instrument = None;
-        ui.label("Select an instrument (\u{270E}) to edit its patch here.");
+        ui.label("Select an instrument (\u{270F}) to edit its patch here.");
         return EditorResponse::NONE;
     };
     let inst_id = recipe.instruments[i].id.clone();
@@ -282,7 +282,10 @@ fn instruments_panel(
         ui.horizontal(|ui| {
             let active = state.active_instrument == Some(i);
             if ui
-                .selectable_label(active, "\u{270E}")
+                // U+270F, the emoji-presentation pencil: it is in egui's
+                // embedded Noto Emoji, where the text-only U+270E is not, so
+                // it draws in any host that ships egui's default fonts (#52).
+                .selectable_label(active, "\u{270F}")
                 .on_hover_text("Edit this instrument's patch")
                 .clicked()
             {

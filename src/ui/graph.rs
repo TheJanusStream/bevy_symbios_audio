@@ -337,11 +337,11 @@ fn toolbar(
         Ok(order) => {
             ui.colored_label(
                 Color32::from_rgb(120, 200, 120),
-                format!("\u{2713} valid graph \u{2014} {} nodes", order.len()),
+                format!("\u{2714} valid graph \u{2014} {} nodes", order.len()),
             );
         }
         Err(e) => {
-            ui.colored_label(Color32::from_rgb(220, 120, 120), format!("\u{2717} {e}"));
+            ui.colored_label(Color32::from_rgb(220, 120, 120), format!("\u{2716} {e}"));
         }
     }
     res
@@ -554,7 +554,7 @@ fn connection_editor(ui: &mut egui::Ui, node: &mut GraphNode) -> EditorResponse 
     for port in &ports {
         ui.horizontal(|ui| {
             ui.label(format!("{port}:"));
-            if ui.small_button("\u{FF0B}const").clicked() {
+            if ui.small_button("\u{2795} const").clicked() {
                 to_add_const.push(port.clone());
                 res.changed = true;
                 res.rebake = true;
@@ -565,7 +565,7 @@ fn connection_editor(ui: &mut egui::Ui, node: &mut GraphNode) -> EditorResponse 
                 ui.horizontal(|ui| {
                     match c {
                         Connection::Node { id, amount } => {
-                            ui.label(format!("  \u{2190} #{}", id.0));
+                            ui.label(format!("  \u{2B05} #{}", id.0));
                             let r = ui.add(egui::DragValue::new(amount).speed(0.05).prefix("amt "));
                             res.changed |= r.changed();
                             res.rebake |= r.drag_stopped() || (r.changed() && !r.dragged());

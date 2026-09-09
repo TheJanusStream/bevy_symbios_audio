@@ -167,3 +167,162 @@ pub fn bool_instant(ui: &mut egui::Ui, val: &mut bool, label: &str) -> EditorRes
         rebake: r.changed(),
     }
 }
+
+/// Every non-ASCII glyph a string literal under `src/ui` draws must be in
+/// egui's own default faces (#52).
+///
+/// This crate ships no font; the host does. The floor every host has is
+/// egui's embedded tail — Ubuntu-Light, Noto Emoji and a small icon face —
+/// and a host's own body face (Overlands puts Noto Sans in front) adds
+/// Latin, Greek and Cyrillic and little else. So a symbol outside egui's
+/// tail is an empty box everywhere, it looks like a styled button until
+/// someone renders it, and nothing at build time can see it: five of them
+/// shipped in 0.4.0. Coverage is not guessable from a glyph's looks — `✔`
+/// (U+2714) is in Noto Emoji and `✓` (U+2713) is not — so this asks the
+/// charmaps, which is the question epaint asks per character.
+#[cfg(test)]
+mod glyph_guard {
+    use bevy_egui::egui;
+
+    /// The contents of every `"…"` literal in `source`, `\u{…}` escapes
+    /// decoded (an escaped code point is a glyph on screen like any other),
+    /// every other escape consumed opaquely, `//` comments skipped, and a
+    /// char literal recognised so `'"'` cannot open a string. A mis-lexed
+    /// literal costs coverage, never a false failure.
+    fn string_literals(source: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut chars = source.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                '/' if chars.peek() == Some(&'/') => {
+                    for c in chars.by_ref() {
+                        if c == '\n' {
+                            break;
+                        }
+                    }
+                }
+                '\'' => {
+                    let mut probe = chars.clone();
+                    let is_char = match probe.next() {
+                        Some('\\') => {
+                            probe.next();
+                            probe.next() == Some('\'')
+                        }
+                        Some(_) => probe.next() == Some('\''),
+                        None => false,
+                    };
+                    if is_char {
+                        if chars.peek() == Some(&'\\') {
+                            chars.next();
+                        }
+                        chars.next();
+                        chars.next();
+                    }
+                }
+                '"' => {
+                    let mut literal = String::new();
+                    loop {
+                        match chars.next() {
+                            None | Some('"') => break,
+                            Some('\\') => match chars.next() {
+                                Some('u') if chars.peek() == Some(&'{') => {
+                                    chars.next();
+                                    let mut hex = String::new();
+                                    for h in chars.by_ref() {
+                                        if h == '}' {
+                                            break;
+                                        }
+                                        hex.push(h);
+                                    }
+                                    if let Some(c) =
+                                        u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32)
+                                    {
+                                        literal.push(c);
+                                    }
+                                }
+                                _ => {}
+                            },
+                            Some(other) => literal.push(other),
+                        }
+                    }
+                    out.push(literal);
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Whether one of egui's default proportional faces owns a glyph for `c`.
+    fn egui_default_faces_draw(defs: &egui::FontDefinitions, c: char) -> bool {
+        use skrifa::MetadataProvider;
+        defs.families[&egui::FontFamily::Proportional]
+            .iter()
+            .map(|name| &defs.font_data[name])
+            .any(|face| {
+                let font = skrifa::FontRef::from_index(&face.font, face.index)
+                    .expect("an egui default face parses");
+                font.charmap().map(c).is_some()
+            })
+    }
+
+    #[test]
+    fn every_editor_glyph_is_in_eguis_default_faces() {
+        let defs = egui::FontDefinitions::default();
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui");
+        let mut sources: Vec<_> = std::fs::read_dir(&dir)
+            .expect("src/ui is readable")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+            .collect();
+        sources.sort();
+        assert!(sources.len() >= 5, "the walk found no editor sources");
+
+        let mut missing = Vec::new();
+        let mut seen = 0usize;
+        for path in &sources {
+            let source = std::fs::read_to_string(path).expect("editor source is readable");
+            for literal in string_literals(&source) {
+                for c in literal.chars().filter(|c| !c.is_ascii()) {
+                    seen += 1;
+                    if !egui_default_faces_draw(&defs, c) {
+                        missing.push(format!(
+                            "{c} U+{:04X} in {}",
+                            u32::from(c),
+                            path.file_name().unwrap_or_default().to_string_lossy()
+                        ));
+                    }
+                }
+            }
+        }
+        missing.sort();
+        missing.dedup();
+        assert!(
+            missing.is_empty(),
+            "editor glyphs egui's default faces cannot draw (tofu in every host):\n  {}",
+            missing.join("\n  ")
+        );
+        // A floor, not a count: the scan's failure mode is reading nothing.
+        assert!(
+            seen >= 15,
+            "the scan saw only {seen} non-ASCII glyphs and has gone blind"
+        );
+    }
+
+    /// The guard can tell a drawn glyph from tofu, and it sees through an
+    /// escape: the shipped pencil, `\u{270E}`, is reported missing while its
+    /// emoji-presentation sibling U+270F draws.
+    #[test]
+    fn the_glyph_guard_sees_the_shipped_tofu() {
+        let defs = egui::FontDefinitions::default();
+        assert!(!egui_default_faces_draw(&defs, '\u{270E}'));
+        assert!(egui_default_faces_draw(&defs, '\u{270F}'));
+        assert!(egui_default_faces_draw(&defs, 'e'));
+        // The expected value is spelled with char literals: a `\u{…}` in a
+        // string literal here would be the very tofu the walk above flags.
+        let lexed = string_literals("ui.label(\"(\\u{270E})\")");
+        assert_eq!(lexed.len(), 1);
+        let chars: Vec<char> = lexed[0].chars().collect();
+        assert_eq!(chars, vec!['(', '\u{270E}', ')']);
+    }
+}
