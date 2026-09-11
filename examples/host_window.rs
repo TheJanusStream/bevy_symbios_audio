@@ -32,13 +32,32 @@
 //! synchronous bake, so the strip looks as it does after an audition:
 //!   cargo run --example host_window --features egui -- --shot dark.png
 //!   cargo run --example host_window --features egui -- --light --shot light.png
+//!
+//! `--orphan` opens the sequence with notes that name no instrument: the
+//! pluck is renamed "harp" and its eight notes still say "pluck", which is
+//! what the instrument name field did before #55. The first of them is
+//! selected and the side panel starts scrolled to the bottom, so the picture
+//! shows the missing notes on the timeline and the inspector's reassign
+//! offer:
+//!   cargo run --example host_window --features egui -- --orphan --shot orphan.png
+//!
+//! `--rename <name>` types `<name>` over the open instrument's name and
+//! presses Enter, as a user would: the field is found in egui's AccessKit
+//! tree by the name it shows, focused by an AccessKit request, and the keys
+//! go in through `EguiInput`. A valid name renames the instrument and its
+//! notes follow; a taken, empty or over-long one is refused, and the picture
+//! shows the field in the error colour with the reason under it:
+//!   cargo run --example host_window --features egui -- --rename bass --shot refused.png
 
 use std::collections::BTreeMap;
 
 use bevy::diagnostic::FrameCount;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
-use bevy_egui::{EguiContexts, EguiPlugin, EguiPrimaryContextPass, egui};
+use bevy_egui::{
+    EguiContexts, EguiInput, EguiOutput, EguiPlugin, EguiPreUpdateSet, EguiPrimaryContextPass,
+    PrimaryEguiContext, egui, egui::accesskit,
+};
 
 use bevy_symbios_audio::{
     AdsrEnvelope, AudioPatch, BiquadLowpass, BrownNoise, Connection, Gate, GraphNode, Instrument,
@@ -67,6 +86,15 @@ const SETTLE_FRAMES: u32 = 60;
 const GIVE_UP: u32 = 600;
 /// How often each window's size is logged, in frames.
 const LOG_EVERY: u32 = 30;
+/// The lane of the instrument `--orphan` renames, and its new name.
+const ORPHAN_TRACK: usize = 2;
+const ORPHAN_NAME: &str = "harp";
+/// Frames for which `--orphan` pins the side panel to its bottom: long
+/// enough for the layout to settle, and then the scroll bar is the user's.
+const ORPHAN_SCROLL_FRAMES: u32 = 30;
+/// Frames with both windows up before `--rename` starts typing: past the
+/// windows' sizing passes, and well before `--shot` takes its picture.
+const TYPE_AFTER_FRAMES: u32 = 10;
 
 fn main() {
     let args = Args::from_env();
@@ -81,34 +109,48 @@ fn main() {
             ..default()
         }))
         .add_plugins((EguiPlugin::default(), AudioEditorPlugin))
-        .insert_resource(Editor::new(!args.light))
+        .insert_resource(Editor::new(!args.light, args.orphan))
         .insert_resource(args)
         .init_resource::<Shot>()
+        .init_resource::<Typist>()
         .add_systems(Startup, (setup_camera, fill_waveform_for_the_shot))
+        .add_systems(
+            PreUpdate,
+            type_the_rename
+                .after(EguiPreUpdateSet::ProcessInput)
+                .before(EguiPreUpdateSet::BeginPass),
+        )
         .add_systems(EguiPrimaryContextPass, render_ui)
         .add_systems(Update, (log_window_sizes, shoot))
         .run();
 }
 
-/// The command line: `--light` and `--shot <path>`.
+/// The command line: `--light`, `--orphan`, `--rename <name>` and
+/// `--shot <path>`.
 #[derive(Resource)]
 struct Args {
     light: bool,
+    orphan: bool,
+    rename: Option<String>,
     shot: Option<String>,
 }
 
 impl Args {
     fn from_env() -> Self {
         let args: Vec<String> = std::env::args().skip(1).collect();
-        let shot = args.iter().position(|a| a == "--shot").map(|at| {
-            args.get(at + 1).cloned().unwrap_or_else(|| {
-                eprintln!("--shot needs a path: --shot host_window.png");
-                std::process::exit(2);
+        let value = |flag: &str, example: &str| {
+            args.iter().position(|a| a == flag).map(|at| {
+                args.get(at + 1).cloned().unwrap_or_else(|| {
+                    eprintln!("{flag} needs a value: {flag} {example}");
+                    std::process::exit(2);
+                })
             })
-        });
+        };
         Self {
             light: args.iter().any(|a| a == "--light"),
-            shot,
+            orphan: args.iter().any(|a| a == "--orphan"),
+            rename: value("--rename", "lead"),
+            shot: value("--shot", "host_window.png"),
         }
     }
 }
@@ -128,23 +170,45 @@ struct Editor {
     shown: [Option<egui::Rect>; 2],
     /// Frames on which both windows were shown.
     frames_shown: u32,
+    /// `--orphan`: pin the side panel to its bottom while the layout settles.
+    scroll_to_bottom: bool,
 }
 
 impl Editor {
-    fn new(dark: bool) -> Self {
+    fn new(dark: bool, orphan: bool) -> Self {
+        let mut recipe = seeded_size_recipe();
         let mut sequence_state = SequenceEditorState::default();
         sequence_state.set_active_instrument(Some(OPEN_INSTRUMENT));
+        if orphan {
+            orphan_the_pluck(&mut recipe);
+            sequence_state.set_selected_event(Some((ORPHAN_TRACK, 0)));
+        }
         Self {
             patch: filtered_drone_patch(),
             patch_state: PatchEditorState::default(),
-            recipe: seeded_size_recipe(),
+            recipe,
             sequence_state,
             dark,
             applied: None,
             shown: [None; 2],
             frames_shown: 0,
+            scroll_to_bottom: orphan,
         }
     }
+}
+
+/// Rename the pluck in place and leave its notes naming the old id, the way
+/// the instrument name field did before #55.
+fn orphan_the_pluck(recipe: &mut SequenceRecipe) {
+    let pluck = &mut recipe.instruments[OPEN_INSTRUMENT];
+    debug_assert!(
+        recipe.tracks[ORPHAN_TRACK]
+            .events
+            .iter()
+            .all(|e| e.instrument_id == pluck.id),
+        "the orphaned lane is the pluck's"
+    );
+    pluck.id = ORPHAN_NAME.into();
 }
 
 fn setup_camera(mut commands: Commands) {
@@ -167,6 +231,7 @@ fn fill_waveform_for_the_shot(
 
 fn render_ui(
     mut contexts: EguiContexts,
+    args: Res<Args>,
     mut editor: ResMut<Editor>,
     monitor: Res<AudioMonitor>,
     mut requests: MessageWriter<MonitorRequest>,
@@ -174,6 +239,10 @@ fn render_ui(
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
+    if args.rename.is_some() {
+        // `type_the_rename` finds the name field in this tree.
+        ctx.enable_accesskit();
+    }
     let editor = editor.as_mut();
     if editor.applied != Some(editor.dark) {
         ctx.set_theme(if editor.dark {
@@ -267,6 +336,7 @@ fn sequence_slot(
     free: egui::Rect,
 ) -> Option<egui::Rect> {
     let id = egui::Id::new("sequence_slot");
+    let pin_to_bottom = editor.scroll_to_bottom && editor.frames_shown < ORPHAN_SCROLL_FRAMES;
     slot_window("Sequence slot", pos, free)
         .show(ctx, |ui| {
             audition_strip(ui, monitor, requests, || MonitorRequest::PlaySequence {
@@ -284,16 +354,21 @@ fn sequence_slot(
                     ..egui::Margin::ZERO
                 }))
                 .show(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            sequence_recipe_editor(
-                                ui,
-                                &mut editor.recipe,
-                                &mut editor.sequence_state,
-                                id.with("sequence"),
-                            );
-                        });
+                    let mut scroll = egui::ScrollArea::vertical().auto_shrink([false, false]);
+                    if pin_to_bottom {
+                        // Past the end; the scroll area clamps it to the
+                        // bottom. Finite: `f32::MAX` overflows the layout to
+                        // -inf and trips egui's NaN assertion.
+                        scroll = scroll.vertical_scroll_offset(1.0e6);
+                    }
+                    scroll.show(ui, |ui| {
+                        sequence_recipe_editor(
+                            ui,
+                            &mut editor.recipe,
+                            &mut editor.sequence_state,
+                            id.with("sequence"),
+                        );
+                    });
                 });
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE.inner_margin(egui::Margin {
@@ -340,6 +415,90 @@ fn audition_strip(
     });
     if !monitor.last_samples.is_empty() {
         waveform(ui, &monitor.last_samples);
+    }
+}
+
+/// Where `--rename` is in its script: one step per frame, because a field
+/// focused on one frame reads keys from the next.
+#[derive(Resource, Default)]
+enum Typist {
+    #[default]
+    Finding,
+    Typing {
+        /// Characters in the name being typed over.
+        chars: usize,
+    },
+    Committing,
+    Done,
+}
+
+/// `--rename <name>`: focus the open instrument's name field, type `<name>`
+/// over it and press Enter. It runs between bevy_egui reading this frame's
+/// input and beginning the pass, and it finds the field in the AccessKit
+/// tree of the last pass, so it needs none of the editor's private ids.
+fn type_the_rename(
+    args: Res<Args>,
+    editor: Res<Editor>,
+    mut typist: ResMut<Typist>,
+    mut contexts: Query<(&mut EguiInput, &EguiOutput), With<PrimaryEguiContext>>,
+) {
+    let Some(name) = &args.rename else {
+        return;
+    };
+    let Ok((mut input, output)) = contexts.single_mut() else {
+        return;
+    };
+    let key = |key| egui::Event::Key {
+        key,
+        physical_key: None,
+        pressed: true,
+        repeat: false,
+        modifiers: egui::Modifiers::NONE,
+    };
+    match *typist {
+        Typist::Finding => {
+            if editor.frames_shown < TYPE_AFTER_FRAMES {
+                return;
+            }
+            let current = editor.recipe.instruments[OPEN_INSTRUMENT].id.as_str();
+            let Some(field) = output
+                .platform_output
+                .accesskit_update
+                .iter()
+                .flat_map(|update| &update.nodes)
+                .find(|(_, node)| {
+                    node.role() == accesskit::Role::TextInput && node.value() == Some(current)
+                })
+                .map(|(id, _)| *id)
+            else {
+                return;
+            };
+            input.0.events.push(egui::Event::AccessKitActionRequest(
+                accesskit::ActionRequest {
+                    action: accesskit::Action::Focus,
+                    target_tree: accesskit::TreeId::ROOT,
+                    target_node: field,
+                    data: None,
+                },
+            ));
+            *typist = Typist::Typing {
+                chars: current.chars().count(),
+            };
+        }
+        Typist::Typing { chars } => {
+            input
+                .0
+                .events
+                .extend((0..chars).map(|_| key(egui::Key::Backspace)));
+            input.0.events.push(egui::Event::Text(name.clone()));
+            *typist = Typist::Committing;
+        }
+        Typist::Committing => {
+            input.0.events.push(key(egui::Key::Enter));
+            info!("--rename: typed {name:?} over the open instrument's name and pressed Enter");
+            *typist = Typist::Done;
+        }
+        Typist::Done => {}
     }
 }
 

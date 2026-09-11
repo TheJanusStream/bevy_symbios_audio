@@ -106,7 +106,8 @@ envelope attacks/sustains while the gate is open, then *releases* and
 rings out across the tail — `release_beats: 0.0` reproduces a hard
 one-shot.  Instruments with an unresolvable graph (or a typo'd
 `instrument_id`) are skipped with a warning rather than aborting the
-mixdown.
+mixdown.  The sequence editor marks a note whose `instrument_id` names no
+instrument, and offers to reassign it.
 
 Set `recipe.loop_start_beats = Some(b)` and a non-zero
 `loop_crossfade_beats` to get a seamless loop — the mixdown baker
@@ -195,7 +196,12 @@ embed:
 - a pannable / zoomable node-graph canvas (`audio_patch_canvas`) that
   edits a whole `AudioPatch` — drag nodes, wire ports, choose the output,
 - a DAW-style sequence-recipe timeline (`sequence_recipe_editor`) with
-  transport, instruments, and draggable track / event lanes,
+  transport, instruments, and draggable track / event lanes. Renaming an
+  instrument takes its notes and its canvas layout with it, applied on
+  Enter and only for a name that is unique, not empty, and within
+  symbios-audio's `Envelope` byte limit. A note whose instrument is gone
+  is drawn in the theme's error colour, labelled `missing: <id>`, and the
+  inspector offers to reassign every note of that id,
 - a pure-egui `waveform` widget plus a Bevy bake-and-play monitor
   (`AudioEditorPlugin`) for auditioning edits,
 - `symbios_genetics`-backed "🎲 Mutate" / reseed helpers (`mutate_patch`,
@@ -217,9 +223,13 @@ after a canvas is never seen, and the window grows every frame until it
 reaches the screen edge. `host_window` shows both editors inside windows,
 laid out the way that works. It doubles as a screenshot harness:
 `--shot <path>` saves a picture and quits, and `--light` switches theme.
+`--orphan` opens the sequence with notes that name no instrument, and
+`--rename <name>` types a new name over the open instrument's and presses
+Enter.
 
 ```sh
 cargo run --example host_window --features egui -- --shot host_window.png
+cargo run --example host_window --features egui -- --orphan --shot orphan.png
 ```
 
 ## Determinism
