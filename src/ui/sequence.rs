@@ -96,6 +96,14 @@ impl SequenceEditorState {
     pub fn active_instrument(&self) -> Option<usize> {
         self.active_instrument
     }
+
+    /// Open instrument `index` in [`active_instrument_canvas`], or close the
+    /// canvas with `None`. It does the same as clicking the instrument's
+    /// pencil, so a host can open an editor on a chosen instrument. An index
+    /// past the end of the recipe's instruments is cleared on the next draw.
+    pub fn set_active_instrument(&mut self, index: Option<usize>) {
+        self.active_instrument = index;
+    }
 }
 
 /// Snap a beat value to the [`SNAP`] grid, clamped to `>= 0`.
@@ -164,6 +172,18 @@ pub fn sequence_recipe_editor(
 /// Draw the active instrument's patch in the Phase-2 node canvas, or a hint if
 /// none is selected.  Each instrument keeps its own canvas layout (keyed by
 /// id) in `state`.
+///
+/// # The canvas claims the rest of the `Ui` — draw it last
+///
+/// With an instrument open this is [`audio_patch_canvas`], which takes all
+/// the space left in `ui`. Anything drawn after it is laid out below that
+/// space, and inside an [`egui::Window`] it also makes the window grow to its
+/// constraint (the same heading on [`audio_patch_canvas`] has the mechanism).
+/// This one is easy to miss because it only shows up once an instrument is
+/// open: with none open, the hint label is short and the content after it
+/// fits. Give it the last region, usually an `egui::CentralPanel` next to an
+/// `egui::Panel::left` that holds [`sequence_recipe_editor`] in a
+/// `ScrollArea`, as the `sequence_editor` and `host_window` examples do.
 pub fn active_instrument_canvas(
     ui: &mut egui::Ui,
     recipe: &mut SequenceRecipe,

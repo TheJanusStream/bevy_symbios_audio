@@ -220,6 +220,29 @@ enum Action {
 /// frame.  Returns an [`EditorResponse`] whose `rebake` flag is set when an
 /// edit is committed (param drag stops, a wire/node/output changes), so the
 /// host knows when to re-bake audio.
+///
+/// # The canvas claims the rest of the `Ui` — draw it last
+///
+/// Below its toolbar the canvas is an [`egui::Scene`], which allocates all of
+/// `ui.available_size_before_wrap()`. Anything that must stay visible — an
+/// audition strip, a status line, a waveform — goes **before** this call, and
+/// side content goes in panels (`egui::Panel::left` for it, then
+/// `egui::CentralPanel` holding the canvas).
+///
+/// Content drawn *after* the canvas is laid out below the space it was given.
+/// In a panel or a fixed area that only hides it. In an [`egui::Window`] it
+/// also makes the window grow every frame: the window's `Resize` keeps
+/// `desired_size.max(last_content_size)` while nobody is dragging its edge
+/// (egui 0.35, `containers/resize.rs`) and never gives height back, so the
+/// content is always taller than the window and the window keeps growing
+/// until it meets its `constrain_to` rect. The trailing content stays
+/// out of sight the whole time, and resizing by hand does not help. Overlands
+/// shipped exactly that: an audition row after the canvas, in a pop-out that
+/// went from 670 px to the screen's height in 30 frames (Overlands #1327).
+///
+/// The `host_window` example lays out both editors inside windows the way
+/// that works, and `tests::a_window_whose_last_item_is_the_canvas_keeps_its_size`
+/// holds this rule and its control.
 pub fn audio_patch_canvas(
     ui: &mut egui::Ui,
     patch: &mut AudioPatch,
@@ -762,6 +785,99 @@ mod tests {
                 });
             });
         }
+    }
+
+    /// A host's window around the canvas, drawn for `frames` frames: a row
+    /// of buttons above the canvas and, when `row_after_canvas`, the same
+    /// row again below it. Resizable and constrained to a 1920x1080 screen,
+    /// the way a host shows a pop-out editor. Returns the window's height on
+    /// every frame and the canvas region's height on the last one.
+    fn window_around_the_canvas(frames: usize, row_after_canvas: bool) -> (Vec<f32>, f32) {
+        let ctx = egui::Context::default();
+        let screen = Rect::from_min_size(Pos2::ZERO, Vec2::new(1920.0, 1080.0));
+        let mut patch = three_node_patch();
+        let mut state = PatchEditorState::default();
+        let mut heights = Vec::with_capacity(frames);
+        let mut canvas = 0.0;
+        for _ in 0..frames {
+            let input = egui::RawInput {
+                screen_rect: Some(screen),
+                ..Default::default()
+            };
+            let _ = ctx.run_ui(input, |root| {
+                let strip = |ui: &mut egui::Ui| {
+                    ui.horizontal(|ui| {
+                        let _ = ui.button("Audition");
+                        let _ = ui.button("Stop");
+                    });
+                };
+                let shown = egui::Window::new("host")
+                    .default_pos(Pos2::new(40.0, 40.0))
+                    .default_size(Vec2::new(900.0, 640.0))
+                    .constrain_to(screen)
+                    .resizable(true)
+                    .show(root.ctx(), |ui| {
+                        strip(ui);
+                        ui.separator();
+                        let top = ui.cursor().top();
+                        audio_patch_canvas(ui, &mut patch, &mut state, Id::new("host_canvas"));
+                        canvas = ui.min_rect().bottom() - top;
+                        if row_after_canvas {
+                            ui.separator();
+                            strip(ui);
+                        }
+                    });
+                if let Some(shown) = shown {
+                    heights.push(shown.response.rect.height());
+                }
+            });
+        }
+        (heights, canvas)
+    }
+
+    /// The canvas takes whatever is left, so as the LAST thing in a window
+    /// it fits the window exactly and the window keeps the size it opened
+    /// at (Overlands #1327, #54 here).
+    #[test]
+    fn a_window_whose_last_item_is_the_canvas_keeps_its_size() {
+        let (heights, canvas) = window_around_the_canvas(30, false);
+        assert_eq!(heights.len(), 30, "the window was shown every frame");
+        // From the third frame on: a window's first frame is a sizing pass.
+        let settled = heights[2];
+        for (frame, h) in heights.iter().enumerate().skip(2) {
+            assert!(
+                (h - settled).abs() < 0.5,
+                "frame {}: the window is {h:.1} px tall, {settled:.1} at frame 3",
+                frame + 1
+            );
+        }
+        assert!(
+            settled < 700.0,
+            "the window opened at 640 and is {settled:.1} px tall"
+        );
+        assert!(
+            canvas > 400.0,
+            "the canvas got only {canvas:.1} px of a 640 px window"
+        );
+    }
+
+    /// The control: the same window with the row moved BELOW the canvas
+    /// grows every frame until it hits the screen, which is the defect the
+    /// rule above exists for. If egui ever stops growing windows this way,
+    /// this test fails, and the docs on [`audio_patch_canvas`] need
+    /// rewriting.
+    #[test]
+    fn a_row_after_the_canvas_grows_the_window_to_its_constraint() {
+        let (heights, _) = window_around_the_canvas(30, true);
+        let (first, last) = (heights[2], heights[heights.len() - 1]);
+        assert!(
+            last > first + 300.0,
+            "the window was supposed to grow and went {first:.1} -> {last:.1}"
+        );
+        assert!(
+            last >= 1080.0 - 41.0,
+            "the window stopped at {last:.1}, short of the 1080 px screen"
+        );
     }
 
     /// The canvas must not panic on a structurally invalid graph — the

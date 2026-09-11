@@ -210,6 +210,18 @@ cargo run --example patch_editor --features egui
 cargo run --example sequence_editor --features egui
 ```
 
+Both canvases take all the space left in the `Ui` they are given, so draw
+them **last**. Put anything that must stay visible above them and a
+sequence editor beside them in a panel. In an `egui::Window`, content drawn
+after a canvas is never seen, and the window grows every frame until it
+reaches the screen edge. `host_window` shows both editors inside windows,
+laid out the way that works. It doubles as a screenshot harness:
+`--shot <path>` saves a picture and quits, and `--light` switches theme.
+
+```sh
+cargo run --example host_window --features egui -- --shot host_window.png
+```
+
 ## Determinism
 
 A bake of the same `(patch, sample_rate, duration)` returns a

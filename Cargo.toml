@@ -69,6 +69,10 @@ required-features = ["egui"]
 name = "sequence_editor"
 required-features = ["egui"]
 
+[[example]]
+name = "host_window"
+required-features = ["egui"]
+
 [[bench]]
 name = "bake"
 harness = false

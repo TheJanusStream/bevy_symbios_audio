@@ -29,6 +29,15 @@
 //!
 //! Every editor composes the same [`EditorResponse`] contract.
 //!
+//! The two canvases, [`graph::audio_patch_canvas`] and
+//! [`sequence::active_instrument_canvas`], claim all the space left in the
+//! `Ui` they are given, so a host draws them **last**. Controls that must
+//! stay visible go above them, and a sequence editor goes beside them in a
+//! panel. In an `egui::Window`, anything drawn after a canvas is never seen,
+//! and the window grows every frame until it reaches its constraint. Each
+//! function's docs explain why, and the `host_window` example is the layout
+//! to copy.
+//!
 //! # The change/commit contract
 //!
 //! Every editor returns an [`EditorResponse`] with two flags:
