@@ -60,7 +60,9 @@ pub const DEFAULT_MEMORY_CACHE_ENTRIES: usize = 64;
 /// different cache entry.
 #[derive(Clone, Debug, Hash, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PatchCacheKey {
+    /// Digest of the patch's canonical JSON form.
     pub patch_fingerprint: u64,
+    /// Samples per second of the bake.
     pub sample_rate: u32,
     /// `f32::to_bits` of the requested duration in seconds.  Stored as
     /// `u32` so the key is `Hash + Eq`.

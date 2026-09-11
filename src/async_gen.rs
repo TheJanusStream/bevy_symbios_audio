@@ -384,6 +384,7 @@ fn spawn_bake(
 /// actually hear the bake.
 #[derive(Component)]
 pub struct AudioPatchReady {
+    /// The baked samples as an [`AudioSource`] asset, ready to play.
     pub handle: Handle<AudioSource>,
 }
 

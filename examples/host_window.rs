@@ -48,6 +48,14 @@
 //! notes follow; a taken, empty or over-long one is refused, and the picture
 //! shows the field in the error colour with the reason under it:
 //!   cargo run --example host_window --features egui -- --rename bass --shot refused.png
+//!
+//! `--drag` starts a wire from the patch slot's Sawtooth output and holds it
+//! over the Lowpass's `q` row, well to the right of the port's dot, without
+//! letting go, so a picture shows what the canvas says during a drag. The
+//! output port and the row label are found in the AccessKit tree, whose
+//! bounds are in canvas units; the canvas layer's transform takes them to
+//! the screen, and the pointer events go in through `EguiInput`:
+//!   cargo run --example host_window --features egui -- --drag --shot drag.png
 
 use std::collections::BTreeMap;
 
@@ -55,8 +63,8 @@ use bevy::diagnostic::FrameCount;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy_egui::{
-    EguiContexts, EguiInput, EguiOutput, EguiPlugin, EguiPreUpdateSet, EguiPrimaryContextPass,
-    PrimaryEguiContext, egui, egui::accesskit,
+    EguiContext, EguiContexts, EguiInput, EguiOutput, EguiPlugin, EguiPreUpdateSet,
+    EguiPrimaryContextPass, PrimaryEguiContext, egui, egui::accesskit,
 };
 
 use bevy_symbios_audio::{
@@ -95,6 +103,12 @@ const ORPHAN_SCROLL_FRAMES: u32 = 30;
 /// Frames with both windows up before `--rename` starts typing: past the
 /// windows' sizing passes, and well before `--shot` takes its picture.
 const TYPE_AFTER_FRAMES: u32 = 10;
+/// Frames `--drag` takes to carry the wire from the output to the row.
+const DRAG_FRAMES: u32 = 12;
+/// How far right of the `q` label `--drag` holds the pointer, in canvas
+/// units: on the row, and farther from the port's dot than a drop used to
+/// snap from.
+const DRAG_PAST_LABEL: f32 = 70.0;
 
 fn main() {
     let args = Args::from_env();
@@ -113,10 +127,11 @@ fn main() {
         .insert_resource(args)
         .init_resource::<Shot>()
         .init_resource::<Typist>()
+        .init_resource::<Dragger>()
         .add_systems(Startup, (setup_camera, fill_waveform_for_the_shot))
         .add_systems(
             PreUpdate,
-            type_the_rename
+            (type_the_rename, drag_a_wire)
                 .after(EguiPreUpdateSet::ProcessInput)
                 .before(EguiPreUpdateSet::BeginPass),
         )
@@ -125,13 +140,14 @@ fn main() {
         .run();
 }
 
-/// The command line: `--light`, `--orphan`, `--rename <name>` and
-/// `--shot <path>`.
+/// The command line: `--light`, `--orphan`, `--rename <name>`, `--drag`
+/// and `--shot <path>`.
 #[derive(Resource)]
 struct Args {
     light: bool,
     orphan: bool,
     rename: Option<String>,
+    drag: bool,
     shot: Option<String>,
 }
 
@@ -150,6 +166,7 @@ impl Args {
             light: args.iter().any(|a| a == "--light"),
             orphan: args.iter().any(|a| a == "--orphan"),
             rename: value("--rename", "lead"),
+            drag: args.iter().any(|a| a == "--drag"),
             shot: value("--shot", "host_window.png"),
         }
     }
@@ -239,8 +256,8 @@ fn render_ui(
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
-    if args.rename.is_some() {
-        // `type_the_rename` finds the name field in this tree.
+    if args.rename.is_some() || args.drag {
+        // `type_the_rename` and `drag_a_wire` find their widgets in this tree.
         ctx.enable_accesskit();
     }
     let editor = editor.as_mut();
@@ -499,6 +516,105 @@ fn type_the_rename(
             *typist = Typist::Done;
         }
         Typist::Done => {}
+    }
+}
+
+/// Where `--drag` is: looking for the port and the row, carrying the wire
+/// (from, to, frames done), or holding it for the picture.
+#[derive(Resource, Default)]
+enum Dragger {
+    #[default]
+    Finding,
+    Carrying(egui::Pos2, egui::Pos2, u32),
+    Holding,
+}
+
+/// `--drag`: press on the Sawtooth's output port in the patch slot, carry
+/// the wire to the Lowpass's `q` row over [`DRAG_FRAMES`] frames, and hold
+/// it there without releasing. Both widgets are found in the last pass's
+/// AccessKit tree, in canvas units, and taken to the screen by whichever
+/// layer transform puts the port inside the patch slot's window.
+fn drag_a_wire(
+    args: Res<Args>,
+    editor: Res<Editor>,
+    mut dragger: ResMut<Dragger>,
+    mut contexts: Query<(&mut EguiContext, &mut EguiInput, &EguiOutput), With<PrimaryEguiContext>>,
+) {
+    if !args.drag {
+        return;
+    }
+    let Ok((mut context, mut input, output)) = contexts.single_mut() else {
+        return;
+    };
+    match *dragger {
+        Dragger::Finding => {
+            let Some(window) = editor.shown[0] else {
+                return;
+            };
+            if editor.frames_shown < TYPE_AFTER_FRAMES {
+                return;
+            }
+            let bounds = |wanted: &dyn Fn(&accesskit::Node) -> bool| {
+                output
+                    .platform_output
+                    .accesskit_update
+                    .iter()
+                    .flat_map(|update| &update.nodes)
+                    .find(|(_, node)| wanted(node))
+                    .and_then(|(_, node)| node.bounds())
+                    .map(|b| {
+                        egui::Rect::from_min_max(
+                            egui::pos2(b.x0 as f32, b.y0 as f32),
+                            egui::pos2(b.x1 as f32, b.y1 as f32),
+                        )
+                    })
+            };
+            let Some(port) = bounds(&|n| {
+                n.label()
+                    .is_some_and(|l| l.starts_with("Output of #0 Sawtooth"))
+            }) else {
+                return;
+            };
+            let Some(row_label) =
+                bounds(&|n| n.role() == accesskit::Role::Label && n.value() == Some("q:"))
+            else {
+                return;
+            };
+            let transforms = context.get_mut().memory(|m| m.to_global.clone());
+            let Some(to_screen) = transforms
+                .values()
+                .find(|t| window.contains(**t * port.center()))
+            else {
+                return;
+            };
+            let from = *to_screen * port.center();
+            let to =
+                *to_screen * egui::pos2(row_label.right() + DRAG_PAST_LABEL, row_label.center().y);
+            info!("--drag: pressing at {from:?} and carrying the wire to {to:?}");
+            input.0.events.push(egui::Event::PointerMoved(from));
+            input.0.events.push(egui::Event::PointerButton {
+                pos: from,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            });
+            *dragger = Dragger::Carrying(from, to, 0);
+        }
+        Dragger::Carrying(from, to, done) => {
+            let done = done + 1;
+            let t = done as f32 / DRAG_FRAMES as f32;
+            input
+                .0
+                .events
+                .push(egui::Event::PointerMoved(from.lerp(to, t)));
+            *dragger = if done >= DRAG_FRAMES {
+                info!("--drag: holding a wire from the Sawtooth over the Lowpass's q row");
+                Dragger::Holding
+            } else {
+                Dragger::Carrying(from, to, done)
+            };
+        }
+        Dragger::Holding => {}
     }
 }
 

@@ -111,12 +111,18 @@ type BakeResult = Result<(Vec<f32>, u32), String>;
 pub enum MonitorRequest {
     /// Bake `patch` for `duration_secs` at `sample_rate`, then loop it.
     PlayPatch {
+        /// The patch to bake.
         patch: AudioPatch,
+        /// Samples per second of the bake.
         sample_rate: u32,
+        /// Length of the bake, and so of the loop, in seconds.
         duration_secs: f32,
     },
     /// Bake `recipe` (at its own sample rate) and loop it.
-    PlaySequence { recipe: SequenceRecipe },
+    PlaySequence {
+        /// The recipe to bake with [`crate::mixdown::bake_sequence`].
+        recipe: SequenceRecipe,
+    },
     /// Stop playback and cancel any in-flight bake.
     Stop,
 }

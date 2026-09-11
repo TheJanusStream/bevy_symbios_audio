@@ -17,9 +17,19 @@
 //! # How editing maps to the schema
 //!
 //! - **Move a node:** drag its title bar (scene-space delta → stored position).
-//! - **Wire a port:** drag from a node's output dot (right edge) onto another
-//!   node's input dot (left edge) — appends a [`Connection::Node`] to that
-//!   port (fan-in: a port holds a *list*, summed at bake time).
+//! - **Wire a port:** drag from a node's output dot (right edge, on the
+//!   title row) onto another node's input: its dot, or anywhere on its row
+//!   in the node's "Inputs" list, where the port is named. That appends a
+//!   [`Connection::Node`] to the port (fan-in: a port holds a *list*,
+//!   summed at bake time). Each input dot sits on the box's left edge
+//!   beside its own row — filled when something drives the port, a ring
+//!   when nothing does — and so does a port that is not one of its kind's
+//!   own (from JSON). While a wire is dragged it is drawn over the boxes,
+//!   the port it would connect to is highlighted in the host's selection
+//!   colour, and a tooltip names it ("➡ #2 Lowpass · cutoff_hz"); over no
+//!   port, nothing is lit and a release does nothing. Only the box on top
+//!   under the pointer can take the wire, so a row another box covers is
+//!   out of reach.
 //! - **Amounts / constants / deletes:** the "Inputs" section inside each node
 //!   box edits each connection's `amount` (or a [`Connection::Constant`]'s
 //!   value) and removes connections.
@@ -53,7 +63,8 @@ const PORT_RADIUS: f32 = 5.0;
 /// Horizontal / vertical spacing of the topological auto-layout grid.
 const COL_W: f32 = 280.0;
 const ROW_H: f32 = 190.0;
-/// How close (scene units) a wire drop must land to an input dot to connect.
+/// How close (scene units) a wire drop must land to an input dot to connect
+/// when it is not on the port's row.
 const SNAP_DIST: f32 = 26.0;
 
 /// Editor-side state for the patch canvas — node layout and view, kept out of
@@ -73,6 +84,13 @@ pub struct PatchEditorState {
     mutate_rate: f32,
     /// Buffer + last error for the JSON import/export section.
     json: super::JsonIoState,
+    /// Every input port as the canvas last drew it: its dot and its row.
+    ports: Vec<PortGeom>,
+    /// Each node's output dot as the canvas last drew it.
+    outputs: HashMap<NodeId, Pos2>,
+    /// Each node's box as the canvas last drew it, in drawing order: a box
+    /// lies over the ones before it.
+    boxes: Vec<(NodeId, Rect)>,
 }
 
 impl Default for PatchEditorState {
@@ -83,8 +101,65 @@ impl Default for PatchEditorState {
             selected: None,
             mutate_rate: 0.3,
             json: super::JsonIoState::default(),
+            ports: Vec::new(),
+            outputs: HashMap::new(),
+            boxes: Vec::new(),
         }
     }
+}
+
+/// One input port as the canvas drew it, in canvas units.
+///
+/// A port's dot sits on its own row of the node's "Inputs" list, where its
+/// name is written, so a wire visibly goes into a named port (#56). Until
+/// then the dots were spread evenly down the box's edge, beside whatever
+/// row happened to be there, and a port that is not one of its kind's own
+/// (from JSON) had a row but no dot.
+#[derive(Clone, Debug, PartialEq)]
+struct PortGeom {
+    node: NodeId,
+    port: String,
+    /// On the box's left edge, level with the port's name.
+    dot: Pos2,
+    /// The port's part of the "Inputs" list (its name row and the rows of
+    /// its connections) across the box's whole width. A wire dropped
+    /// anywhere on it connects to this port.
+    row: Rect,
+    /// Something drives the port: a wire or a constant.
+    connected: bool,
+}
+
+/// The port a wire from `from` connects to if it is dropped at `at`: the
+/// row under the pointer, or failing that the nearest dot within
+/// [`SNAP_DIST`].
+///
+/// Over a box, only that box's ports count, and only the box on top when
+/// boxes overlap (`boxes` is in drawing order): a row another box covers is
+/// out of sight, so it is out of reach too. A node's own ports are never a
+/// target, since a wire into its own node is refused.
+fn drop_target<'a>(
+    ports: &'a [PortGeom],
+    boxes: &[(NodeId, Rect)],
+    from: NodeId,
+    at: Pos2,
+) -> Option<&'a PortGeom> {
+    let under = boxes
+        .iter()
+        .rev()
+        .find(|(_, rect)| rect.contains(at))
+        .map(|(node, _)| *node);
+    let eligible = || {
+        ports
+            .iter()
+            .filter(move |p| p.node != from && under.is_none_or(|node| p.node == node))
+    };
+    eligible().find(|p| p.row.contains(at)).or_else(|| {
+        eligible()
+            .map(|p| (p, p.dot.distance(at)))
+            .filter(|(_, d)| *d <= SNAP_DIST)
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(p, _)| p)
+    })
 }
 
 impl PatchEditorState {
@@ -188,18 +263,6 @@ fn delete_node(patch: &mut AudioPatch, target: NodeId) {
     {
         patch.graph.output = first.id;
     }
-}
-
-/// Closest input anchor to `at` within [`SNAP_DIST`], if any.
-fn nearest_input(anchors: &HashMap<(NodeId, String), Pos2>, at: Pos2) -> Option<(NodeId, String)> {
-    let mut best: Option<(NodeId, String, f32)> = None;
-    for ((id, port), p) in anchors {
-        let d = p.distance(at);
-        if d <= SNAP_DIST && best.as_ref().is_none_or(|(_, _, bd)| d < *bd) {
-            best = Some((*id, port.clone(), d));
-        }
-    }
-    best.map(|(id, port, _)| (id, port))
 }
 
 /// Deferred structural edit, applied after the node-drawing loop releases its
@@ -380,10 +443,15 @@ fn canvas_contents(
     let mut res = EditorResponse::NONE;
     let mut actions: Vec<Action> = Vec::new();
 
-    let mut out_anchor: HashMap<NodeId, Pos2> = HashMap::new();
-    let mut in_anchor: HashMap<(NodeId, String), Pos2> = HashMap::new();
-    let mut node_rects: HashMap<NodeId, Rect> = HashMap::new();
-    let mut temp_wire: Option<(Pos2, Pos2)> = None;
+    // This frame's ports and output dots are drawn from, and kept in, the
+    // state.
+    state.ports.clear();
+    state.outputs.clear();
+    state.boxes.clear();
+    let mut titles: HashMap<NodeId, &'static str> = HashMap::new();
+    // The wire being dragged: from which node, where the pointer is, and the
+    // output port's response, which owns the target's tooltip.
+    let mut dragging: Option<(NodeId, Pos2, egui::Response)> = None;
 
     let output_id = patch.graph.output;
     let selected = state.selected;
@@ -425,7 +493,7 @@ fn canvas_contents(
         let fr = frame.show(&mut child, |ui| {
             ui.set_width(NODE_WIDTH);
             // Title bar: drag to move, click to select, 🎲 to mutate this node.
-            ui.horizontal(|ui| {
+            let title_row = ui.horizontal(|ui| {
                 let title = format!("#{}  {}", nid.0, node_kind_label(&node.kind));
                 let title_resp = ui.add(
                     egui::Label::new(egui::RichText::new(title).strong())
@@ -449,31 +517,69 @@ fn canvas_contents(
             });
             ui.separator();
             res.merge(node_kind_editor(ui, &mut node.kind, Id::new(("nk", nid.0))));
-            res.merge(connection_editor(ui, node));
+            let (conn_res, rows) = connection_editor(ui, node);
+            res.merge(conn_res);
+            (title_row.response.rect, rows)
         });
 
         let rect = fr.response.rect;
-        node_rects.insert(nid, rect);
-        out_anchor.insert(nid, Pos2::new(rect.right(), rect.center().y));
+        let (title_rect, rows) = fr.inner;
+        state.boxes.push((nid, rect));
+        titles.insert(nid, node_kind_label(&node.kind));
+        // The output leaves from the title row, where the node is named.
+        let oa = Pos2::new(rect.right(), title_rect.center().y);
+        state.outputs.insert(nid, oa);
+        for PortRow {
+            port,
+            name_row,
+            section,
+        } in rows
+        {
+            let connected = node.inputs.get(&port).is_some_and(|c| !c.is_empty());
+            state.ports.push(PortGeom {
+                node: nid,
+                port,
+                dot: Pos2::new(rect.left(), name_row.center().y),
+                row: Rect::from_x_y_ranges(rect.x_range(), section.y_range()),
+                connected,
+            });
+        }
 
-        let ports = input_ports(&node.kind);
-        for (i, port) in ports.iter().enumerate() {
-            let t = (i as f32 + 1.0) / (ports.len() as f32 + 1.0);
-            let anchor = Pos2::new(rect.left(), rect.top() + t * rect.height());
-            in_anchor.insert((nid, (*port).to_string()), anchor);
+        // This node's dots, painted before the next box so a box that lies
+        // over this one covers them too.
+        painter.circle_filled(oa, PORT_RADIUS, Color32::from_rgb(230, 190, 90));
+        for p in state.ports.iter().filter(|p| p.node == nid) {
+            if p.connected {
+                painter.circle_filled(p.dot, PORT_RADIUS, Color32::from_gray(190));
+            } else {
+                // A ring: nothing drives this port yet.
+                painter.circle(
+                    p.dot,
+                    PORT_RADIUS,
+                    Color32::from_gray(32),
+                    Stroke::new(1.5, Color32::from_gray(190)),
+                );
+            }
         }
 
         // Output port: drag to start a wire.
-        let oa = out_anchor[&nid];
         let out_resp = ui.interact(
             Rect::from_center_size(oa, Vec2::splat(PORT_RADIUS * 2.5)),
             id.with(("outport", nid.0)),
             Sense::drag(),
         );
+        // Named for assistive tech and for scripted input (host_window --drag).
+        out_resp.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Other,
+                true,
+                format!("Output of #{} {}", nid.0, node_kind_label(&node.kind)),
+            )
+        });
         if out_resp.dragged()
             && let Some(p) = out_resp.interact_pointer_pos()
         {
-            temp_wire = Some((oa, p));
+            dragging = Some((nid, p, out_resp.clone()));
         }
         if out_resp.drag_stopped()
             && let Some(p) = out_resp.interact_pointer_pos()
@@ -486,35 +592,73 @@ fn canvas_contents(
     let mut wires: Vec<egui::Shape> = Vec::new();
     for node in &patch.graph.nodes {
         for (port, conns) in &node.inputs {
-            let dst = in_anchor
-                .get(&(node.id, port.clone()))
-                .copied()
+            // Every port with connections has a row, so this finds its dot;
+            // the box's left centre is only a last resort.
+            let dst = state
+                .ports
+                .iter()
+                .find(|p| p.node == node.id && p.port == *port)
+                .map(|p| p.dot)
                 .or_else(|| {
-                    node_rects
-                        .get(&node.id)
-                        .map(|r| Pos2::new(r.left(), r.center().y))
+                    state
+                        .boxes
+                        .iter()
+                        .find(|(id, _)| *id == node.id)
+                        .map(|(_, r)| Pos2::new(r.left(), r.center().y))
                 });
             let Some(dst) = dst else { continue };
             for c in conns {
                 if let Connection::Node { id: src, .. } = c
-                    && let Some(src_pos) = out_anchor.get(src)
+                    && let Some(src_pos) = state.outputs.get(src)
                 {
                     wires.push(wire_shape(*src_pos, dst, Color32::from_gray(150)));
                 }
             }
         }
     }
-    if let Some((a, b)) = temp_wire {
-        wires.push(wire_shape(a, b, Color32::from_rgb(90, 160, 250)));
-    }
     painter.set(wire_idx, egui::Shape::Vec(wires));
 
-    // --- port dots (on top of wires) -----------------------------------
-    for p in out_anchor.values() {
-        painter.circle_filled(*p, PORT_RADIUS, Color32::from_rgb(230, 190, 90));
-    }
-    for p in in_anchor.values() {
-        painter.circle_filled(*p, PORT_RADIUS, Color32::from_gray(190));
+    // --- the wire being dragged, over the boxes, and where it would land --
+    if let Some((from, at, out_resp)) = dragging
+        && let Some(&src) = state.outputs.get(&from)
+    {
+        let target = drop_target(&state.ports, &state.boxes, from, at);
+        let visuals = ui.visuals();
+        if let Some(target) = target {
+            let selection = visuals.selection;
+            painter.rect(
+                target.row,
+                3.0,
+                selection.bg_fill.gamma_multiply(0.3),
+                selection.stroke,
+                egui::StrokeKind::Outside,
+            );
+            painter.circle(
+                target.dot,
+                PORT_RADIUS + 1.5,
+                selection.bg_fill,
+                selection.stroke,
+            );
+        }
+        // The wire ends on the dot it would connect to, so the user sees the
+        // connection before letting go; over no port it follows the pointer.
+        let end = target.map_or(at, |t| t.dot);
+        painter.add(wire_shape(src, end, visuals.selection.stroke.color));
+        if let Some(target) = target {
+            // A tooltip is drawn in screen space, so the name stays legible
+            // at any zoom of the canvas.
+            let kind = titles.get(&target.node).copied().unwrap_or_default();
+            let text = format!(
+                "\u{27A1} #{} {kind} \u{00B7} {}",
+                target.node.0, target.port
+            );
+            // Never wrapped: an auto-sized area offers the width of its last
+            // pass, so a name longer than the last one would wrap and the
+            // box would ratchet narrower as the pointer crosses rows.
+            egui::Tooltip::for_widget(&out_resp)
+                .at_pointer()
+                .show(|ui| ui.add(egui::Label::new(text).extend()));
+        }
     }
 
     // --- apply deferred structural edits -------------------------------
@@ -525,12 +669,11 @@ fn canvas_contents(
                 *state.positions.entry(nid).or_default() += delta;
             }
             Action::CompleteWire { from, at } => {
-                if let Some((to, port)) = nearest_input(&in_anchor, at)
-                    && to != from
-                    && let Some(n) = patch.graph.nodes.iter_mut().find(|n| n.id == to)
+                if let Some(target) = drop_target(&state.ports, &state.boxes, from, at)
+                    && let Some(n) = patch.graph.nodes.iter_mut().find(|n| n.id == target.node)
                 {
                     n.inputs
-                        .entry(port)
+                        .entry(target.port.clone())
                         .or_default()
                         .push(Connection::from_node(from));
                     res.changed = true;
@@ -541,17 +684,33 @@ fn canvas_contents(
     }
 
     // Claim the bounding area so Scene's "reset view" can fit the content.
-    if let Some(bounds) = node_rects.values().copied().reduce(|a, b| a.union(b)) {
+    if let Some(bounds) = state
+        .boxes
+        .iter()
+        .map(|(_, r)| *r)
+        .reduce(|a, b| a.union(b))
+    {
         ui.allocate_rect(bounds.expand(60.0), Sense::hover());
     }
 
     res
 }
 
+/// Where one port's rows landed in a node box.
+struct PortRow {
+    port: String,
+    /// The row that starts with the port's name.
+    name_row: Rect,
+    /// The name row and the rows of the port's connections below it.
+    section: Rect,
+}
+
 /// The "Inputs" section inside a node box: per-connection amount/value editing,
-/// per-port "add constant", and per-connection delete.
-fn connection_editor(ui: &mut egui::Ui, node: &mut GraphNode) -> EditorResponse {
+/// per-port "add constant", and per-connection delete. Returns where each
+/// port's rows went, so the canvas can put the port's dot beside its name.
+fn connection_editor(ui: &mut egui::Ui, node: &mut GraphNode) -> (EditorResponse, Vec<PortRow>) {
     let mut res = EditorResponse::NONE;
+    let mut rows = Vec::new();
 
     // Canonical ports first, then any extra ports already present (e.g. from
     // loaded JSON) so nothing wired is hidden.
@@ -565,7 +724,7 @@ fn connection_editor(ui: &mut egui::Ui, node: &mut GraphNode) -> EditorResponse 
         }
     }
     if ports.is_empty() {
-        return res;
+        return (res, rows);
     }
 
     ui.separator();
@@ -575,17 +734,21 @@ fn connection_editor(ui: &mut egui::Ui, node: &mut GraphNode) -> EditorResponse 
     let mut to_add_const: Vec<String> = Vec::new();
 
     for port in &ports {
-        ui.horizontal(|ui| {
-            ui.label(format!("{port}:"));
-            if ui.small_button("\u{2795} const").clicked() {
-                to_add_const.push(port.clone());
-                res.changed = true;
-                res.rebake = true;
-            }
-        });
+        let name_row = ui
+            .horizontal(|ui| {
+                ui.label(format!("{port}:"));
+                if ui.small_button("\u{2795} const").clicked() {
+                    to_add_const.push(port.clone());
+                    res.changed = true;
+                    res.rebake = true;
+                }
+            })
+            .response
+            .rect;
+        let mut section = name_row;
         if let Some(conns) = node.inputs.get_mut(port) {
             for (i, c) in conns.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
+                let row = ui.horizontal(|ui| {
                     match c {
                         Connection::Node { id, amount } => {
                             ui.label(format!("  \u{2B05} #{}", id.0));
@@ -606,8 +769,14 @@ fn connection_editor(ui: &mut egui::Ui, node: &mut GraphNode) -> EditorResponse 
                         res.rebake = true;
                     }
                 });
+                section = section.union(row.response.rect);
             }
         }
+        rows.push(PortRow {
+            port: port.clone(),
+            name_row,
+            section,
+        });
     }
 
     // Remove highest indices first so earlier removals don't shift them.
@@ -629,7 +798,7 @@ fn connection_editor(ui: &mut egui::Ui, node: &mut GraphNode) -> EditorResponse 
             .push(Connection::constant(0.0));
     }
 
-    res
+    (res, rows)
 }
 
 /// A cubic-bezier wire from `a` to `b`, sampled to a polyline with horizontal
@@ -743,17 +912,99 @@ mod tests {
         assert!(state.positions.contains_key(&NodeId(2)));
     }
 
+    /// A port of `node` whose dot is at `dot` and whose row spans `row`.
+    fn port(node: u32, name: &str, dot: Pos2, row: Rect) -> PortGeom {
+        PortGeom {
+            node: NodeId(node),
+            port: name.into(),
+            dot,
+            row,
+            connected: false,
+        }
+    }
+
     #[test]
-    fn nearest_input_snaps_only_within_threshold() {
-        let mut anchors: HashMap<(NodeId, String), Pos2> = HashMap::new();
-        anchors.insert((NodeId(5), "in".into()), Pos2::new(100.0, 100.0));
-        // Just inside the snap radius.
+    fn a_row_under_the_pointer_is_the_target_however_far_its_dot_is() {
+        let row = Rect::from_min_max(Pos2::new(100.0, 200.0), Pos2::new(310.0, 222.0));
+        let ports = [port(5, "q", Pos2::new(100.0, 211.0), row)];
+        let boxes = [(NodeId(5), row.expand2(Vec2::new(0.0, 80.0)))];
+        let far_right = Pos2::new(300.0, 211.0);
+        assert!(far_right.distance(ports[0].dot) > SNAP_DIST);
         assert_eq!(
-            nearest_input(&anchors, Pos2::new(100.0 + SNAP_DIST - 1.0, 100.0)),
-            Some((NodeId(5), "in".into()))
+            drop_target(&ports, &boxes, NodeId(1), far_right).map(|p| p.port.as_str()),
+            Some("q")
         );
-        // Well outside it.
-        assert_eq!(nearest_input(&anchors, Pos2::new(500.0, 500.0)), None);
+    }
+
+    #[test]
+    fn off_every_row_a_dot_within_the_snap_radius_is_the_target() {
+        let row = Rect::from_min_max(Pos2::new(100.0, 200.0), Pos2::new(310.0, 222.0));
+        let ports = [port(5, "in", Pos2::new(100.0, 211.0), row)];
+        let boxes = [(NodeId(5), row.expand2(Vec2::new(0.0, 80.0)))];
+        // Left of the box, just inside the snap radius of the dot.
+        let near = Pos2::new(100.0 - SNAP_DIST + 1.0, 211.0);
+        assert!(!row.contains(near));
+        assert_eq!(
+            drop_target(&ports, &boxes, NodeId(1), near).map(|p| p.port.as_str()),
+            Some("in")
+        );
+        assert_eq!(
+            drop_target(&ports, &boxes, NodeId(1), Pos2::new(500.0, 500.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn only_the_box_on_top_can_be_the_target_and_never_the_wires_own() {
+        let row = Rect::from_min_max(Pos2::new(100.0, 200.0), Pos2::new(310.0, 222.0));
+        let at = Pos2::new(200.0, 211.0);
+        let tall = row.expand2(Vec2::new(0.0, 80.0));
+        // Two boxes overlap here: the later one is drawn over the earlier.
+        let ports = [
+            port(5, "under", Pos2::new(100.0, 211.0), row),
+            port(6, "over", Pos2::new(100.0, 211.0), row),
+        ];
+        let boxes = [(NodeId(5), tall), (NodeId(6), tall)];
+        assert_eq!(
+            drop_target(&ports, &boxes, NodeId(1), at).map(|p| p.port.as_str()),
+            Some("over")
+        );
+        // Out of node 6 and over its own box: nothing, not the row under it.
+        assert_eq!(drop_target(&ports, &boxes, NodeId(6), at), None);
+
+        // Node 7 has no ports and covers node 5's row: the row is out of
+        // sight, so it is not a target either.
+        let covered = [port(5, "hidden", Pos2::new(100.0, 211.0), row)];
+        let boxes = [
+            (NodeId(5), tall),
+            (NodeId(7), Rect::from_center_size(at, Vec2::splat(60.0))),
+        ];
+        assert_eq!(drop_target(&covered, &boxes, NodeId(1), at), None);
+    }
+
+    /// What the canvas keeps in its state after a frame: every port of every
+    /// kind with its dot on the box's left edge and inside its own row.
+    #[test]
+    fn the_state_keeps_each_ports_dot_inside_its_row() {
+        for kind in NodeKind::defaults() {
+            let name = node_kind_label(&kind);
+            let canvas = Canvas::new(one_node(kind.clone()));
+            let state = &canvas.state;
+            let names: Vec<&str> = state.ports.iter().map(|p| p.port.as_str()).collect();
+            assert_eq!(
+                names,
+                input_ports(&kind),
+                "{name}: one entry per port, in order"
+            );
+            for p in &state.ports {
+                assert!(p.row.contains(p.dot), "{name}.{}: {p:?}", p.port);
+                assert_eq!(p.dot.x, p.row.left(), "{name}.{}: on the box edge", p.port);
+            }
+            assert!(
+                state.outputs.contains_key(&NodeId(0)),
+                "{name}: an output dot"
+            );
+        }
     }
 
     #[test]
@@ -878,6 +1129,365 @@ mod tests {
             last >= 1080.0 - 41.0,
             "the window stopped at {last:.1}, short of the 1080 px screen"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Ports on their rows, and the drop target (#56, Overlands #1329)
+    // -----------------------------------------------------------------------
+    //
+    // These read what the canvas showed, not what it meant to show: labels
+    // from the AccessKit tree, dots, boxes and wires from the painted shapes,
+    // so they held the old layout to the same standard. AccessKit bounds are
+    // in canvas units and shapes in screen points, so labels go through the
+    // canvas layer's transform.
+
+    use egui::accesskit;
+    use egui::emath::TSTransform;
+
+    /// The canvas on a headless context, large enough to show a few nodes.
+    struct Canvas {
+        ctx: egui::Context,
+        patch: AudioPatch,
+        state: PatchEditorState,
+        out: egui::FullOutput,
+    }
+
+    impl Canvas {
+        fn new(patch: AudioPatch) -> Self {
+            let ctx = egui::Context::default();
+            ctx.enable_accesskit();
+            let mut canvas = Self {
+                ctx,
+                patch,
+                state: PatchEditorState::default(),
+                out: egui::FullOutput::default(),
+            };
+            for _ in 0..3 {
+                canvas.frame(Vec::new());
+            }
+            canvas
+        }
+
+        fn frame(&mut self, events: Vec<egui::Event>) -> EditorResponse {
+            let Self {
+                ctx,
+                patch,
+                state,
+                out,
+            } = self;
+            let mut res = EditorResponse::NONE;
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1200.0))),
+                events,
+                ..Default::default()
+            };
+            *out = ctx.run_ui(input, |root| {
+                egui::CentralPanel::default().show(root, |ui| {
+                    res = audio_patch_canvas(ui, patch, state, Id::new("geometry"));
+                });
+            });
+            res
+        }
+
+        /// Canvas units to screen points: the canvas is the only transformed
+        /// layer here.
+        fn to_screen(&self) -> TSTransform {
+            let transforms = self.ctx.memory(|m| m.to_global.clone());
+            assert_eq!(transforms.len(), 1, "one canvas, one layer transform");
+            *transforms.values().next().expect("one transform")
+        }
+
+        /// Every label's text and its rect on screen.
+        fn labels(&self) -> Vec<(String, Rect)> {
+            let to_screen = self.to_screen();
+            self.out
+                .platform_output
+                .accesskit_update
+                .iter()
+                .flat_map(|update| &update.nodes)
+                .filter(|(_, n)| n.role() == accesskit::Role::Label)
+                .filter_map(|(_, n)| {
+                    let b = n.bounds()?;
+                    let rect = Rect::from_min_max(
+                        Pos2::new(b.x0 as f32, b.y0 as f32),
+                        Pos2::new(b.x1 as f32, b.y1 as f32),
+                    );
+                    Some((n.value()?.to_owned(), to_screen * rect))
+                })
+                .collect()
+        }
+
+        /// The one label reading exactly `text`.
+        fn label(&self, text: &str) -> Rect {
+            let found: Vec<Rect> = self
+                .labels()
+                .into_iter()
+                .filter(|(t, _)| t == text)
+                .map(|(_, r)| r)
+                .collect();
+            assert_eq!(
+                found.len(),
+                1,
+                "labels reading {text:?}; all labels: {:?}",
+                self.labels()
+            );
+            found[0]
+        }
+
+        fn shapes(&self) -> Vec<egui::Shape> {
+            fn walk(shape: &egui::Shape, out: &mut Vec<egui::Shape>) {
+                match shape {
+                    egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, out)),
+                    other => out.push(other.clone()),
+                }
+            }
+            let mut out = Vec::new();
+            for clipped in &self.out.shapes {
+                walk(&clipped.shape, &mut out);
+            }
+            out
+        }
+
+        /// Port dots on screen: circles of the port radius at this zoom.
+        fn dots(&self) -> Vec<Pos2> {
+            let radius = PORT_RADIUS * self.to_screen().scaling;
+            self.shapes()
+                .into_iter()
+                .filter_map(|s| match s {
+                    egui::Shape::Circle(c) if (c.radius - radius).abs() < 0.25 * radius => {
+                        Some(c.center)
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Node boxes on screen: the frames filled with the node colour.
+        fn boxes(&self) -> Vec<Rect> {
+            self.shapes()
+                .into_iter()
+                .filter_map(|s| match s {
+                    egui::Shape::Rect(r) if r.fill == Color32::from_gray(32) => Some(r.rect),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        /// Every polyline's points: the wires.
+        fn wires(&self) -> Vec<Vec<Pos2>> {
+            self.shapes()
+                .into_iter()
+                .filter_map(|s| match s {
+                    egui::Shape::Path(p) if p.points.len() > 8 => Some(p.points),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn painted_text(&self) -> Vec<String> {
+            self.shapes()
+                .into_iter()
+                .filter_map(|s| match s {
+                    egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    fn one_node(kind: NodeKind) -> AudioPatch {
+        AudioPatch {
+            seed: 0,
+            graph: crate::patch::NodeGraph {
+                nodes: vec![node(0, kind)],
+                output: NodeId(0),
+            },
+        }
+    }
+
+    /// A dot's y inside `row`'s vertical span.
+    fn beside(dot: Pos2, row: Rect) -> bool {
+        (row.top()..=row.bottom()).contains(&dot.y)
+    }
+
+    #[test]
+    fn every_input_dot_sits_on_the_box_edge_beside_its_own_row() {
+        let mut checked = 0;
+        for kind in NodeKind::defaults() {
+            let name = node_kind_label(&kind);
+            let ports = input_ports(&kind);
+            let canvas = Canvas::new(one_node(kind.clone()));
+            let boxes = canvas.boxes();
+            assert_eq!(boxes.len(), 1, "{name}: one node box");
+            let node_box = boxes[0];
+            let dots = canvas.dots();
+            for port in ports {
+                let row = canvas.label(&format!("{port}:"));
+                assert!(
+                    dots.iter()
+                        .any(|d| (d.x - node_box.left()).abs() < 0.5 && beside(*d, row)),
+                    "{name}: no dot on the box's left edge beside the {port:?} row \
+                     ({row:?}); dots {dots:?}, box {node_box:?}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 20, "only {checked} ports were checked");
+    }
+
+    #[test]
+    fn the_output_dot_sits_on_the_title_row() {
+        for kind in NodeKind::defaults() {
+            let name = node_kind_label(&kind);
+            let canvas = Canvas::new(one_node(kind.clone()));
+            let node_box = canvas.boxes()[0];
+            let title = canvas.label(&format!("#0  {name}"));
+            assert!(
+                canvas
+                    .dots()
+                    .iter()
+                    .any(|d| (d.x - node_box.right()).abs() < 0.5 && beside(*d, title)),
+                "{name}: the output dot is not on the title row {title:?}; dots {:?}",
+                canvas.dots()
+            );
+        }
+    }
+
+    /// `#0` a sine, `#1` a gain whose `extra` port (not one of Gain's own,
+    /// as a patch loaded from JSON can have) is wired from the sine.
+    fn sine_into_gain(extra: bool) -> AudioPatch {
+        let mut gain = node(1, NodeKind::Gain(Default::default()));
+        if extra {
+            gain.inputs
+                .insert("extra".into(), vec![Connection::from_node(NodeId(0))]);
+        }
+        AudioPatch {
+            seed: 0,
+            graph: crate::patch::NodeGraph {
+                nodes: vec![node(0, NodeKind::Sine(SineOsc::default())), gain],
+                output: NodeId(1),
+            },
+        }
+    }
+
+    #[test]
+    fn a_wire_into_an_extra_port_ends_on_that_ports_row() {
+        let canvas = Canvas::new(sine_into_gain(true));
+        let row = canvas.label("extra:");
+        let wires = canvas.wires();
+        assert_eq!(wires.len(), 1, "one wire");
+        let end = *wires[0].last().expect("a wire has points");
+        assert!(
+            beside(end, row),
+            "the wire ends at {end:?}, not beside the extra row {row:?}"
+        );
+        assert!(
+            canvas.dots().iter().any(|d| d.distance(end) < 0.5),
+            "the extra port has a dot where its wire ends"
+        );
+    }
+
+    /// Press on the sine's output dot, carry the wire to `to` over a few
+    /// frames and hold it there; the canvas as it looks mid-drag.
+    fn drag_from_the_sine_to(canvas: &mut Canvas, to: Pos2) {
+        let node_box = canvas
+            .boxes()
+            .into_iter()
+            .min_by(|a, b| a.left().total_cmp(&b.left()))
+            .expect("the sine's box is leftmost");
+        let from = canvas
+            .dots()
+            .into_iter()
+            .find(|d| (d.x - node_box.right()).abs() < 0.5)
+            .expect("the sine's output dot");
+        canvas.frame(vec![
+            egui::Event::PointerMoved(from),
+            egui::Event::PointerButton {
+                pos: from,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        for step in 1..=4 {
+            canvas.frame(vec![egui::Event::PointerMoved(
+                from.lerp(to, step as f32 / 4.0),
+            )]);
+        }
+        // Then hold still, as a user does before letting go: the target's
+        // tooltip is a new area, and its first frame is a sizing pass.
+        canvas.frame(Vec::new());
+        canvas.frame(Vec::new());
+    }
+
+    fn release(canvas: &mut Canvas, at: Pos2) -> EditorResponse {
+        canvas.frame(vec![egui::Event::PointerButton {
+            pos: at,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }])
+    }
+
+    #[test]
+    fn a_wire_dropped_anywhere_on_a_row_connects_to_that_rows_port() {
+        let mut canvas = Canvas::new(sine_into_gain(false));
+        let row = canvas.label("gain:");
+        // Well right of the label: on the row, and far from the port's dot,
+        // which is on the box's left edge.
+        let to = Pos2::new(row.right() + 60.0, row.center().y);
+        let scale = canvas.to_screen().scaling;
+        let dot_x = canvas
+            .boxes()
+            .into_iter()
+            .map(|b| b.left())
+            .fold(f32::MIN, f32::max);
+        assert!(
+            (to.x - dot_x) / scale > SNAP_DIST,
+            "the drop point must be out of the old snap radius"
+        );
+
+        drag_from_the_sine_to(&mut canvas, to);
+        assert!(
+            canvas
+                .painted_text()
+                .iter()
+                .any(|t| t == "\u{27A1} #1 Gain \u{00B7} gain"),
+            "mid-drag, the target port is named; painted: {:?}",
+            canvas.painted_text()
+        );
+        let res = release(&mut canvas, to);
+
+        let gain = &canvas.patch.graph.nodes[1];
+        assert_eq!(
+            gain.inputs.get("gain"),
+            Some(&vec![Connection::from_node(NodeId(0))]),
+            "the drop wired the row's port; inputs: {:?}",
+            gain.inputs
+        );
+        assert!(res.changed && res.rebake);
+    }
+
+    #[test]
+    fn a_wire_dropped_on_no_port_connects_nothing_and_names_nothing() {
+        let mut canvas = Canvas::new(sine_into_gain(false));
+        let gain_box = canvas
+            .boxes()
+            .into_iter()
+            .max_by(|a, b| a.left().total_cmp(&b.left()))
+            .expect("the gain's box");
+        // Below the gain's box: no row, no dot.
+        let to = Pos2::new(gain_box.center().x, gain_box.bottom() + 80.0);
+        drag_from_the_sine_to(&mut canvas, to);
+        assert!(
+            !canvas
+                .painted_text()
+                .iter()
+                .any(|t| t.starts_with('\u{27A1}')),
+            "nothing is named over empty canvas"
+        );
+        release(&mut canvas, to);
+        assert!(canvas.patch.graph.nodes[1].inputs.is_empty());
     }
 
     /// The canvas must not panic on a structurally invalid graph — the

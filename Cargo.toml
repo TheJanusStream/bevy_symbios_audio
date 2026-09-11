@@ -1,6 +1,6 @@
 [package]
 name = "bevy_symbios_audio"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 authors = ["Janus"]
 description = "Algorithmic audio generator for Bevy."
@@ -28,7 +28,10 @@ cli = ["dep:clap"]
 bevy = { version = "0.19", features = ["wav"] }
 bevy_egui = { version = "0.41", optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
-rand = "0.9"
+# Only the `Rng` / `SeedableRng` traits over a seeded ChaCha8Rng: nothing
+# draws OS entropy, so the default os_rng / thread_rng features stay off
+# (Overlands #1172, finding 70).
+rand = { version = "0.9", default-features = false, features = ["std"] }
 rand_chacha = "0.9"
 rayon = "1.11"
 serde = { version = "1.0", features = ["derive", "rc"] }
@@ -83,3 +86,6 @@ debug = true
 [lints.rust]
 # Set by docs.rs only; see the attribute at the top of `src/lib.rs`.
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs)'] }
+# The sibling crates' shared policy (Overlands #1172). Every public item is
+# documented; the gate's `-D warnings` keeps it that way.
+missing_docs = "warn"

@@ -194,7 +194,11 @@ embed:
 - per-node config editors (one widget group per `NodeKind`) plus a kind
   picker (`node_kind_editor`),
 - a pannable / zoomable node-graph canvas (`audio_patch_canvas`) that
-  edits a whole `AudioPatch` — drag nodes, wire ports, choose the output,
+  edits a whole `AudioPatch` — drag nodes, wire ports, choose the output.
+  Each input port's dot sits beside its own named row in the node's
+  "Inputs" list; a wire can be dropped on the dot or anywhere on the row,
+  and while it is dragged the port it would connect to is highlighted and
+  named,
 - a DAW-style sequence-recipe timeline (`sequence_recipe_editor`) with
   transport, instruments, and draggable track / event lanes. Renaming an
   instrument takes its notes and its canvas layout with it, applied on
@@ -223,9 +227,9 @@ after a canvas is never seen, and the window grows every frame until it
 reaches the screen edge. `host_window` shows both editors inside windows,
 laid out the way that works. It doubles as a screenshot harness:
 `--shot <path>` saves a picture and quits, and `--light` switches theme.
-`--orphan` opens the sequence with notes that name no instrument, and
+`--orphan` opens the sequence with notes that name no instrument,
 `--rename <name>` types a new name over the open instrument's and presses
-Enter.
+Enter, and `--drag` holds a wire over a port's row mid-drag.
 
 ```sh
 cargo run --example host_window --features egui -- --shot host_window.png
