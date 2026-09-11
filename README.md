@@ -216,8 +216,20 @@ embed:
   with the seconds so far, Playing, Muted, Error), a caption saying what is
   played ("1.0 s at 22.05 kHz, looped"), and the waveform. It returns the
   `MonitorRequest` to write rather than writing it,
-- `symbios_genetics`-backed "🎲 Mutate" / reseed helpers (`mutate_patch`,
-  `randomize_seed`) and a reusable JSON copy/paste section (`json_io`).
+- `symbios_genetics`-backed Mutate / Reroll seed helpers (`mutate_patch`,
+  `randomize_seed`) and a reusable JSON copy/paste section (`json_io`),
+- `EditorStyle`, the colour roles the editors paint with: canvas ground,
+  node boxes, wires and ports, the timeline's lanes, loop markers and
+  notes, the waveform, and ok / warn / error. With nothing set, every
+  widget derives one from the `Visuals` it is drawn with
+  (`EditorStyle::from_visuals`), so the editors follow egui's dark and light
+  themes. A host with its own palette calls
+  `set_editor_style(ctx, style)` when its theme changes.
+
+Buttons say what they do in words ("Add node", "Fit view", "Delete note").
+The few glyphs left match Overlands' own: the remove cross `✖`, the valid
+check `✔`, the audition's `▶` and `⏹`, and the pencil of an instrument's
+`✏ Edit`.
 
 Every editor returns an `EditorResponse { changed, rebake }` so a host
 can persist mid-drag edits (`changed`) but only re-bake on commit

@@ -51,6 +51,7 @@ use bevy_egui::egui;
 
 use super::graph::describe_graph_error;
 use super::preview::{AudioMonitor, MonitorRequest, MonitorStatus, fingerprint, waveform};
+use super::style::editor_style;
 use crate::patch::{AudioPatch, topo_sort};
 use crate::sequence::SequenceRecipe;
 
@@ -324,7 +325,7 @@ pub fn audition_strip(
     ui.label(egui::RichText::new(source.caption()).weak());
     if let MonitorStatus::Error(message) = &status {
         let text = source.fault().unwrap_or_else(|| message.clone());
-        let color = ui.visuals().error_fg_color;
+        let color = editor_style(ui).error;
         ui.add(egui::Label::new(egui::RichText::new(text).color(color)).wrap());
     }
     let samples = monitor.samples_of();
@@ -361,8 +362,11 @@ fn auto_hover(source: &AuditionSource<'_>) -> String {
 }
 
 /// The status chip: a word in a tinted outline, with a spinner while
-/// baking. Every colour is the host theme's.
+/// baking. The quiet states are the theme's text tiers; Muted and Error are
+/// the editor style's warn and error, like every other warning and error
+/// the editors paint.
 fn status_chip(ui: &mut egui::Ui, status: &MonitorStatus, elapsed: Option<Duration>, muted: bool) {
+    let style = editor_style(ui);
     let visuals = ui.visuals();
     let (label, tone, hover) = match status {
         MonitorStatus::Idle => (
@@ -380,7 +384,7 @@ fn status_chip(ui: &mut egui::Ui, status: &MonitorStatus, elapsed: Option<Durati
         ),
         MonitorStatus::Playing if muted => (
             "Muted".to_string(),
-            visuals.warn_fg_color,
+            style.warn,
             "Playing, but the app's sound is muted, so nothing is heard",
         ),
         MonitorStatus::Playing => (
@@ -390,7 +394,7 @@ fn status_chip(ui: &mut egui::Ui, status: &MonitorStatus, elapsed: Option<Durati
         ),
         MonitorStatus::Error(_) => (
             "Error".to_string(),
-            visuals.error_fg_color,
+            style.error,
             "The last bake failed; the reason is below",
         ),
     };
@@ -614,6 +618,58 @@ mod tests {
                 strip.texts()
             );
         }
+    }
+
+    /// The chip's warning and error, and the reason under an error, are the
+    /// editor style's warn and error, so they follow a host's palette.
+    #[test]
+    fn muted_and_error_are_painted_in_the_styles_colours() {
+        use crate::ui::style::set_editor_style;
+        use crate::ui::style::tests::distinct_style;
+        use crate::ui::test_paint::text_painted;
+        let s = distinct_style();
+        let cases: [(&str, AudioPatch, MonitorStatus, bool, egui::Color32); 2] = [
+            ("Muted", one_gain(), MonitorStatus::Playing, true, s.warn),
+            (
+                "Error",
+                looped(),
+                MonitorStatus::Error("graph contains a cycle".into()),
+                false,
+                s.error,
+            ),
+        ];
+        for (chip, patch, status, muted, colour) in cases {
+            let source = AuditionSource::patch(&patch, 22_050, 1.0);
+            let mut strip = Strip::new();
+            set_editor_style(&strip.ctx, s.clone());
+            let request = strip.state.play(&source);
+            let mut monitor = AudioMonitor::default();
+            monitor.stage(&request, status);
+            strip.settle(&monitor, source, muted);
+            assert_eq!(
+                text_painted(&strip.out, chip).map(|(_, c)| c),
+                Some(colour),
+                "{chip}: the chip's word"
+            );
+        }
+        // The reason under an error, too.
+        let broken = looped();
+        let source = AuditionSource::patch(&broken, 22_050, 1.0);
+        let mut strip = Strip::new();
+        set_editor_style(&strip.ctx, s.clone());
+        let request = strip.state.play(&source);
+        let mut monitor = AudioMonitor::default();
+        monitor.stage(&request, MonitorStatus::Error("cycle".into()));
+        strip.settle(&monitor, source, false);
+        let reason = strip
+            .texts()
+            .into_iter()
+            .find(|t| t.contains("feed each other"))
+            .expect("the reason");
+        assert_eq!(
+            text_painted(&strip.out, &reason).map(|(_, c)| c),
+            Some(s.error)
+        );
     }
 
     /// A bake in flight says how long it has been running.

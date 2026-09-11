@@ -1,0 +1,432 @@
+//! The editors' colours: [`EditorStyle`], a set of named roles that every
+//! widget in [`crate::ui`] paints with (#58, Overlands #1331).
+//!
+//! # Why `Visuals` alone is not enough
+//!
+//! egui's `Visuals` names a window's colours: its text tiers, its fills, a
+//! selection, a warning and an error. The editors paint more than a window
+//! does: a canvas ground, node boxes, wires and ports, a timeline's lanes and
+//! loop markers, note blocks, a waveform. Until 0.4.4 each of those was a
+//! literal picked for egui's dark theme, so under a light theme the node
+//! boxes stayed charcoal while the theme drew dark text on them, and the
+//! node titles and port labels disappeared.
+//!
+//! # Where the style comes from
+//!
+//! [`EditorStyle::from_visuals`] derives every role from a `Visuals`, and the
+//! editors use it whenever the host has set nothing. A host that only
+//! switches egui's theme therefore gets editors that follow the switch.
+//!
+//! A host with its own palette builds a style, usually `from_visuals` with
+//! the roles it wants to own overwritten, and passes it to
+//! [`set_editor_style`] each time its theme changes. The style is kept in
+//! the egui context's data, so every editor drawn in that context reads it
+//! and no signature changes. A set style is not re-derived when the
+//! `Visuals` change: set it again, or call [`clear_editor_style`] to go back
+//! to following the `Visuals`.
+//!
+//! [`EditorStyle`] is `#[non_exhaustive]`: new roles may be added in a
+//! compatible release, each with a `from_visuals` default, so a host builds
+//! one from `from_visuals` and never with a struct literal.
+
+use bevy_egui::egui::{self, Color32};
+
+/// The success green on a dark ground. egui's `Visuals` has no success
+/// colour, so [`EditorStyle::from_visuals`] picks between this and
+/// [`OK_ON_LIGHT`], whichever reads better on the window. Both are the
+/// Overlands palette's `status.ok` for its dark and light themes.
+const OK_ON_DARK: Color32 = Color32::from_rgb(130, 200, 130);
+/// The success green on a light ground; see [`OK_ON_DARK`].
+const OK_ON_LIGHT: Color32 = Color32::from_rgb(30, 130, 50);
+/// How far the alternate lane stripe leans from the window fill toward the
+/// text colour: enough to tell two lanes apart, in either direction.
+const LANE_STRIPE: f32 = 0.06;
+/// Opacity of the crossfade band over the lanes.
+const CROSSFADE_ALPHA: f32 = 0.12;
+/// Opacity of a note's release tail, a faint copy of its fill.
+const TAIL_ALPHA: f32 = 0.35;
+
+/// The editors' colour roles. See the [module docs](self).
+///
+/// Build one with [`EditorStyle::from_visuals`], change the roles you want,
+/// and give it to [`set_editor_style`]. Text inside a node box, the
+/// toolbars and the inspectors is drawn by ordinary egui widgets and follows
+/// the host's `Visuals`; these roles are the colours the editors paint
+/// themselves.
+#[derive(Clone, Debug, PartialEq)]
+#[non_exhaustive]
+pub struct EditorStyle {
+    /// Behind the patch canvas's nodes.
+    pub canvas_ground: Color32,
+    /// A node box. Its widgets draw with the host's `Visuals`, so this has to
+    /// be a surface the host's text reads on; the default is `window_fill`.
+    pub node_fill: Color32,
+    /// A node box's edge.
+    pub node_stroke: Color32,
+    /// A node's title ("#2  Lowpass").
+    pub node_title: Color32,
+    /// The selected node's edge.
+    pub node_selected: Color32,
+    /// The edge of the node the patch plays (the graph's output).
+    pub node_output: Color32,
+    /// A wire between two nodes.
+    pub wire: Color32,
+    /// The wire being dragged, and the port it would connect to.
+    pub wire_active: Color32,
+    /// The port dots on a node's edges.
+    pub port: Color32,
+    /// "Valid graph".
+    pub ok: Color32,
+    /// A warning: the audition strip's Muted chip.
+    pub warn: Color32,
+    /// An error: a broken graph's outline and reason, a refused name, a note
+    /// with no instrument, a JSON parse failure, a failed bake.
+    pub error: Color32,
+    /// Behind the timeline's ruler and lanes.
+    pub timeline_ground: Color32,
+    /// The timeline's beat lines.
+    pub timeline_grid: Color32,
+    /// Text painted straight onto a ground: the ruler's beat numbers, the
+    /// empty waveform's "no signal", a lane's remove cross at rest.
+    pub ground_text: Color32,
+    /// Even-numbered lanes.
+    pub lane: Color32,
+    /// Odd-numbered lanes.
+    pub lane_alt: Color32,
+    /// The marker where a loop starts.
+    pub loop_start: Color32,
+    /// The marker at the end of the sequence.
+    pub loop_end: Color32,
+    /// The shade over the crossfade before the end. Usually translucent.
+    pub crossfade_band: Color32,
+    /// A note block.
+    pub note_fill: Color32,
+    /// The selected note's outline. The fill stays [`Self::note_fill`], so
+    /// its text reads the same selected or not.
+    pub note_selected: Color32,
+    /// The instrument name on a note block.
+    pub note_text: Color32,
+    /// A note's release tail after its block. Usually translucent.
+    pub release_tail: Color32,
+    /// Behind a waveform.
+    pub waveform_ground: Color32,
+    /// A waveform's zero line.
+    pub waveform_zero: Color32,
+    /// A waveform's trace.
+    pub waveform_trace: Color32,
+}
+
+impl EditorStyle {
+    /// Every role from `visuals`: the style the editors use when the host
+    /// sets none.
+    ///
+    /// - Grounds (canvas, timeline, waveform) are `extreme_bg_color`, the
+    ///   inset ground egui gives a text field; node boxes and lanes are
+    ///   `window_fill`, where the theme's own text reads.
+    /// - Text is the theme's: a node title in `strong_text_color`, text on
+    ///   a ground in `text_color`, a note's name in the selection's text
+    ///   colour on the selection fill.
+    /// - Edges and the grid are the separator colour. The selected node,
+    ///   the dragged wire and the loop start are `hyperlink_color`, the
+    ///   theme's interactive accent; the output node and the sequence end
+    ///   are `strong_text_color`.
+    /// - `warn` and `error` are the theme's. `Visuals` has no success
+    ///   colour, so `ok` (and the waveform trace) is a green chosen for the
+    ///   window: a pale one on a dark window, a deep one on a light window.
+    pub fn from_visuals(visuals: &egui::Visuals) -> Self {
+        let text = visuals.text_color();
+        let strong = visuals.strong_text_color();
+        let edge = visuals.widgets.noninteractive.bg_stroke.color;
+        let accent = visuals.hyperlink_color;
+        let ground = visuals.extreme_bg_color;
+        let surface = visuals.window_fill;
+        let ok = ok_for(surface);
+        Self {
+            canvas_ground: ground,
+            node_fill: surface,
+            node_stroke: edge,
+            node_title: strong,
+            node_selected: accent,
+            node_output: strong,
+            wire: text,
+            wire_active: accent,
+            port: visuals.widgets.inactive.fg_stroke.color,
+            ok,
+            warn: visuals.warn_fg_color,
+            error: visuals.error_fg_color,
+            timeline_ground: ground,
+            timeline_grid: edge,
+            ground_text: text,
+            lane: surface,
+            lane_alt: surface.lerp_to_gamma(text, LANE_STRIPE),
+            loop_start: accent,
+            loop_end: strong,
+            crossfade_band: accent.gamma_multiply(CROSSFADE_ALPHA),
+            note_fill: visuals.selection.bg_fill,
+            note_selected: strong,
+            note_text: visuals.selection.stroke.color,
+            release_tail: visuals.selection.bg_fill.gamma_multiply(TAIL_ALPHA),
+            waveform_ground: ground,
+            waveform_zero: edge,
+            waveform_trace: ok,
+        }
+    }
+}
+
+/// The success green that reads better on `surface`.
+fn ok_for(surface: Color32) -> Color32 {
+    if contrast_ratio(OK_ON_DARK, surface) >= contrast_ratio(OK_ON_LIGHT, surface) {
+        OK_ON_DARK
+    } else {
+        OK_ON_LIGHT
+    }
+}
+
+/// The key the style is kept under in the context's data.
+fn style_key() -> egui::Id {
+    egui::Id::new("bevy_symbios_audio::ui::EditorStyle")
+}
+
+/// Make `style` the colours of every editor drawn in `ctx`, until the next
+/// call or [`clear_editor_style`]. Call it when the host's theme changes.
+pub fn set_editor_style(ctx: &egui::Context, style: EditorStyle) {
+    ctx.data_mut(|data| data.insert_temp(style_key(), style));
+}
+
+/// Forget a style set with [`set_editor_style`]: the editors in `ctx` go
+/// back to [`EditorStyle::from_visuals`] of the `Visuals` they are drawn
+/// with.
+pub fn clear_editor_style(ctx: &egui::Context) {
+    ctx.data_mut(|data| data.remove::<EditorStyle>(style_key()));
+}
+
+/// The style the editors paint `ui` with: the one set on its context, or
+/// else [`EditorStyle::from_visuals`] of `ui`'s own `Visuals`.
+pub fn editor_style(ui: &egui::Ui) -> EditorStyle {
+    set_style(ui.ctx()).unwrap_or_else(|| EditorStyle::from_visuals(ui.visuals()))
+}
+
+/// The style set on `ctx`, if any.
+pub(crate) fn set_style(ctx: &egui::Context) -> Option<EditorStyle> {
+    ctx.data(|data| data.get_temp::<EditorStyle>(style_key()))
+}
+
+/// WCAG 2.1 relative luminance of an opaque sRGB colour.
+fn relative_luminance(c: Color32) -> f32 {
+    let linear = |v: u8| {
+        let s = f32::from(v) / 255.0;
+        if s <= 0.040_45 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * linear(c.r()) + 0.7152 * linear(c.g()) + 0.0722 * linear(c.b())
+}
+
+/// WCAG 2.1 contrast ratio of two opaque colours: 1 for one colour against
+/// itself, 21 for black on white. Normal text needs 4.5.
+pub(crate) fn contrast_ratio(a: Color32, b: Color32) -> f32 {
+    let (la, lb) = (relative_luminance(a), relative_luminance(b));
+    (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::ui::test_paint::contrast_on;
+
+    /// WCAG AA for normal text.
+    pub(crate) const AA: f32 = 4.5;
+
+    fn both_themes() -> [(&'static str, egui::Visuals); 2] {
+        [
+            ("dark", egui::Visuals::dark()),
+            ("light", egui::Visuals::light()),
+        ]
+    }
+
+    /// A style whose every role is a colour of its own that egui's stock
+    /// visuals never paint, so a test can tell which role painted what.
+    pub(crate) fn distinct_style() -> EditorStyle {
+        let mut style = EditorStyle::from_visuals(&egui::Visuals::dark());
+        let roles = [
+            &mut style.canvas_ground,
+            &mut style.node_fill,
+            &mut style.node_stroke,
+            &mut style.node_title,
+            &mut style.node_selected,
+            &mut style.node_output,
+            &mut style.wire,
+            &mut style.wire_active,
+            &mut style.port,
+            &mut style.ok,
+            &mut style.warn,
+            &mut style.error,
+            &mut style.timeline_ground,
+            &mut style.timeline_grid,
+            &mut style.ground_text,
+            &mut style.lane,
+            &mut style.lane_alt,
+            &mut style.loop_start,
+            &mut style.loop_end,
+            &mut style.crossfade_band,
+            &mut style.note_fill,
+            &mut style.note_selected,
+            &mut style.note_text,
+            &mut style.release_tail,
+            &mut style.waveform_ground,
+            &mut style.waveform_zero,
+            &mut style.waveform_trace,
+        ];
+        for (i, role) in roles.into_iter().enumerate() {
+            let step = u8::try_from(i).expect("fewer than 28 roles") * 9;
+            *role = Color32::from_rgb(201, 3 + step, 57);
+        }
+        style
+    }
+
+    /// The acceptance of Overlands #1331: in egui's own dark and light
+    /// themes, the text the editors paint reads on what it is painted on.
+    #[test]
+    fn from_visuals_holds_the_editors_text_to_aa_in_dark_and_light() {
+        for (theme, visuals) in both_themes() {
+            let s = EditorStyle::from_visuals(&visuals);
+            let pairs = [
+                ("node title on node fill", s.node_title, s.node_fill),
+                ("note text on note fill", s.note_text, s.note_fill),
+                (
+                    "waveform trace on its ground",
+                    s.waveform_trace,
+                    s.waveform_ground,
+                ),
+                (
+                    "ruler text on the timeline",
+                    s.ground_text,
+                    s.timeline_ground,
+                ),
+                (
+                    "'no signal' on the waveform",
+                    s.ground_text,
+                    s.waveform_ground,
+                ),
+                ("valid graph on the window", s.ok, visuals.window_fill),
+            ];
+            for (what, fg, bg) in pairs {
+                let ratio = contrast_on(fg, bg);
+                assert!(
+                    ratio >= AA,
+                    "{theme}: {what} is {ratio:.2}:1 ({fg:?} on {bg:?})"
+                );
+            }
+        }
+    }
+
+    /// A selected note's outline is drawn inside its block, so it has to
+    /// read against the note's fill: WCAG 1.4.11's 3:1. Overlands' first
+    /// mapping outlined its bright teal notes in light grey, at 2.16:1.
+    #[test]
+    fn from_visuals_outlines_a_selected_note_where_it_can_be_seen() {
+        for (theme, visuals) in both_themes() {
+            let s = EditorStyle::from_visuals(&visuals);
+            let ratio = contrast_on(s.note_selected, s.note_fill);
+            assert!(ratio >= 3.0, "{theme}: the outline is {ratio:.2}:1");
+        }
+    }
+
+    /// The control for the contrast tests: the palette 0.4.3 painted, a
+    /// charcoal box under light visuals' dark title text, fails the bar.
+    #[test]
+    fn the_old_charcoal_box_fails_the_bar_under_light_visuals() {
+        let light = egui::Visuals::light();
+        let old_box = Color32::from_gray(32);
+        assert!(contrast_on(light.strong_text_color(), old_box) < 2.0);
+    }
+
+    /// The default follows the theme: a light theme gets light grounds and
+    /// boxes, and the ok green is picked for the window it sits on.
+    #[test]
+    fn from_visuals_follows_the_themes_grounds_and_picks_the_green_for_the_window() {
+        let dark = EditorStyle::from_visuals(&egui::Visuals::dark());
+        let light = EditorStyle::from_visuals(&egui::Visuals::light());
+        assert_eq!(dark.node_fill, egui::Visuals::dark().window_fill);
+        assert_eq!(light.node_fill, egui::Visuals::light().window_fill);
+        assert_eq!(
+            light.timeline_ground,
+            egui::Visuals::light().extreme_bg_color
+        );
+        assert_eq!((dark.ok, light.ok), (OK_ON_DARK, OK_ON_LIGHT));
+        assert_ne!(light.lane, light.lane_alt, "two lanes can be told apart");
+    }
+
+    fn ui_run(ctx: &egui::Context, visuals: egui::Visuals) -> EditorStyle {
+        ctx.set_visuals(visuals);
+        let mut seen = None;
+        let _ = ctx.run_ui(egui::RawInput::default(), |root| {
+            egui::CentralPanel::default().show(root, |ui| seen = Some(editor_style(ui)));
+        });
+        seen.expect("the panel ran")
+    }
+
+    /// With nothing set the editors follow the `Visuals`; a set style wins
+    /// over any theme until it is cleared.
+    #[test]
+    fn a_set_style_wins_until_it_is_cleared() {
+        let ctx = egui::Context::default();
+        assert_eq!(
+            ui_run(&ctx, egui::Visuals::light()),
+            EditorStyle::from_visuals(&egui::Visuals::light())
+        );
+        set_editor_style(&ctx, distinct_style());
+        assert_eq!(ui_run(&ctx, egui::Visuals::light()), distinct_style());
+        assert_eq!(ui_run(&ctx, egui::Visuals::dark()), distinct_style());
+        clear_editor_style(&ctx);
+        assert_eq!(
+            ui_run(&ctx, egui::Visuals::dark()),
+            EditorStyle::from_visuals(&egui::Visuals::dark())
+        );
+    }
+
+    #[test]
+    fn the_distinct_style_gives_every_role_its_own_colour() {
+        let s = distinct_style();
+        let all = [
+            s.canvas_ground,
+            s.node_fill,
+            s.node_stroke,
+            s.node_title,
+            s.node_selected,
+            s.node_output,
+            s.wire,
+            s.wire_active,
+            s.port,
+            s.ok,
+            s.warn,
+            s.error,
+            s.timeline_ground,
+            s.timeline_grid,
+            s.ground_text,
+            s.lane,
+            s.lane_alt,
+            s.loop_start,
+            s.loop_end,
+            s.crossfade_band,
+            s.note_fill,
+            s.note_selected,
+            s.note_text,
+            s.release_tail,
+            s.waveform_ground,
+            s.waveform_zero,
+            s.waveform_trace,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            assert!(all[i + 1..].iter().all(|b| a != b), "role {i} repeats");
+        }
+    }
+
+    #[test]
+    fn contrast_ratio_spans_one_to_twenty_one() {
+        assert!((contrast_ratio(Color32::BLACK, Color32::WHITE) - 21.0).abs() < 0.01);
+        assert!((contrast_ratio(Color32::GRAY, Color32::GRAY) - 1.0).abs() < 1e-6);
+    }
+}

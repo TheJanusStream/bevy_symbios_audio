@@ -28,10 +28,21 @@
 //!   [`crate::sequence::SequenceRecipe`], with [`sequence::active_instrument_canvas`]
 //!   opening any instrument's patch in the [`graph`] canvas.
 //! - [`evolve`] / [`io`] — cross-cutting polish wired into the editors above:
-//!   `symbios_genetics`-backed "🎲 Mutate" / reseed helpers ([`evolve`]) and a
-//!   reusable JSON copy/paste section ([`io::json_io`]).
+//!   `symbios_genetics`-backed Mutate / Reroll seed helpers ([`evolve`]) and
+//!   a reusable JSON copy/paste section ([`io::json_io`]).
+//! - [`style`] — [`EditorStyle`], the named colour roles every widget above
+//!   paints with. A host sets its own with [`set_editor_style`] when its
+//!   theme changes; with none set, the widgets derive one from the `Visuals`
+//!   they are drawn with ([`EditorStyle::from_visuals`]).
 //!
 //! Every editor composes the same [`EditorResponse`] contract.
+//!
+//! Buttons say what they do in words ("Add node", "Fit view", "Delete
+//! note"). The glyphs that stay are the remove cross `✖` and the valid
+//! check `✔`, the code points Overlands' affordances use for the same acts,
+//! the audition's `▶` and `⏹`, which Overlands draws on its own Play and
+//! Stop, and the pencil of an instrument's `✏ Edit` toggle, which Overlands
+//! puts on its own Edit audio button.
 //!
 //! The two canvases, [`graph::audio_patch_canvas`] and
 //! [`sequence::active_instrument_canvas`], claim all the space left in the
@@ -69,6 +80,9 @@ pub mod io;
 pub mod node;
 pub mod preview;
 pub mod sequence;
+pub mod style;
+#[cfg(test)]
+mod test_paint;
 
 pub use audition::{AUTO_QUIET_SECS, AuditionSource, AuditionState, audition_strip};
 pub use evolve::{mutate_node_kind, mutate_patch, randomize_seed};
@@ -84,6 +98,7 @@ pub use preview::{
     AudioEditorPlugin, AudioMonitor, MonitorRequest, MonitorStatus, waveform, waveform_sized,
 };
 pub use sequence::{SequenceEditorState, active_instrument_canvas, sequence_recipe_editor};
+pub use style::{EditorStyle, clear_editor_style, editor_style, set_editor_style};
 
 /// Outcome of running an editor widget for one frame.
 ///
@@ -318,6 +333,13 @@ mod glyph_guard {
             missing.join("\n  ")
         );
         // A floor, not a count: the scan's failure mode is reading nothing.
+        // #58 took the emoji off the buttons (the plus, wastebasket, die,
+        // clipboard and arrow circle, 12 literals) and the scan still saw 37:
+        // 20 in drawn code (the remove cross, the valid check, the audition's
+        // play and stop, the Edit pencil, the wire arrows, dashes, quotes,
+        // ellipses, the pitch times sign) and 17 in tests. The floor was
+        // expected to trip and did not, so it stays at 15, well under what is
+        // drawn and well over what a blind scan reads.
         assert!(
             seen >= 15,
             "the scan saw only {seen} non-ASCII glyphs and has gone blind"

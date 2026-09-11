@@ -1,7 +1,7 @@
 //! Genetics controls for the editor — mutate a node, a patch, or reseed.
 //!
 //! Every node config implements [`symbios_genetics::Genotype`] (via the crate's
-//! `impl_genotype!` macro), so the editor can offer "🎲 Mutate" buttons that
+//! `impl_genotype!` macro), so the editor can offer Mutate buttons that
 //! nudge parameters along the same axes the evolutionary search uses.  These
 //! helpers dispatch the closed [`NodeKind`] enum to the right inner config's
 //! mutation and provide a clock-seeded RNG for one-shot, interactive clicks.

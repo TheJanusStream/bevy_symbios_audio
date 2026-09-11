@@ -24,8 +24,10 @@
 //!   For an event with no instrument it says so and offers to reassign every
 //!   event of that id to an existing instrument.
 //!
-//! New colours come from the host's `ui.visuals()` (the error colour is
-//! `error_fg_color`), so they follow its theme.
+//! Every colour the timeline paints — its ground, grid and ruler, the lanes,
+//! the loop markers, note blocks and their names, the error colour of a
+//! missing note or a refused name — comes from the [`EditorStyle`] in effect
+//! ([`crate::ui::style`]), so it follows the host's theme (#58).
 //!
 //! Like the rest of [`crate::ui`] this is pure egui returning an
 //! [`EditorResponse`]; the host drives the bake-and-play monitor (Phase 3) off
@@ -47,6 +49,7 @@ use crate::sequence::{Event, Instrument, PitchMode, SequenceRecipe, Track};
 
 use super::evolve::fresh_rng;
 use super::io::json_io;
+use super::style::{EditorStyle, editor_style};
 use super::{
     EditorResponse, JsonIoState, PatchEditorState, audio_patch_canvas, drag_debounced,
     slider_debounced,
@@ -86,7 +89,7 @@ pub struct SequenceEditorState {
     px_per_beat: f32,
     /// Move-vs-resize for the active block drag.
     drag_mode: DragMode,
-    /// Mutation rate for the "🎲 Mutate recipe" button.
+    /// Mutation rate for the "Mutate recipe" button.
     mutate_rate: f32,
     /// Buffer + last error for the JSON import/export section.
     json: JsonIoState,
@@ -276,6 +279,21 @@ fn paint_missing_block(painter: &egui::Painter, body: Rect, selected: bool, erro
     );
 }
 
+/// A note's block: the style's note fill, outlined in `note_selected` when
+/// selected. The fill does not change with the selection, so the note's
+/// name reads the same either way, and the selection is a shape as well as
+/// a colour.
+fn paint_note_block(painter: &egui::Painter, body: Rect, selected: bool, style: &EditorStyle) {
+    painter.rect_filled(body, 3.0, style.note_fill);
+    let edge = if selected {
+        Stroke::new(2.0, style.note_selected)
+    } else {
+        // The ground's colour, so two notes that touch stay two.
+        Stroke::new(1.0, style.timeline_ground)
+    };
+    painter.rect_stroke(body, 3.0, edge, StrokeKind::Inside);
+}
+
 impl SequenceEditorState {
     /// Index of the instrument currently open for patch editing, if any.
     pub fn active_instrument(&self) -> Option<usize> {
@@ -284,7 +302,7 @@ impl SequenceEditorState {
 
     /// Open instrument `index` in [`active_instrument_canvas`], or close the
     /// canvas with `None`. It does the same as clicking the instrument's
-    /// pencil, so a host can open an editor on a chosen instrument. An index
+    /// Edit toggle, so a host can open an editor on a chosen instrument. An index
     /// past the end of the recipe's instruments is cleared on the next draw.
     pub fn set_active_instrument(&mut self, index: Option<usize>) {
         self.active_instrument = index;
@@ -333,6 +351,7 @@ pub fn sequence_recipe_editor(
     id: Id,
 ) -> EditorResponse {
     let mut res = EditorResponse::NONE;
+    let style = editor_style(ui);
 
     egui::CollapsingHeader::new("Transport")
         .default_open(true)
@@ -340,7 +359,7 @@ pub fn sequence_recipe_editor(
 
     ui.horizontal(|ui| {
         if ui
-            .button("\u{1F3B2} Mutate recipe")
+            .button("Mutate recipe")
             .on_hover_text("Nudge BPM and event volumes via symbios-genetics")
             .clicked()
         {
@@ -353,15 +372,17 @@ pub fn sequence_recipe_editor(
     res.merge(json_io(ui, recipe, &mut state.json, id.with("recipe_json")));
 
     ui.separator();
-    res.merge(instruments_panel(ui, recipe, state, id));
+    res.merge(instruments_panel(ui, recipe, state, id, &style));
 
     ui.separator();
-    res.merge(timeline(ui, recipe, state, id));
+    res.merge(timeline(ui, recipe, state, id, &style));
 
     ui.separator();
     egui::CollapsingHeader::new("Event inspector")
         .default_open(true)
-        .show(ui, |ui| res.merge(event_inspector(ui, recipe, state)));
+        .show(ui, |ui| {
+            res.merge(event_inspector(ui, recipe, state, &style))
+        });
 
     res
 }
@@ -392,7 +413,7 @@ pub fn active_instrument_canvas(
         .filter(|i| *i < recipe.instruments.len())
     else {
         state.active_instrument = None;
-        ui.label("Select an instrument (\u{270F}) to edit its patch here.");
+        ui.label("Press an instrument's \u{270F} Edit to open its patch here.");
         return EditorResponse::NONE;
     };
     let inst_id = recipe.instruments[i].id.clone();
@@ -484,6 +505,7 @@ fn instruments_panel(
     recipe: &mut SequenceRecipe,
     state: &mut SequenceEditorState,
     id: Id,
+    style: &EditorStyle,
 ) -> EditorResponse {
     let mut res = EditorResponse::NONE;
     let mut add = false;
@@ -492,7 +514,7 @@ fn instruments_panel(
 
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Instruments").strong());
-        if ui.button("\u{2795} Add").clicked() {
+        if ui.button("Add instrument").clicked() {
             add = true;
         }
     });
@@ -507,11 +529,13 @@ fn instruments_panel(
         let field = ui.horizontal(|ui| {
             let active = state.active_instrument == Some(i);
             if ui
-                // U+270F, the emoji-presentation pencil: it is in egui's
+                // The pencil and the word, as Overlands says it ("✏ Edit
+                // audio…"): the one glyph the vocabulary keeps for editing
+                // (#58). U+270F, the emoji-presentation pencil, is in egui's
                 // embedded Noto Emoji, where the text-only U+270E is not, so
                 // it draws in any host that ships egui's default fonts (#52).
-                .selectable_label(active, "\u{270F}")
-                .on_hover_text("Edit this instrument's patch")
+                .selectable_label(active, "\u{270F} Edit")
+                .on_hover_text("Open this instrument's patch in the canvas")
                 .clicked()
             {
                 state.active_instrument = if active { None } else { Some(i) };
@@ -522,6 +546,7 @@ fn instruments_panel(
                 i,
                 &mut state.name_edits,
                 id.with(("instrument_name", i)),
+                style.error,
             );
             let nodes = recipe.instruments[i].patch.graph.nodes.len();
             ui.label(egui::RichText::new(format!("{nodes} node(s)")).weak());
@@ -548,7 +573,7 @@ fn instruments_panel(
         // of its way; it waits for the user rather than apply itself.
         let note = state.name_edits.get(&i).and_then(|edit| {
             match check_name(recipe, i, &edit.text, instrument_id_byte_limit()) {
-                Err(refusal) => Some((refusal.to_string(), ui.visuals().error_fg_color)),
+                Err(refusal) => Some((refusal.to_string(), style.error)),
                 Ok(_) if !focused => Some((
                     "Not applied yet: Enter in the field applies it, Esc puts the name back"
                         .to_owned(),
@@ -614,18 +639,17 @@ struct NameField {
 
 /// The name field of instrument `row`: it edits the row's [`NameEdit`], not
 /// the id, and reports a commit only for a name [`check_name`] accepts.
-/// While the typed name is refused, the text and the frame take the error
-/// colour.
+/// While the typed name is refused, the text and the frame take `error`.
 fn name_field(
     ui: &mut egui::Ui,
     recipe: &SequenceRecipe,
     row: usize,
     edits: &mut HashMap<usize, NameEdit>,
     field_id: Id,
+    error: Color32,
 ) -> NameField {
     let current = &recipe.instruments[row].id;
     let limit = instrument_id_byte_limit();
-    let error = ui.visuals().error_fg_color;
     let refused = |edits: &HashMap<usize, NameEdit>| {
         edits
             .get(&row)
@@ -714,11 +738,12 @@ fn timeline(
     recipe: &mut SequenceRecipe,
     state: &mut SequenceEditorState,
     id: Id,
+    style: &EditorStyle,
 ) -> EditorResponse {
     let mut res = EditorResponse::NONE;
 
     ui.horizontal(|ui| {
-        if ui.button("\u{2795} Track").clicked() {
+        if ui.button("Add track").clicked() {
             recipe.tracks.push(Track::default());
             res.changed = true;
             res.rebake = true;
@@ -741,7 +766,7 @@ fn timeline(
         .unwrap_or_default();
     // Notes whose id is not in here name no instrument and bake to nothing.
     let known: HashSet<String> = recipe.instruments.iter().map(|i| i.id.clone()).collect();
-    let error = ui.visuals().error_fg_color;
+    let error = style.error;
 
     let mut total = dur;
     for t in &recipe.tracks {
@@ -764,7 +789,7 @@ fn timeline(
             let painter = ui.painter_at(rect);
             let bx = |beat: f32| rect.left() + GUTTER + beat * ppb;
 
-            painter.rect_filled(rect, 0.0, Color32::from_gray(22));
+            painter.rect_filled(rect, 0.0, style.timeline_ground);
 
             // Beat ruler + grid lines.
             let step = if ppb < 20.0 {
@@ -779,7 +804,7 @@ fn timeline(
                 let x = bx(beat as f32);
                 painter.line_segment(
                     [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
-                    Stroke::new(1.0, Color32::from_gray(44)),
+                    Stroke::new(1.0, style.timeline_grid),
                 );
                 if beat % step == 0 {
                     painter.text(
@@ -787,7 +812,7 @@ fn timeline(
                         Align2::LEFT_TOP,
                         beat.to_string(),
                         egui::FontId::proportional(10.0),
-                        Color32::from_gray(130),
+                        style.ground_text,
                     );
                 }
                 beat += 1;
@@ -799,20 +824,20 @@ fn timeline(
                 let x = bx(ls);
                 painter.line_segment(
                     [Pos2::new(x, lanes_top), Pos2::new(x, rect.bottom())],
-                    Stroke::new(2.0, Color32::from_rgb(120, 200, 140)),
+                    Stroke::new(2.0, style.loop_start),
                 );
             }
             let x_end = bx(dur);
             painter.line_segment(
                 [Pos2::new(x_end, lanes_top), Pos2::new(x_end, rect.bottom())],
-                Stroke::new(2.0, Color32::from_rgb(230, 190, 90)),
+                Stroke::new(2.0, style.loop_end),
             );
             if crossfade > 0.0 {
                 let x0 = bx((dur - crossfade).max(0.0));
                 painter.rect_filled(
                     Rect::from_min_max(Pos2::new(x0, lanes_top), Pos2::new(x_end, rect.bottom())),
                     0.0,
-                    Color32::from_rgba_unmultiplied(230, 190, 90, 28),
+                    style.crossfade_band,
                 );
             }
 
@@ -826,9 +851,9 @@ fn timeline(
                     ),
                     0.0,
                     if ti % 2 == 0 {
-                        Color32::from_gray(30)
+                        style.lane
                     } else {
-                        Color32::from_gray(34)
+                        style.lane_alt
                     },
                 );
 
@@ -844,9 +869,9 @@ fn timeline(
                     "\u{2716}",
                     egui::FontId::proportional(13.0),
                     if x_resp.hovered() {
-                        Color32::from_rgb(220, 120, 120)
+                        error
                     } else {
-                        Color32::from_gray(90)
+                        style.ground_text
                     },
                 );
                 if x_resp.clicked() {
@@ -885,28 +910,14 @@ fn timeline(
                             if missing {
                                 error.gamma_multiply(0.15)
                             } else {
-                                Color32::from_rgba_unmultiplied(120, 160, 230, 60)
+                                style.release_tail
                             },
                         );
                     }
                     if missing {
                         paint_missing_block(&painter, body, selected, error);
                     } else {
-                        painter.rect_filled(
-                            body,
-                            3.0,
-                            if selected {
-                                Color32::from_rgb(90, 160, 250)
-                            } else {
-                                Color32::from_rgb(70, 110, 170)
-                            },
-                        );
-                        painter.rect_stroke(
-                            body,
-                            3.0,
-                            Stroke::new(1.0, Color32::from_gray(15)),
-                            StrokeKind::Inside,
-                        );
+                        paint_note_block(&painter, body, selected, style);
                     }
                     painter.text(
                         Pos2::new(body.left() + 4.0, body.center().y),
@@ -917,7 +928,7 @@ fn timeline(
                             ev.instrument_id.clone()
                         },
                         egui::FontId::proportional(11.0),
-                        if missing { error } else { Color32::WHITE },
+                        if missing { error } else { style.note_text },
                     );
 
                     let resp = ui.interact(body, id.with(("ev", ti, ei)), Sense::click_and_drag());
@@ -997,6 +1008,7 @@ fn event_inspector(
     ui: &mut egui::Ui,
     recipe: &mut SequenceRecipe,
     state: &mut SequenceEditorState,
+    style: &EditorStyle,
 ) -> EditorResponse {
     let mut res = EditorResponse::NONE;
 
@@ -1012,7 +1024,7 @@ fn event_inspector(
 
     let inst_ids: Vec<String> = recipe.instruments.iter().map(|i| i.id.clone()).collect();
     let dur = recipe.duration_beats.max(1.0);
-    let error = ui.visuals().error_fg_color;
+    let error = style.error;
     let mut delete = false;
     // Set by the reassign offer: every note of the first id takes the second.
     let mut reassign_all: Option<(String, String)> = None;
@@ -1129,7 +1141,7 @@ fn event_inspector(
             egui::Slider::new(&mut ev.volume, 0.0..=1.0).text("volume"),
         ));
 
-        if ui.button("\u{1F5D1} Delete event").clicked() {
+        if ui.button("Delete note").clicked() {
             delete = true;
         }
     }
@@ -1242,6 +1254,10 @@ mod tests {
 
     use egui::accesskit;
 
+    use crate::ui::style::set_editor_style;
+    use crate::ui::style::tests::{AA, distinct_style};
+    use crate::ui::test_paint::{button_labels, colours, contrast_on, glyph_labels, shapes};
+
     /// A note of `instrument` at `time_beats`.
     fn note(instrument: &str, time_beats: f32) -> Event {
         Event {
@@ -1323,8 +1339,26 @@ mod tests {
             Self::with_state(recipe, SequenceEditorState::default())
         }
 
+        /// With [`distinct_style`] set, so each role the editor paints has
+        /// a colour nothing else does.
         fn with_state(recipe: SequenceRecipe, state: SequenceEditorState) -> Self {
             let ctx = egui::Context::default();
+            set_editor_style(&ctx, distinct_style());
+            Self::on(ctx, recipe, state)
+        }
+
+        /// Under `visuals`, with no style set.
+        fn themed(
+            recipe: SequenceRecipe,
+            state: SequenceEditorState,
+            visuals: egui::Visuals,
+        ) -> Self {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(visuals);
+            Self::on(ctx, recipe, state)
+        }
+
+        fn on(ctx: egui::Context, recipe: SequenceRecipe, state: SequenceEditorState) -> Self {
             ctx.enable_accesskit();
             let mut driver = Self {
                 ctx,
@@ -1819,6 +1853,169 @@ mod tests {
         assert!(
             layouts.is_empty(),
             "a never-opened instrument starts from a fresh layout, not a stranger's"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Colours from the editor style, words on the buttons (#58, Overlands
+    // #1331 E1 E2)
+    // -----------------------------------------------------------------------
+
+    /// `wind` plays one long note with a release tail on lane 0, selected;
+    /// `kick` one short note on lane 1. The recipe loops from beat 2 with a
+    /// one-beat crossfade.
+    fn two_lane_recipe() -> (SequenceRecipe, SequenceEditorState) {
+        let mut recipe = recipe_with(&["wind", "kick"], 2);
+        recipe.tracks[0].events = vec![Event {
+            gate_beats: 4.0,
+            release_beats: 1.0,
+            ..note("wind", 0.0)
+        }];
+        recipe.tracks[1].events = vec![note("kick", 1.0)];
+        recipe.loop_start_beats = Some(2.0);
+        recipe.loop_crossfade_beats = 1.0;
+        let mut state = SequenceEditorState::default();
+        state.set_selected_event(Some((0, 0)));
+        (recipe, state)
+    }
+
+    /// The block a note label is painted on: the last opaque fill of a
+    /// note's height under the label's centre. An outline is painted as a
+    /// rect too, with a transparent fill, after the block it outlines.
+    fn block_under(out: &egui::FullOutput, label: &egui::Rect) -> Option<egui::epaint::RectShape> {
+        let block_h = LANE_H - 8.0;
+        shapes(out)
+            .into_iter()
+            .filter_map(|s| match s {
+                egui::Shape::Rect(r)
+                    if (r.rect.height() - block_h).abs() < 1.0
+                        && r.fill.is_opaque()
+                        && r.rect.contains(label.center()) =>
+                {
+                    Some(r)
+                }
+                _ => None,
+            })
+            .last()
+    }
+
+    /// Every note label reading `name` on the timeline, with its colour and
+    /// the fill of the block under it.
+    fn note_labels(out: &egui::FullOutput, name: &str) -> Vec<(Color32, Color32)> {
+        shapes(out)
+            .into_iter()
+            .filter_map(|s| match s {
+                egui::Shape::Text(t) if t.galley.text() == name => {
+                    let rect = t.visual_bounding_rect();
+                    let block = block_under(out, &rect)?;
+                    Some((crate::ui::test_paint::text_colour(&t), block.fill))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The acceptance of #1331 for notes: in egui's dark and light themes, a
+    /// note's name reads on its block, selected or not.
+    #[test]
+    fn a_notes_name_reads_on_its_block_in_dark_and_light() {
+        for (theme, visuals) in [
+            ("dark", egui::Visuals::dark()),
+            ("light", egui::Visuals::light()),
+        ] {
+            let (recipe, state) = two_lane_recipe();
+            let driver = Driver::themed(recipe, state, visuals);
+            for name in ["wind", "kick"] {
+                let found = note_labels(&driver.out, name);
+                assert_eq!(found.len(), 1, "{theme}: one {name:?} note label");
+                let (text, fill) = found[0];
+                let ratio = contrast_on(text, fill);
+                assert!(
+                    ratio >= AA,
+                    "{theme}: {name:?} is {ratio:.2}:1 on its block ({text:?} on {fill:?})"
+                );
+            }
+        }
+    }
+
+    /// A style the host set is what the timeline paints, role by role.
+    #[test]
+    fn a_set_style_is_what_the_timeline_paints() {
+        let s = distinct_style();
+        let (recipe, state) = two_lane_recipe();
+        let driver = Driver::with_state(recipe, state);
+        let painted = colours(&driver.out);
+        for (role, colour) in [
+            ("timeline_ground", s.timeline_ground),
+            ("timeline_grid", s.timeline_grid),
+            ("ground_text", s.ground_text),
+            ("lane", s.lane),
+            ("lane_alt", s.lane_alt),
+            ("loop_start", s.loop_start),
+            ("loop_end", s.loop_end),
+            ("crossfade_band", s.crossfade_band),
+            ("note_fill", s.note_fill),
+            ("note_selected", s.note_selected),
+            ("release_tail", s.release_tail),
+        ] {
+            assert!(painted.contains(&colour), "{role} is not painted");
+        }
+        for name in ["wind", "kick"] {
+            assert_eq!(
+                note_labels(&driver.out, name),
+                [(s.note_text, s.note_fill)],
+                "{name}: the label in note_text on a note_fill block"
+            );
+        }
+    }
+
+    /// A note with no instrument and a refused name are in the style's
+    /// error colour.
+    #[test]
+    fn missing_notes_and_refused_names_are_in_the_styles_error_colour() {
+        let s = distinct_style();
+        let mut state = SequenceEditorState::default();
+        state.set_selected_event(Some((0, 0)));
+        let mut driver = Driver::with_state(ghost_recipe(), state);
+        assert!(colours(&driver.out).contains(&s.error), "the ghost note");
+        let (_, missing) = crate::ui::test_paint::text_painted(&driver.out, "missing: ghost")
+            .expect("the ghost note's label");
+        assert_eq!(missing, s.error);
+
+        driver.focus("wind");
+        driver.frame(backspaces(4));
+        driver.frame(vec![typed("kick")]);
+        let (_, refusal) =
+            crate::ui::test_paint::text_painted(&driver.out, "Another instrument is called 'kick'")
+                .expect("the reason");
+        assert_eq!(refusal, s.error);
+    }
+
+    /// E2: the sequence editor's buttons say what they do in words. The
+    /// remove cross stays (Overlands' `affordances::CROSS`), and so does the
+    /// pencil of the instrument's Edit toggle, which Overlands draws for the
+    /// same act ("✏ Edit audio…").
+    #[test]
+    fn the_sequence_buttons_say_what_they_do_in_words() {
+        let (recipe, state) = two_lane_recipe();
+        let driver = Driver::with_state(recipe, state);
+        let labels = button_labels(&driver.out);
+        for word in [
+            "Add instrument",
+            "Add track",
+            "Mutate recipe",
+            "Delete note",
+            "\u{270F} Edit",
+        ] {
+            assert!(
+                labels.iter().any(|l| l == word),
+                "no {word:?} button; buttons: {labels:?}"
+            );
+        }
+        assert_eq!(
+            glyph_labels(&labels, &['\u{2716}', '\u{270F}']),
+            Vec::<String>::new(),
+            "buttons labelled with a glyph where the vocabulary says a word"
         );
     }
 }

@@ -68,15 +68,19 @@ pub fn waveform(ui: &mut egui::Ui, samples: &[f32]) -> egui::Response {
 /// vertical line from that slice's minimum to its maximum sample — the
 /// standard cheap audio overview that reads well at any zoom and needs no
 /// audio device (wasm-safe).  Samples are clamped to `[-1, 1]` for display.
+///
+/// Its ground, zero line and trace are the [`EditorStyle`](super::EditorStyle)'s
+/// `waveform_*` roles, and an empty buffer's "no signal" is its `ground_text`.
 pub fn waveform_sized(ui: &mut egui::Ui, samples: &[f32], size: egui::Vec2) -> egui::Response {
+    let style = super::style::editor_style(ui);
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
     let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 4.0, egui::Color32::from_gray(18));
+    painter.rect_filled(rect, 4.0, style.waveform_ground);
 
     let mid = rect.center().y;
     painter.line_segment(
         [egui::pos2(rect.left(), mid), egui::pos2(rect.right(), mid)],
-        egui::Stroke::new(1.0, egui::Color32::from_gray(70)),
+        egui::Stroke::new(1.0, style.waveform_zero),
     );
 
     if samples.is_empty() {
@@ -85,7 +89,7 @@ pub fn waveform_sized(ui: &mut egui::Ui, samples: &[f32], size: egui::Vec2) -> e
             egui::Align2::CENTER_CENTER,
             "no signal",
             egui::FontId::proportional(12.0),
-            egui::Color32::from_gray(110),
+            style.ground_text,
         );
         return resp;
     }
@@ -93,7 +97,7 @@ pub fn waveform_sized(ui: &mut egui::Ui, samples: &[f32], size: egui::Vec2) -> e
     let half = rect.height() * 0.5 * 0.94;
     let cols = rect.width().max(1.0) as usize;
     let n = samples.len();
-    let color = egui::Color32::from_rgb(120, 200, 140);
+    let color = style.waveform_trace;
     for x in 0..cols {
         let start = x * n / cols;
         let end = ((x + 1) * n / cols).clamp(start + 1, n);
@@ -423,6 +427,86 @@ mod tests {
                 });
             });
         }
+    }
+
+    /// One frame of a waveform of `samples`; what it painted.
+    fn painted_waveform(ctx: &egui::Context, samples: &[f32]) -> egui::FullOutput {
+        ctx.run_ui(egui::RawInput::default(), |root| {
+            egui::CentralPanel::default().show(root, |ui| {
+                waveform(ui, samples);
+            });
+        })
+    }
+
+    fn a_sine() -> Vec<f32> {
+        (0..2000).map(|i| (i as f32 * 0.05).sin()).collect()
+    }
+
+    /// The acceptance of Overlands #1331 for the waveform: in egui's dark
+    /// and light themes the trace reads on its ground. The ground is the
+    /// rect the trace's lines lie in, and the trace is the vertical lines.
+    #[test]
+    fn the_waveform_trace_reads_on_its_ground_in_dark_and_light() {
+        use crate::ui::style::tests::AA;
+        use crate::ui::test_paint::{contrast_on, shapes};
+        for (theme, visuals) in [
+            ("dark", egui::Visuals::dark()),
+            ("light", egui::Visuals::light()),
+        ] {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(visuals);
+            let out = painted_waveform(&ctx, &a_sine());
+            let painted = shapes(&out);
+            let ground = painted
+                .iter()
+                .find_map(|s| match s {
+                    egui::Shape::Rect(r) if r.rect.height() == 72.0 => Some(r.fill),
+                    _ => None,
+                })
+                .expect("the waveform's ground");
+            let traces: Vec<egui::Color32> = painted
+                .iter()
+                .filter_map(|s| match s {
+                    egui::Shape::LineSegment { points, stroke } if points[0].x == points[1].x => {
+                        Some(stroke.color)
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(traces.len() > 100, "{theme}: a column per pixel");
+            for trace in traces {
+                let ratio = contrast_on(trace, ground);
+                assert!(
+                    ratio >= AA,
+                    "{theme}: the trace is {ratio:.2}:1 on {ground:?}"
+                );
+            }
+        }
+    }
+
+    /// A style the host set is what the waveform paints: its ground, zero
+    /// line and trace, and an empty one's "no signal".
+    #[test]
+    fn a_set_style_is_what_the_waveform_paints() {
+        use crate::ui::style::set_editor_style;
+        use crate::ui::style::tests::distinct_style;
+        use crate::ui::test_paint::{colours, text_painted};
+        let s = distinct_style();
+        let ctx = egui::Context::default();
+        set_editor_style(&ctx, s.clone());
+        let painted = colours(&painted_waveform(&ctx, &a_sine()));
+        for (role, colour) in [
+            ("waveform_ground", s.waveform_ground),
+            ("waveform_zero", s.waveform_zero),
+            ("waveform_trace", s.waveform_trace),
+        ] {
+            assert!(painted.contains(&colour), "{role} is not painted");
+        }
+        let out = painted_waveform(&ctx, &[]);
+        assert_eq!(
+            text_painted(&out, "no signal").map(|(_, c)| c),
+            Some(s.ground_text)
+        );
     }
 
     #[test]

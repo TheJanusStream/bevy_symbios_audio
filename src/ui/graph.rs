@@ -40,12 +40,21 @@
 //! the standard way to keep an immediate-mode graph editor borrow-clean.
 //!
 //! Validity ([`topo_sort`]) is shown live in the toolbar and the output node
-//! gets a gold border, so cycles / missing-output / unknown-node are visible
+//! gets its own border, so cycles / missing-output / unknown-node are visible
 //! the moment they're created. A broken graph is also located: the toolbar
 //! names the nodes at fault ("#0 Gain and #1 Gain feed each other in a
-//! loop…"), and the canvas outlines their boxes in the host's error colour —
-//! the nodes of a loop, the node holding a wire from a node that is not
-//! there, or every node sharing an id (#57).
+//! loop…"), and the canvas outlines their boxes in the error colour — the
+//! nodes of a loop, the node holding a wire from a node that is not there,
+//! or every node sharing an id (#57).
+//!
+//! # Colours
+//!
+//! Everything the canvas paints itself — the ground, the node boxes and
+//! their edges and titles, wires, ports, the validity line — takes its colour
+//! from the [`EditorStyle`] in effect ([`crate::ui::style`]): the host's, if
+//! it set one, else one derived from the `Visuals` the canvas is drawn with.
+//! A node box is filled with a surface the theme's text reads on, so the
+//! widgets inside it read in a light theme as well as a dark one (#58).
 
 use std::collections::{HashMap, HashSet};
 
@@ -61,9 +70,13 @@ use super::EditorResponse;
 use super::evolve::{fresh_rng, mutate_node_kind, mutate_patch, randomize_seed};
 use super::io::json_io;
 use super::node::{node_kind_editor, node_kind_label};
+use super::style::{EditorStyle, editor_style};
 
 const NODE_WIDTH: f32 = 210.0;
 const PORT_RADIUS: f32 = 5.0;
+/// Opacity of the highlight over the row a dragged wire would connect to:
+/// the row's labels are under it and must still read.
+const DROP_ROW_ALPHA: f32 = 0.2;
 /// Horizontal / vertical spacing of the topological auto-layout grid.
 const COL_W: f32 = 280.0;
 const ROW_H: f32 = 190.0;
@@ -84,7 +97,7 @@ pub struct PatchEditorState {
     scene_rect: Rect,
     /// Selected node (delete target + highlight).
     selected: Option<NodeId>,
-    /// Mutation rate for the "🎲 Mutate" buttons.
+    /// Mutation rate for the Mutate buttons.
     mutate_rate: f32,
     /// Buffer + last error for the JSON import/export section.
     json: super::JsonIoState,
@@ -451,31 +464,38 @@ pub fn audio_patch_canvas(
     state: &mut PatchEditorState,
     id: Id,
 ) -> EditorResponse {
+    let style = editor_style(ui);
     let mut res = EditorResponse::NONE;
-    res.merge(toolbar(ui, patch, state));
+    res.merge(toolbar(ui, patch, state, &style));
     res.merge(json_io(ui, patch, &mut state.json, id.with("patch_json")));
     state.ensure_layout(patch);
 
+    // The scene takes the rest of the `Ui`, and draws on a layer over this
+    // one: the ground goes under it, where it will be.
+    ui.painter()
+        .rect_filled(ui.available_rect_before_wrap(), 0.0, style.canvas_ground);
     let mut scene_rect = state.scene_rect;
     let scene = egui::Scene::new().zoom_range(egui::Rangef::new(0.2, 2.0));
     let inner = scene.show(ui, &mut scene_rect, |ui| {
-        canvas_contents(ui, patch, state, id)
+        canvas_contents(ui, patch, state, id, &style)
     });
     state.scene_rect = scene_rect;
     res.merge(inner.inner);
     res
 }
 
-/// Fixed toolbar above the canvas: add / delete nodes, pick the output, reset
-/// the view, and a live validity readout.
+/// Fixed toolbar above the canvas: add / delete nodes, pick the output, fit
+/// the view, and a live validity readout. Its buttons say what they do in
+/// words (#58).
 fn toolbar(
     ui: &mut egui::Ui,
     patch: &mut AudioPatch,
     state: &mut PatchEditorState,
+    style: &EditorStyle,
 ) -> EditorResponse {
     let mut res = EditorResponse::NONE;
     ui.horizontal_wrapped(|ui| {
-        if ui.button("\u{2795} Add node").clicked() {
+        if ui.button("Add node").clicked() {
             let new_id = NodeId(
                 patch
                     .graph
@@ -499,7 +519,7 @@ fn toolbar(
 
         let can_delete = state.selected.is_some() && patch.graph.nodes.len() > 1;
         if ui
-            .add_enabled(can_delete, egui::Button::new("\u{1F5D1} Delete"))
+            .add_enabled(can_delete, egui::Button::new("Delete"))
             .on_hover_text("Remove the selected node and any wires into it")
             .clicked()
             && let Some(sel) = state.selected
@@ -530,7 +550,11 @@ fn toolbar(
             });
 
         ui.separator();
-        if ui.button("\u{27F2} Reset view").clicked() {
+        if ui
+            .button("Fit view")
+            .on_hover_text("Pan and zoom so every node is in view")
+            .clicked()
+        {
             // A zero-size rect makes Scene auto-fit to the content next frame.
             state.scene_rect = Rect::ZERO;
         }
@@ -538,7 +562,7 @@ fn toolbar(
 
     ui.horizontal_wrapped(|ui| {
         if ui
-            .button("\u{1F3B2} Mutate")
+            .button("Mutate")
             .on_hover_text("Nudge every node's parameters via symbios-genetics")
             .clicked()
         {
@@ -548,8 +572,11 @@ fn toolbar(
         }
         ui.add(egui::Slider::new(&mut state.mutate_rate, 0.0..=1.0).text("rate"));
         if ui
-            .button(format!("\u{1F3B2} seed {}", patch.seed))
-            .on_hover_text("Reroll the patch seed (re-randomises noise / random LFOs)")
+            .button("Reroll seed")
+            .on_hover_text(format!(
+                "The seed is {}. Reroll it to re-randomise noise and random LFOs",
+                patch.seed
+            ))
             .clicked()
         {
             randomize_seed(patch, &mut fresh_rng());
@@ -558,17 +585,19 @@ fn toolbar(
         }
     });
 
+    // The check and the cross are Overlands' `affordances::CHECK` and
+    // `CROSS`, its glyphs for valid and failed.
     match topo_sort(&patch.graph) {
         Ok(order) => {
             ui.colored_label(
-                Color32::from_rgb(120, 200, 120),
+                style.ok,
                 format!("\u{2714} valid graph \u{2014} {} nodes", order.len()),
             );
         }
         Err(e) => {
             // Named, and outlined on the canvas below (#57).
             ui.colored_label(
-                ui.visuals().error_fg_color,
+                style.error,
                 format!("\u{2716} {}", describe_graph_error(&patch.graph, &e)),
             );
         }
@@ -582,6 +611,7 @@ fn canvas_contents(
     patch: &mut AudioPatch,
     state: &mut PatchEditorState,
     id: Id,
+    style: &EditorStyle,
 ) -> EditorResponse {
     let mut res = EditorResponse::NONE;
     let mut actions: Vec<Action> = Vec::new();
@@ -606,7 +636,7 @@ fn canvas_contents(
         Ok(_) => HashSet::new(),
         Err(e) => nodes_at_fault(&patch.graph, &e).into_iter().collect(),
     };
-    let error_stroke = Stroke::new(2.0, ui.visuals().error_fg_color);
+    let error_stroke = Stroke::new(2.0, style.error);
 
     // Reserve a shape slot up front; we backfill it with the wires after node
     // rects are known, so wires render *behind* the node boxes.
@@ -625,11 +655,11 @@ fn canvas_contents(
         let stroke = if at_fault.contains(&nid) {
             error_stroke
         } else if selected == Some(nid) {
-            Stroke::new(2.0, Color32::from_rgb(90, 160, 250))
+            Stroke::new(2.0, style.node_selected)
         } else if output_id == nid {
-            Stroke::new(2.0, Color32::from_rgb(230, 190, 90))
+            Stroke::new(2.0, style.node_output)
         } else {
-            Stroke::new(1.0, Color32::from_gray(110))
+            Stroke::new(1.0, style.node_stroke)
         };
 
         let mut child = ui.new_child(
@@ -641,15 +671,16 @@ fn canvas_contents(
         child.set_width(NODE_WIDTH);
 
         let frame = egui::Frame::group(child.style())
-            .fill(Color32::from_gray(32))
+            .fill(style.node_fill)
             .stroke(stroke);
         let fr = frame.show(&mut child, |ui| {
             ui.set_width(NODE_WIDTH);
-            // Title bar: drag to move, click to select, 🎲 to mutate this node.
+            // Title bar: drag to move, click to select, Mutate to mutate
+            // this node.
             let title_row = ui.horizontal(|ui| {
                 let title = format!("#{}  {}", nid.0, node_kind_label(&node.kind));
                 let title_resp = ui.add(
-                    egui::Label::new(egui::RichText::new(title).strong())
+                    egui::Label::new(egui::RichText::new(title).strong().color(style.node_title))
                         .sense(Sense::click_and_drag()),
                 );
                 if title_resp.dragged() {
@@ -659,7 +690,7 @@ fn canvas_contents(
                     actions.push(Action::Select(nid));
                 }
                 if ui
-                    .small_button("\u{1F3B2}")
+                    .small_button("Mutate")
                     .on_hover_text("Mutate this node")
                     .clicked()
                 {
@@ -700,17 +731,17 @@ fn canvas_contents(
 
         // This node's dots, painted before the next box so a box that lies
         // over this one covers them too.
-        painter.circle_filled(oa, PORT_RADIUS, Color32::from_rgb(230, 190, 90));
+        painter.circle_filled(oa, PORT_RADIUS, style.port);
         for p in state.ports.iter().filter(|p| p.node == nid) {
             if p.connected {
-                painter.circle_filled(p.dot, PORT_RADIUS, Color32::from_gray(190));
+                painter.circle_filled(p.dot, PORT_RADIUS, style.port);
             } else {
                 // A ring: nothing drives this port yet.
                 painter.circle(
                     p.dot,
                     PORT_RADIUS,
-                    Color32::from_gray(32),
-                    Stroke::new(1.5, Color32::from_gray(190)),
+                    style.node_fill,
+                    Stroke::new(1.5, style.port),
                 );
             }
         }
@@ -764,7 +795,7 @@ fn canvas_contents(
                 if let Connection::Node { id: src, .. } = c
                     && let Some(src_pos) = state.outputs.get(src)
                 {
-                    wires.push(wire_shape(*src_pos, dst, Color32::from_gray(150)));
+                    wires.push(wire_shape(*src_pos, dst, style.wire));
                 }
             }
         }
@@ -776,27 +807,21 @@ fn canvas_contents(
         && let Some(&src) = state.outputs.get(&from)
     {
         let target = drop_target(&state.ports, &state.boxes, from, at);
-        let visuals = ui.visuals();
+        let active = style.wire_active;
         if let Some(target) = target {
-            let selection = visuals.selection;
             painter.rect(
                 target.row,
                 3.0,
-                selection.bg_fill.gamma_multiply(0.3),
-                selection.stroke,
+                active.gamma_multiply(DROP_ROW_ALPHA),
+                Stroke::new(1.0, active),
                 egui::StrokeKind::Outside,
             );
-            painter.circle(
-                target.dot,
-                PORT_RADIUS + 1.5,
-                selection.bg_fill,
-                selection.stroke,
-            );
+            painter.circle_filled(target.dot, PORT_RADIUS + 1.5, active);
         }
         // The wire ends on the dot it would connect to, so the user sees the
         // connection before letting go; over no port it follows the pointer.
         let end = target.map_or(at, |t| t.dot);
-        painter.add(wire_shape(src, end, visuals.selection.stroke.color));
+        painter.add(wire_shape(src, end, active));
         if let Some(target) = target {
             // A tooltip is drawn in screen space, so the name stays legible
             // at any zoom of the canvas.
@@ -890,7 +915,7 @@ fn connection_editor(ui: &mut egui::Ui, node: &mut GraphNode) -> (EditorResponse
         let name_row = ui
             .horizontal(|ui| {
                 ui.label(format!("{port}:"));
-                if ui.small_button("\u{2795} const").clicked() {
+                if ui.small_button("Add constant").clicked() {
                     to_add_const.push(port.clone());
                     res.changed = true;
                     res.rebake = true;
@@ -1297,7 +1322,18 @@ mod tests {
     use egui::accesskit;
     use egui::emath::TSTransform;
 
+    use crate::ui::style::tests::{AA, distinct_style};
+    use crate::ui::style::{EditorStyle, set_editor_style, set_style};
+    use crate::ui::test_paint::{
+        button_labels, colours, contrast_on, glyph_labels, shapes, text_painted,
+    };
+
     /// The canvas on a headless context, large enough to show a few nodes.
+    ///
+    /// [`Canvas::new`] sets [`distinct_style`] on the context, so every role
+    /// the canvas paints has a colour nothing else does and a test can find
+    /// a node box by its fill. [`Canvas::themed`] sets no style, so the
+    /// canvas falls back to the theme's.
     struct Canvas {
         ctx: egui::Context,
         patch: AudioPatch,
@@ -1308,6 +1344,18 @@ mod tests {
     impl Canvas {
         fn new(patch: AudioPatch) -> Self {
             let ctx = egui::Context::default();
+            set_editor_style(&ctx, distinct_style());
+            Self::on(ctx, patch)
+        }
+
+        /// The canvas under `visuals`, with no style set.
+        fn themed(patch: AudioPatch, visuals: egui::Visuals) -> Self {
+            let ctx = egui::Context::default();
+            ctx.set_visuals(visuals);
+            Self::on(ctx, patch)
+        }
+
+        fn on(ctx: egui::Context, patch: AudioPatch) -> Self {
             ctx.enable_accesskit();
             let mut canvas = Self {
                 ctx,
@@ -1388,17 +1436,43 @@ mod tests {
         }
 
         fn shapes(&self) -> Vec<egui::Shape> {
-            fn walk(shape: &egui::Shape, out: &mut Vec<egui::Shape>) {
-                match shape {
-                    egui::Shape::Vec(shapes) => shapes.iter().for_each(|s| walk(s, out)),
-                    other => out.push(other.clone()),
-                }
-            }
-            let mut out = Vec::new();
-            for clipped in &self.out.shapes {
-                walk(&clipped.shape, &mut out);
-            }
-            out
+            shapes(&self.out)
+        }
+
+        /// The style the canvas paints with: the one set on the context, or
+        /// the theme's.
+        fn style(&self) -> EditorStyle {
+            set_style(&self.ctx)
+                .unwrap_or_else(|| EditorStyle::from_visuals(&self.ctx.global_style().visuals))
+        }
+
+        /// The painted rect of each node box, in drawing order, found by
+        /// where the state says the boxes are rather than by their colour.
+        fn painted_boxes(&self) -> Vec<egui::epaint::RectShape> {
+            let to_screen = self.to_screen();
+            let rects: Vec<egui::epaint::RectShape> = self
+                .shapes()
+                .into_iter()
+                .filter_map(|s| match s {
+                    egui::Shape::Rect(r) => Some(r),
+                    _ => None,
+                })
+                .collect();
+            self.state
+                .boxes
+                .iter()
+                .map(|(id, rect)| {
+                    let on_screen = to_screen * *rect;
+                    rects
+                        .iter()
+                        .find(|r| {
+                            r.rect.center().distance(on_screen.center()) < 2.0
+                                && (r.rect.size() - on_screen.size()).length() < 4.0
+                        })
+                        .cloned()
+                        .unwrap_or_else(|| panic!("no painted rect for node #{}", id.0))
+                })
+                .collect()
         }
 
         /// Port dots on screen: circles of the port radius at this zoom.
@@ -1415,12 +1489,14 @@ mod tests {
                 .collect()
         }
 
-        /// Node boxes on screen: the frames filled with the node colour.
+        /// Node boxes on screen: the frames filled with the style's node
+        /// fill, which under [`distinct_style`] nothing else paints.
         fn boxes(&self) -> Vec<Rect> {
+            let fill = self.style().node_fill;
             self.shapes()
                 .into_iter()
                 .filter_map(|s| match s {
-                    egui::Shape::Rect(r) if r.fill == Color32::from_gray(32) => Some(r.rect),
+                    egui::Shape::Rect(r) if r.fill == fill => Some(r.rect),
                     _ => None,
                 })
                 .collect()
@@ -1448,18 +1524,22 @@ mod tests {
         }
 
         /// Whether each node box, in drawing order (the patch's node order),
-        /// is outlined in the host's error colour.
+        /// is outlined in the style's error colour.
         fn outlined_in_error(&self) -> Vec<bool> {
-            let error = self.ctx.global_style().visuals.error_fg_color;
+            let style = self.style();
             self.shapes()
                 .into_iter()
                 .filter_map(|s| match s {
-                    egui::Shape::Rect(r) if r.fill == Color32::from_gray(32) => {
-                        Some(r.stroke.color == error)
+                    egui::Shape::Rect(r) if r.fill == style.node_fill => {
+                        Some(r.stroke.color == style.error)
                     }
                     _ => None,
                 })
                 .collect()
+        }
+
+        fn buttons(&self) -> Vec<String> {
+            button_labels(&self.out)
         }
     }
 
@@ -1791,5 +1871,139 @@ mod tests {
             text.contains("#1 Gain") && text.contains("#9"),
             "the node and the missing one are named; painted:\n{text}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Colours from the editor style (#58, Overlands #1331 E1)
+    // -----------------------------------------------------------------------
+
+    /// E1: under the host's light theme the node boxes stayed charcoal and
+    /// the theme drew dark titles on them. Read off the painted frame: the
+    /// title's colour against its box's fill, in both of egui's themes, with
+    /// no style set so the canvas falls back to the theme's.
+    #[test]
+    fn a_node_title_reads_on_its_box_in_dark_and_light() {
+        for (theme, visuals) in [
+            ("dark", egui::Visuals::dark()),
+            ("light", egui::Visuals::light()),
+        ] {
+            let canvas = Canvas::themed(three_node_patch(), visuals);
+            let boxes = canvas.painted_boxes();
+            for (i, name) in ["#0  Sine", "#1  LFO", "#2  Lowpass"]
+                .into_iter()
+                .enumerate()
+            {
+                let (_, title) = text_painted(&canvas.out, name)
+                    .unwrap_or_else(|| panic!("{theme}: no title {name:?}"));
+                let ratio = contrast_on(title, boxes[i].fill);
+                assert!(
+                    ratio >= AA,
+                    "{theme}: {name:?} is {ratio:.2}:1 on its box ({title:?} on {:?})",
+                    boxes[i].fill
+                );
+            }
+        }
+    }
+
+    /// A style the host set is what the canvas paints, role by role: the
+    /// ground, the boxes and their three edges, the title, the wires, the
+    /// ports and the validity line.
+    #[test]
+    fn a_set_style_is_what_the_canvas_paints() {
+        let s = distinct_style();
+        let mut canvas = Canvas::new(three_node_patch());
+        canvas.state.selected = Some(NodeId(0));
+        canvas.frame(Vec::new());
+
+        let painted = colours(&canvas.out);
+        for (role, colour) in [
+            ("canvas_ground", s.canvas_ground),
+            ("wire", s.wire),
+            ("port", s.port),
+        ] {
+            assert!(painted.contains(&colour), "{role} is not painted");
+        }
+        // #0 selected, #1 plain, #2 the output.
+        let edges: Vec<Color32> = canvas
+            .painted_boxes()
+            .iter()
+            .map(|b| b.stroke.color)
+            .collect();
+        assert_eq!(edges, [s.node_selected, s.node_stroke, s.node_output]);
+        assert!(canvas.painted_boxes().iter().all(|b| b.fill == s.node_fill));
+        let (_, title) = text_painted(&canvas.out, "#1  LFO").expect("a title");
+        assert_eq!(title, s.node_title);
+        let (_, valid) =
+            text_painted(&canvas.out, "\u{2714} valid graph \u{2014} 3 nodes").expect("the line");
+        assert_eq!(valid, s.ok);
+    }
+
+    #[test]
+    fn a_broken_graph_is_named_and_outlined_in_the_styles_error_colour() {
+        let s = distinct_style();
+        let canvas = Canvas::new(loop_with_a_source_and_a_listener());
+        let line = canvas
+            .painted_text()
+            .into_iter()
+            .find(|t| t.contains("feed each other"))
+            .expect("the validity line");
+        let (_, colour) = text_painted(&canvas.out, &line).expect("painted");
+        assert_eq!(colour, s.error);
+        assert!(colours(&canvas.out).contains(&s.error));
+        assert_eq!(canvas.outlined_in_error(), [true, true, false, false]);
+    }
+
+    /// The wire in the hand and the row it would land on are the active
+    /// wire colour, not the theme's selection colours.
+    #[test]
+    fn a_dragged_wire_and_its_target_are_painted_in_the_active_wire_colour() {
+        let s = distinct_style();
+        let mut canvas = Canvas::new(sine_into_gain(false));
+        assert!(
+            !colours(&canvas.out).contains(&s.wire_active),
+            "nothing in hand yet"
+        );
+        let row = canvas.label("gain:");
+        drag_from_the_sine_to(&mut canvas, Pos2::new(row.right() + 60.0, row.center().y));
+        assert!(colours(&canvas.out).contains(&s.wire_active));
+    }
+
+    /// E2: the canvas's buttons say what they do in words, as the host's do.
+    /// The one glyph left is the remove cross, the code point Overlands'
+    /// `affordances::CROSS` uses for the same act.
+    #[test]
+    fn the_canvas_buttons_say_what_they_do_in_words() {
+        let canvas = Canvas::new(three_node_patch());
+        let labels = canvas.buttons();
+        for word in [
+            "Add node",
+            "Delete",
+            "Fit view",
+            "Mutate",
+            "Reroll seed",
+            "Add constant",
+        ] {
+            assert!(
+                labels.iter().any(|l| l == word),
+                "no {word:?} button; buttons: {labels:?}"
+            );
+        }
+        assert_eq!(
+            glyph_labels(&labels, &['\u{2716}']),
+            Vec::<String>::new(),
+            "buttons labelled with a glyph where the vocabulary says a word"
+        );
+    }
+
+    /// The control: the glyph check sees a glyph label, so the test above
+    /// cannot pass by reading no labels.
+    #[test]
+    fn the_glyph_check_flags_a_glyph_label_and_passes_the_cross() {
+        let labels = vec![
+            "\u{1F3B2} Mutate".to_string(),
+            "\u{2716}".to_string(),
+            "Fit view".to_string(),
+        ];
+        assert_eq!(glyph_labels(&labels, &['\u{2716}']), ["\u{1F3B2} Mutate"]);
     }
 }

@@ -34,6 +34,11 @@
 //!   cargo run --example host_window --features egui
 //!   cargo run --example host_window --features egui -- --light
 //!
+//! The host sets no editor style, so the editors derive their colours from
+//! egui's theme (`EditorStyle::from_visuals`) and follow the bar's Dark and
+//! Light. A host with its own palette would call `set_editor_style` when its
+//! theme changes, as Overlands does.
+//!
 //! `--shot <path>` waits for the layout to settle, saves a picture of the app
 //! window and quits. Under `--shot` every sink is muted, so a picture never
 //! makes a sound, whatever the strips say:
