@@ -198,7 +198,8 @@ embed:
   Each input port's dot sits beside its own named row in the node's
   "Inputs" list; a wire can be dropped on the dot or anywhere on the row,
   and while it is dragged the port it would connect to is highlighted and
-  named,
+  named. A graph that cannot bake says why by name ("#2 Lowpass and #3
+  Gain feed each other in a loop") and outlines the nodes at fault,
 - a DAW-style sequence-recipe timeline (`sequence_recipe_editor`) with
   transport, instruments, and draggable track / event lanes. Renaming an
   instrument takes its notes and its canvas layout with it, applied on
@@ -207,7 +208,14 @@ embed:
   is drawn in the theme's error colour, labelled `missing: <id>`, and the
   inspector offers to reassign every note of that id,
 - a pure-egui `waveform` widget plus a Bevy bake-and-play monitor
-  (`AudioEditorPlugin`) for auditioning edits,
+  (`AudioEditorPlugin`) for auditioning edits. A replaced or stopped patch
+  bake is cancelled, not left to run,
+- the audition strip (`audition_strip`), the row a host puts above an
+  editor to hear it: Audition, Stop, an Auto toggle that re-bakes a playing
+  audition shortly after each committed edit, a status chip (Idle, Baking
+  with the seconds so far, Playing, Muted, Error), a caption saying what is
+  played ("1.0 s at 22.05 kHz, looped"), and the waveform. It returns the
+  `MonitorRequest` to write rather than writing it,
 - `symbios_genetics`-backed "🎲 Mutate" / reseed helpers (`mutate_patch`,
   `randomize_seed`) and a reusable JSON copy/paste section (`json_io`).
 
@@ -227,12 +235,15 @@ after a canvas is never seen, and the window grows every frame until it
 reaches the screen edge. `host_window` shows both editors inside windows,
 laid out the way that works. It doubles as a screenshot harness:
 `--shot <path>` saves a picture and quits, and `--light` switches theme.
-`--orphan` opens the sequence with notes that name no instrument,
-`--rename <name>` types a new name over the open instrument's and presses
-Enter, and `--drag` holds a wire over a port's row mid-drag.
+`--status <idle|baking|playing|muted|error>` puts the audition strips in
+that state through real requests, `--broken` opens the patch with a loop
+in its graph, `--orphan` opens the sequence with notes that name no
+instrument, `--rename <name>` types a new name over the open instrument's
+and presses Enter, and `--drag` holds a wire over a port's row mid-drag.
 
 ```sh
 cargo run --example host_window --features egui -- --shot host_window.png
+cargo run --example host_window --features egui -- --status error --shot error.png
 cargo run --example host_window --features egui -- --orphan --shot orphan.png
 ```
 

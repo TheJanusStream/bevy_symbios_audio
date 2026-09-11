@@ -1,8 +1,9 @@
 //! `sequence_editor` — interactive editor for a [`SequenceRecipe`].
 //!
 //! A small DAW-style layout:
-//! - **top:** the bake-and-play monitor (▶ Bake & Play bakes the *whole* recipe
-//!   via `bake_sequence`, ⏹ stops) with a live waveform;
+//! - **top:** the crate's audition strip (▶ Audition bakes the *whole*
+//!   recipe via `bake_sequence` and loops it, ⏹ stops, and with Auto on a
+//!   committed edit re-bakes what plays) with the waveform of the last bake;
 //! - **left:** the sequence editor — transport, instruments, and the
 //!   track/event timeline (drag blocks to move, drag a block's right edge to
 //!   resize its gate, double-click an empty lane to add an event);
@@ -22,8 +23,8 @@ use bevy_symbios_audio::{
     SequenceRecipe, SineOsc, Track,
     sequence::Event,
     ui::{
-        AudioEditorPlugin, AudioMonitor, MonitorRequest, MonitorStatus, SequenceEditorState,
-        active_instrument_canvas, sequence_recipe_editor, waveform,
+        AudioEditorPlugin, AudioMonitor, AuditionSource, AuditionState, MonitorRequest,
+        SequenceEditorState, active_instrument_canvas, audition_strip, sequence_recipe_editor,
     },
 };
 
@@ -44,10 +45,15 @@ fn main() {
         .run();
 }
 
+/// The recipe, its editor state, and its audition strip, with whether an
+/// editor committed an edit last frame (the strip is drawn first, so it
+/// hears of a commit a frame later).
 #[derive(Resource)]
 struct Editor {
     recipe: SequenceRecipe,
     state: SequenceEditorState,
+    audition: AuditionState,
+    committed: bool,
 }
 
 impl Default for Editor {
@@ -55,6 +61,8 @@ impl Default for Editor {
         Self {
             recipe: starter_recipe(),
             state: SequenceEditorState::default(),
+            audition: AuditionState::default(),
+            committed: false,
         }
     }
 }
@@ -209,55 +217,43 @@ fn render_ui(
             .max_rect(ctx.viewport_rect()),
     );
 
+    let editor = editor.as_mut();
     egui::Panel::top("monitor").show(&mut viewport_ui, |ui| {
-        ui.horizontal(|ui| {
-            if ui.button("\u{25B6} Bake & Play").clicked() {
-                requests.write(MonitorRequest::PlaySequence {
-                    recipe: editor.recipe.clone(),
-                });
-            }
-            if ui.button("\u{23F9} Stop").clicked() {
-                requests.write(MonitorRequest::Stop);
-            }
-            match &monitor.status {
-                MonitorStatus::Idle => {
-                    ui.label("idle");
-                }
-                MonitorStatus::Baking => {
-                    ui.spinner();
-                    ui.label("baking\u{2026}");
-                }
-                MonitorStatus::Playing => {
-                    ui.label("playing (loop)");
-                }
-                MonitorStatus::Error(e) => {
-                    ui.colored_label(egui::Color32::from_rgb(220, 120, 120), e);
-                }
-            }
-        });
-        waveform(ui, &monitor.last_samples);
+        if let Some(request) = audition_strip(
+            ui,
+            &monitor,
+            &mut editor.audition,
+            AuditionSource::sequence(&editor.recipe),
+            editor.committed,
+            false,
+        ) {
+            requests.write(request);
+        }
     });
 
-    let editor = editor.as_mut();
+    let mut committed = false;
     egui::Panel::left("sequence")
         .default_size(420.0)
         .show(&mut viewport_ui, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                sequence_recipe_editor(
+                committed |= sequence_recipe_editor(
                     ui,
                     &mut editor.recipe,
                     &mut editor.state,
                     egui::Id::new("sequence_editor"),
-                );
+                )
+                .rebake;
             });
         });
 
     egui::CentralPanel::default().show(&mut viewport_ui, |ui| {
-        active_instrument_canvas(
+        committed |= active_instrument_canvas(
             ui,
             &mut editor.recipe,
             &mut editor.state,
             egui::Id::new("instrument_canvas"),
-        );
+        )
+        .rebake;
     });
+    editor.committed = committed;
 }

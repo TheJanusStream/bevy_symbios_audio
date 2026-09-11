@@ -116,6 +116,8 @@ impl Default for AsyncAudioConfig {
     }
 }
 
+// Only the native pool sizes itself; on wasm there is no pool to size.
+#[cfg(not(target_arch = "wasm32"))]
 fn resolve_pool_threads(cfg: &AsyncAudioConfig) -> usize {
     if cfg.pool_threads == 0 {
         std::thread::available_parallelism()

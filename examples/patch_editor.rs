@@ -8,8 +8,10 @@
 //!
 //! Pan by dragging empty canvas; zoom with the scroll wheel.
 //!
-//! A bake-and-play monitor sits across the top: "▶ Bake & Play" bakes the
-//! edited patch and loops it through a waveform display, "⏹ Stop" halts it.
+//! The crate's audition strip sits across the top: "▶ Audition" bakes the
+//! edited patch and loops it, "⏹ Stop" halts it, and with Auto on every
+//! committed edit re-bakes what plays. The chip says what the monitor is
+//! doing, the caption what is played, and the waveform shows the last bake.
 //!
 //! Run with:
 //!   cargo run --example patch_editor --features egui
@@ -23,8 +25,8 @@ use bevy_symbios_audio::{
     AudioPatch, BiquadLowpass, Connection, GraphNode, Lfo, LfoShape, NodeGraph, NodeId, NodeKind,
     SineOsc,
     ui::{
-        AudioEditorPlugin, AudioMonitor, MonitorRequest, MonitorStatus, PatchEditorState,
-        audio_patch_canvas, waveform,
+        AudioEditorPlugin, AudioMonitor, AuditionSource, AuditionState, MonitorRequest,
+        PatchEditorState, audio_patch_canvas, audition_strip,
     },
 };
 
@@ -49,11 +51,15 @@ fn main() {
         .run();
 }
 
-/// The patch being edited plus its canvas view/layout state.
+/// The patch being edited, its canvas view/layout state, and its audition
+/// strip, with whether the canvas committed an edit last frame (the strip is
+/// drawn above the canvas, so it hears of a commit a frame later).
 #[derive(Resource)]
 struct Editor {
     patch: AudioPatch,
     state: PatchEditorState,
+    audition: AuditionState,
+    committed: bool,
 }
 
 impl Default for Editor {
@@ -61,6 +67,8 @@ impl Default for Editor {
         Self {
             patch: starter_patch(),
             state: PatchEditorState::default(),
+            audition: AuditionState::default(),
+            committed: false,
         }
     }
 }
@@ -138,46 +146,30 @@ fn render_ui(
             .max_rect(ctx.viewport_rect()),
     );
 
-    // Monitor controls + waveform (top).
+    // The audition strip (top).
+    let editor = editor.as_mut();
     egui::Panel::top("monitor").show(&mut viewport_ui, |ui| {
-        ui.horizontal(|ui| {
-            if ui.button("\u{25B6} Bake & Play").clicked() {
-                requests.write(MonitorRequest::PlayPatch {
-                    patch: editor.patch.clone(),
-                    sample_rate: PREVIEW_SR,
-                    duration_secs: PREVIEW_SECS,
-                });
-            }
-            if ui.button("\u{23F9} Stop").clicked() {
-                requests.write(MonitorRequest::Stop);
-            }
-            match &monitor.status {
-                MonitorStatus::Idle => {
-                    ui.label("idle");
-                }
-                MonitorStatus::Baking => {
-                    ui.spinner();
-                    ui.label("baking\u{2026}");
-                }
-                MonitorStatus::Playing => {
-                    ui.label("playing (loop)");
-                }
-                MonitorStatus::Error(e) => {
-                    ui.colored_label(egui::Color32::from_rgb(220, 120, 120), e);
-                }
-            }
-        });
-        waveform(ui, &monitor.last_samples);
+        let source = AuditionSource::patch(&editor.patch, PREVIEW_SR, PREVIEW_SECS);
+        if let Some(request) = audition_strip(
+            ui,
+            &monitor,
+            &mut editor.audition,
+            source,
+            editor.committed,
+            false,
+        ) {
+            requests.write(request);
+        }
     });
 
     // Node-graph canvas (fills the rest).
-    let editor = editor.as_mut();
     egui::CentralPanel::default().show(&mut viewport_ui, |ui| {
-        audio_patch_canvas(
+        editor.committed = audio_patch_canvas(
             ui,
             &mut editor.patch,
             &mut editor.state,
             egui::Id::new("patch_canvas"),
-        );
+        )
+        .rebake;
     });
 }

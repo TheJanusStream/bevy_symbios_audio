@@ -4,12 +4,19 @@
 //!
 //! The two windows are laid out like Overlands' audio pop-out:
 //!
-//! - **Patch slot:** the audition strip (Audition, Stop, the monitor's status,
-//!   and the waveform once something has been baked), a separator, then
-//!   [`audio_patch_canvas`] **last**.
+//! - **Patch slot:** the crate's [`audition_strip`] (Audition, Stop, Auto, the
+//!   status chip, the caption and the waveform of the slot's last bake), a
+//!   separator, then [`audio_patch_canvas`] **last**. It auditions the way
+//!   Overlands' world plays a construct's patch: one second at 22 050 Hz,
+//!   looped.
 //! - **Sequence slot:** the same strip, then [`sequence_recipe_editor`] in a
 //!   resizable, scrolling left panel, with [`active_instrument_canvas`]
 //!   filling the rest in a central panel.
+//!
+//! Each editor's commit (`EditorResponse::rebake`) goes to its strip on the
+//! next frame, so with Auto on a playing audition re-bakes after an edit. The
+//! host bar's Mute stands in for a host's own sound switch: it silences every
+//! sink and tells the strips, whose chip then says Muted instead of Playing.
 //!
 //! The order matters. A canvas is an `egui::Scene` and takes all the space
 //! left in its `Ui`. Anything drawn after it lands below the window's
@@ -28,10 +35,25 @@
 //!   cargo run --example host_window --features egui -- --light
 //!
 //! `--shot <path>` waits for the layout to settle, saves a picture of the app
-//! window and quits. It plays nothing: the waveform is filled from a
-//! synchronous bake, so the strip looks as it does after an audition:
+//! window and quits. Under `--shot` every sink is muted, so a picture never
+//! makes a sound, whatever the strips say:
 //!   cargo run --example host_window --features egui -- --shot dark.png
 //!   cargo run --example host_window --features egui -- --light --shot light.png
+//!
+//! `--status <state>` puts the strips in one of the chip's states before the
+//! picture, through real requests to the monitor: `idle` (nothing asked),
+//! `playing` (the patch slot auditioned; the default under `--shot`), `muted`
+//! (the same with the host bar's Mute on), `baking` (the sequence slot
+//! auditioned, pictured while its bake runs) and `error` (the patch slot
+//! auditioned with `--broken`'s patch). `--broken` opens the patch slot with
+//! a loop in its graph, so the canvas outlines the two nodes of the loop and
+//! names them:
+//!   cargo run --example host_window --features egui -- --status baking --shot baking.png
+//!   cargo run --example host_window --features egui -- --status error --shot error.png
+//!
+//! A `baking` picture needs a bake slower than a few frames: the dev profile
+//! bakes the seeded-size sequence in about a second, a release build in well
+//! under a tenth of one, too fast to picture.
 //!
 //! `--orphan` opens the sequence with notes that name no instrument: the
 //! pluck is renamed "harp" and its eight notes still say "pluck", which is
@@ -59,6 +81,7 @@
 
 use std::collections::BTreeMap;
 
+use bevy::audio::{AudioSink, AudioSinkPlayback};
 use bevy::diagnostic::FrameCount;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
@@ -70,12 +93,12 @@ use bevy_egui::{
 use bevy_symbios_audio::{
     AdsrEnvelope, AudioPatch, BiquadLowpass, BrownNoise, Connection, Gate, GraphNode, Instrument,
     Lfo, LfoShape, NodeGraph, NodeId, NodeKind, PinkNoise, SawtoothOsc, SequenceRecipe, SineOsc,
-    Track, TriangleOsc, bake,
+    Track, TriangleOsc,
     sequence::Event,
     ui::{
-        AudioEditorPlugin, AudioMonitor, MonitorRequest, MonitorStatus, PatchEditorState,
-        SequenceEditorState, active_instrument_canvas, audio_patch_canvas, sequence_recipe_editor,
-        waveform,
+        AudioEditorPlugin, AudioMonitor, AuditionSource, AuditionState, MonitorRequest,
+        MonitorStatus, PatchEditorState, SequenceEditorState, active_instrument_canvas,
+        audio_patch_canvas, audition_strip, sequence_recipe_editor,
     },
 };
 
@@ -83,9 +106,12 @@ use bevy_symbios_audio::{
 const SLOT: egui::Vec2 = egui::vec2(900.0, 640.0);
 /// Space between the windows and around them.
 const GAP: f32 = 12.0;
-/// What the patch slot's Audition bakes.
-const PATCH_SAMPLE_RATE: u32 = 44_100;
-const PATCH_SECS: f32 = 4.0;
+/// What the patch slot's Audition bakes: what Overlands' world bakes for a
+/// construct's patch, and loops.
+const PATCH_SAMPLE_RATE: u32 = 22_050;
+const PATCH_SECS: f32 = 1.0;
+/// The patch slot's caption says whose numbers those are.
+const PATCH_NOTE: &str = "as a construct plays it";
 /// The instrument the sequence slot opens on (the pluck: three wired nodes).
 const OPEN_INSTRUMENT: usize = 2;
 /// Frames with both windows up before `--shot` takes its picture.
@@ -109,8 +135,16 @@ const DRAG_FRAMES: u32 = 12;
 /// units: on the row, and farther from the port's dot than a drop used to
 /// snap from.
 const DRAG_PAST_LABEL: f32 = 70.0;
+/// Frames with both windows up when `--status` asks the monitor for its
+/// state: after the windows' sizing passes, and in time for a bake to land
+/// before `--shot` takes its picture. `baking` asks only once the layout has
+/// settled, and the picture follows [`BAKING_FOR`] later, inside the bake.
+const STATUS_AT_FRAMES: u32 = 20;
+/// How long `--status baking` lets the bake run before the picture, so the
+/// chip shows a count.
+const BAKING_FOR: std::time::Duration = std::time::Duration::from_millis(100);
 
-fn main() {
+fn main() -> AppExit {
     let args = Args::from_env();
     let width = 2.0 * SLOT.x + 3.0 * GAP;
     App::new()
@@ -123,12 +157,12 @@ fn main() {
             ..default()
         }))
         .add_plugins((EguiPlugin::default(), AudioEditorPlugin))
-        .insert_resource(Editor::new(!args.light, args.orphan))
+        .insert_resource(Editor::new(&args))
         .insert_resource(args)
         .init_resource::<Shot>()
         .init_resource::<Typist>()
         .init_resource::<Dragger>()
-        .add_systems(Startup, (setup_camera, fill_waveform_for_the_shot))
+        .add_systems(Startup, setup_camera)
         .add_systems(
             PreUpdate,
             (type_the_rename, drag_a_wire)
@@ -136,19 +170,55 @@ fn main() {
                 .before(EguiPreUpdateSet::BeginPass),
         )
         .add_systems(EguiPrimaryContextPass, render_ui)
-        .add_systems(Update, (log_window_sizes, shoot))
-        .run();
+        .add_systems(
+            Update,
+            (
+                log_window_sizes,
+                ask_for_the_status,
+                silence_the_sinks,
+                shoot,
+            ),
+        )
+        .run()
 }
 
-/// The command line: `--light`, `--orphan`, `--rename <name>`, `--drag`
-/// and `--shot <path>`.
+/// The command line: `--light`, `--orphan`, `--rename <name>`, `--drag`,
+/// `--broken`, `--status <state>` and `--shot <path>`.
 #[derive(Resource)]
 struct Args {
     light: bool,
     orphan: bool,
     rename: Option<String>,
     drag: bool,
+    broken: bool,
+    status: Option<Status>,
     shot: Option<String>,
+}
+
+/// The chip state `--status` asks for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Status {
+    Idle,
+    Baking,
+    Playing,
+    Muted,
+    Error,
+}
+
+impl Status {
+    fn parse(name: &str) -> Self {
+        match name {
+            "idle" => Self::Idle,
+            "baking" => Self::Baking,
+            "playing" => Self::Playing,
+            "muted" => Self::Muted,
+            "error" => Self::Error,
+            other => {
+                eprintln!("--status {other}: expected idle, baking, playing, muted or error");
+                std::process::exit(2);
+            }
+        }
+    }
 }
 
 impl Args {
@@ -162,12 +232,20 @@ impl Args {
                 })
             })
         };
+        let shot = value("--shot", "host_window.png");
+        let status = value("--status", "baking")
+            .map(|name| Status::parse(&name))
+            // A picture shows the strip after an audition unless it asks
+            // for another state.
+            .or(shot.as_ref().map(|_| Status::Playing));
         Self {
             light: args.iter().any(|a| a == "--light"),
             orphan: args.iter().any(|a| a == "--orphan"),
             rename: value("--rename", "lead"),
             drag: args.iter().any(|a| a == "--drag"),
-            shot: value("--shot", "host_window.png"),
+            broken: args.iter().any(|a| a == "--broken") || status == Some(Status::Error),
+            status,
+            shot,
         }
     }
 }
@@ -178,8 +256,16 @@ impl Args {
 struct Editor {
     patch: AudioPatch,
     patch_state: PatchEditorState,
+    /// The patch slot's strip, and whether its canvas committed an edit on
+    /// the last frame (the strip is drawn above the canvas).
+    patch_audition: AuditionState,
+    patch_committed: bool,
     recipe: SequenceRecipe,
     sequence_state: SequenceEditorState,
+    sequence_audition: AuditionState,
+    sequence_committed: bool,
+    /// The host bar's Mute: every sink silent, and the strips told.
+    muted: bool,
     dark: bool,
     /// The theme last handed to egui, so it is set once per change.
     applied: Option<bool>,
@@ -192,24 +278,33 @@ struct Editor {
 }
 
 impl Editor {
-    fn new(dark: bool, orphan: bool) -> Self {
+    fn new(args: &Args) -> Self {
         let mut recipe = seeded_size_recipe();
         let mut sequence_state = SequenceEditorState::default();
         sequence_state.set_active_instrument(Some(OPEN_INSTRUMENT));
-        if orphan {
+        if args.orphan {
             orphan_the_pluck(&mut recipe);
             sequence_state.set_selected_event(Some((ORPHAN_TRACK, 0)));
         }
         Self {
-            patch: filtered_drone_patch(),
+            patch: if args.broken {
+                looped_drone_patch()
+            } else {
+                filtered_drone_patch()
+            },
             patch_state: PatchEditorState::default(),
+            patch_audition: AuditionState::default(),
+            patch_committed: false,
             recipe,
             sequence_state,
-            dark,
+            sequence_audition: AuditionState::default(),
+            sequence_committed: false,
+            muted: args.status == Some(Status::Muted),
+            dark: !args.light,
             applied: None,
             shown: [None; 2],
             frames_shown: 0,
-            scroll_to_bottom: orphan,
+            scroll_to_bottom: args.orphan,
         }
     }
 }
@@ -232,17 +327,51 @@ fn setup_camera(mut commands: Commands) {
     commands.spawn(Camera2d);
 }
 
-/// Under `--shot`, bake the patch slot here and hand the buffer to the
-/// monitor, so the strips draw their waveform the way they do after an
-/// audition, without anything playing through the speakers.
-fn fill_waveform_for_the_shot(
+/// `--status`: ask the monitor for the state the picture should show, the
+/// way pressing Audition does, once the windows have settled.
+fn ask_for_the_status(
     args: Res<Args>,
-    editor: Res<Editor>,
-    mut monitor: ResMut<AudioMonitor>,
+    mut editor: ResMut<Editor>,
+    mut requests: MessageWriter<MonitorRequest>,
+    mut asked: Local<bool>,
 ) {
-    if args.shot.is_some() {
-        monitor.last_samples = bake(&editor.patch, PATCH_SAMPLE_RATE, PATCH_SECS);
-        monitor.sample_rate = PATCH_SAMPLE_RATE;
+    let Some(status) = args.status else {
+        return;
+    };
+    let at = if status == Status::Baking {
+        SETTLE_FRAMES
+    } else {
+        STATUS_AT_FRAMES
+    };
+    if *asked || editor.frames_shown < at {
+        return;
+    }
+    *asked = true;
+    let editor = editor.as_mut();
+    let request = match status {
+        Status::Idle => return,
+        Status::Playing | Status::Muted | Status::Error => {
+            let source = AuditionSource::patch(&editor.patch, PATCH_SAMPLE_RATE, PATCH_SECS);
+            editor.patch_audition.play(&source)
+        }
+        Status::Baking => editor
+            .sequence_audition
+            .play(&AuditionSource::sequence(&editor.recipe)),
+    };
+    info!("--status {status:?}: asking the monitor to play a slot");
+    requests.write(request);
+}
+
+/// Hold every sink to the host bar's Mute, and silence them all under
+/// `--shot`, the way a host's own sound switch mutes the monitor's voice.
+fn silence_the_sinks(args: Res<Args>, editor: Res<Editor>, mut sinks: Query<&mut AudioSink>) {
+    let silent = editor.muted || args.shot.is_some();
+    for mut sink in &mut sinks {
+        if silent && !sink.is_muted() {
+            sink.mute();
+        } else if !silent && sink.is_muted() {
+            sink.unmute();
+        }
     }
 }
 
@@ -285,6 +414,9 @@ fn render_ui(
             ui.separator();
             ui.selectable_value(&mut editor.dark, true, "Dark");
             ui.selectable_value(&mut editor.dark, false, "Light");
+            ui.separator();
+            ui.checkbox(&mut editor.muted, "Mute")
+                .on_hover_text("The host's own sound switch: every sink silent");
         });
     });
     // What the bar leaves: the windows open in it and are constrained to
@@ -325,18 +457,26 @@ fn patch_slot(
     let id = egui::Id::new("patch_slot");
     slot_window("Patch slot", pos, free)
         .show(ctx, |ui| {
-            audition_strip(ui, monitor, requests, || MonitorRequest::PlayPatch {
-                patch: editor.patch.clone(),
-                sample_rate: PATCH_SAMPLE_RATE,
-                duration_secs: PATCH_SECS,
-            });
+            let source = AuditionSource::patch(&editor.patch, PATCH_SAMPLE_RATE, PATCH_SECS)
+                .with_note(PATCH_NOTE);
+            if let Some(request) = audition_strip(
+                ui,
+                monitor,
+                &mut editor.patch_audition,
+                source,
+                editor.patch_committed,
+                editor.muted,
+            ) {
+                requests.write(request);
+            }
             ui.separator();
-            audio_patch_canvas(
+            let res = audio_patch_canvas(
                 ui,
                 &mut editor.patch,
                 &mut editor.patch_state,
                 id.with("canvas"),
             );
+            editor.patch_committed = res.rebake;
         })
         .map(|shown| shown.response.rect)
 }
@@ -356,10 +496,18 @@ fn sequence_slot(
     let pin_to_bottom = editor.scroll_to_bottom && editor.frames_shown < ORPHAN_SCROLL_FRAMES;
     slot_window("Sequence slot", pos, free)
         .show(ctx, |ui| {
-            audition_strip(ui, monitor, requests, || MonitorRequest::PlaySequence {
-                recipe: editor.recipe.clone(),
-            });
+            if let Some(request) = audition_strip(
+                ui,
+                monitor,
+                &mut editor.sequence_audition,
+                AuditionSource::sequence(&editor.recipe),
+                editor.sequence_committed,
+                editor.muted,
+            ) {
+                requests.write(request);
+            }
             ui.separator();
+            let mut committed = false;
             // Panel ids are global, so they are salted with the slot: two
             // windows must never share one panel's width.
             egui::Panel::left(id.with("sequence_panel"))
@@ -379,12 +527,13 @@ fn sequence_slot(
                         scroll = scroll.vertical_scroll_offset(1.0e6);
                     }
                     scroll.show(ui, |ui| {
-                        sequence_recipe_editor(
+                        committed |= sequence_recipe_editor(
                             ui,
                             &mut editor.recipe,
                             &mut editor.sequence_state,
                             id.with("sequence"),
-                        );
+                        )
+                        .rebake;
                     });
                 });
             egui::CentralPanel::default()
@@ -393,46 +542,17 @@ fn sequence_slot(
                     ..egui::Margin::ZERO
                 }))
                 .show(ui, |ui| {
-                    active_instrument_canvas(
+                    committed |= active_instrument_canvas(
                         ui,
                         &mut editor.recipe,
                         &mut editor.sequence_state,
                         id.with("instrument_canvas"),
-                    );
+                    )
+                    .rebake;
                 });
+            editor.sequence_committed = committed;
         })
         .map(|shown| shown.response.rect)
-}
-
-/// Audition, Stop, the monitor's status, and the waveform of the last bake.
-/// `make_request` builds the play message only when Audition is pressed, so
-/// the working copy is cloned only then.
-fn audition_strip(
-    ui: &mut egui::Ui,
-    monitor: &AudioMonitor,
-    requests: &mut MessageWriter<MonitorRequest>,
-    make_request: impl FnOnce() -> MonitorRequest,
-) {
-    ui.horizontal(|ui| {
-        if ui
-            .add_enabled(!monitor.is_baking(), egui::Button::new("\u{25B6} Audition"))
-            .clicked()
-        {
-            requests.write(make_request());
-        }
-        if ui.button("\u{23F9} Stop").clicked() {
-            requests.write(MonitorRequest::Stop);
-        }
-        match &monitor.status {
-            MonitorStatus::Idle => ui.weak("idle"),
-            MonitorStatus::Baking => ui.weak("baking\u{2026}"),
-            MonitorStatus::Playing => ui.weak("playing (loop)"),
-            MonitorStatus::Error(e) => ui.colored_label(ui.visuals().error_fg_color, e),
-        };
-    });
-    if !monitor.last_samples.is_empty() {
-        waveform(ui, &monitor.last_samples);
-    }
 }
 
 /// Where `--rename` is in its script: one step per frame, because a field
@@ -649,11 +769,33 @@ struct Shot {
     last_len: Option<u64>,
 }
 
+/// Whether the monitor shows what `--status` asked for, so the picture can
+/// be taken. `Err` when it never will: a `baking` picture whose bake ended
+/// before it had run [`BAKING_FOR`].
+fn status_reached(status: Option<Status>, monitor: &AudioMonitor) -> Result<bool, String> {
+    Ok(match status {
+        None | Some(Status::Idle) => true,
+        Some(Status::Playing | Status::Muted) => monitor.status == MonitorStatus::Playing,
+        Some(Status::Error) => matches!(monitor.status, MonitorStatus::Error(_)),
+        Some(Status::Baking) => match monitor.bake_elapsed() {
+            Some(elapsed) => elapsed >= BAKING_FOR,
+            None if monitor.status == MonitorStatus::Playing => {
+                return Err(format!(
+                    "the bake ended in under {BAKING_FOR:?}, before the picture; \
+                     a baking picture needs the dev profile"
+                ));
+            }
+            None => false,
+        },
+    })
+}
+
 /// Save a picture of the app window and quit, for `--shot <path>`.
 fn shoot(
     mut commands: Commands,
     args: Res<Args>,
     editor: Res<Editor>,
+    monitor: Res<AudioMonitor>,
     mut shot: ResMut<Shot>,
     mut exit: MessageWriter<AppExit>,
 ) {
@@ -666,6 +808,23 @@ fn shoot(
         if editor.frames_shown < SETTLE_FRAMES {
             return;
         }
+        match status_reached(args.status, &monitor) {
+            Ok(true) => {}
+            Ok(false) => {
+                shot.waited += 1;
+                if shot.waited > GIVE_UP {
+                    error!("--shot: the monitor never reached {:?}", args.status);
+                    exit.write(AppExit::error());
+                }
+                return;
+            }
+            Err(why) => {
+                error!("--shot: {why}");
+                exit.write(AppExit::error());
+                return;
+            }
+        }
+        shot.waited = 0;
         // A stale picture from an earlier run would read as this one.
         let _ = std::fs::remove_file(path);
         info!(
@@ -743,6 +902,33 @@ fn filtered_drone_patch() -> AudioPatch {
             output: filter,
         },
     }
+}
+
+/// `--broken`: the drone with a gain after the lowpass wired back into the
+/// lowpass's input, so `#2 Lowpass` and `#3 Gain` feed each other in a loop
+/// and the patch cannot bake.
+fn looped_drone_patch() -> AudioPatch {
+    let mut patch = filtered_drone_patch();
+    let (filter, gain) = (NodeId(2), NodeId(3));
+    let mut gain_inputs = BTreeMap::new();
+    gain_inputs.insert("in".to_string(), vec![Connection::from_node(filter)]);
+    patch.graph.nodes.push(GraphNode {
+        id: gain,
+        kind: NodeKind::Gain(Default::default()),
+        inputs: gain_inputs,
+    });
+    let lowpass = patch
+        .graph
+        .nodes
+        .iter_mut()
+        .find(|n| n.id == filter)
+        .expect("the drone has its lowpass");
+    lowpass
+        .inputs
+        .entry("in".to_string())
+        .or_default()
+        .push(Connection::from_node(gain));
+    patch
 }
 
 /// Five instruments on five lanes, 34 beats at 60 BPM and 22 050 Hz with a

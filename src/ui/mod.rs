@@ -19,6 +19,10 @@
 //! - [`preview`] — a pure-egui [`preview::waveform`] widget plus a Bevy
 //!   bake-and-play monitor ([`preview::AudioEditorPlugin`]) for auditioning
 //!   edits.
+//! - [`audition`] — [`audition::audition_strip`], the row a host puts above
+//!   an editor to hear it: Audition, Stop, an Auto re-bake, a status chip, a
+//!   caption saying what is played, and the waveform. It returns the
+//!   [`preview::MonitorRequest`] to write rather than writing it.
 //! - [`sequence`] — a [`sequence::sequence_recipe_editor`] timeline (transport,
 //!   instruments, draggable track/event lanes) for a whole
 //!   [`crate::sequence::SequenceRecipe`], with [`sequence::active_instrument_canvas`]
@@ -58,6 +62,7 @@
 
 use bevy_egui::egui;
 
+pub mod audition;
 pub mod evolve;
 pub mod graph;
 pub mod io;
@@ -65,6 +70,7 @@ pub mod node;
 pub mod preview;
 pub mod sequence;
 
+pub use audition::{AUTO_QUIET_SECS, AuditionSource, AuditionState, audition_strip};
 pub use evolve::{mutate_node_kind, mutate_patch, randomize_seed};
 pub use graph::{PatchEditorState, audio_patch_canvas};
 pub use io::{JsonIoState, json_io};

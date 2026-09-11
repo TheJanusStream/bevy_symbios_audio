@@ -41,9 +41,13 @@
 //!
 //! Validity ([`topo_sort`]) is shown live in the toolbar and the output node
 //! gets a gold border, so cycles / missing-output / unknown-node are visible
-//! the moment they're created.
+//! the moment they're created. A broken graph is also located: the toolbar
+//! names the nodes at fault ("#0 Gain and #1 Gain feed each other in a
+//! loop…"), and the canvas outlines their boxes in the host's error colour —
+//! the nodes of a loop, the node holding a wire from a node that is not
+//! there, or every node sharing an id (#57).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use bevy_egui::egui::{
     self, Align, Color32, Id, Layout, Pos2, Rect, Sense, Stroke, UiBuilder, Vec2,
@@ -51,7 +55,7 @@ use bevy_egui::egui::{
 
 use crate::node::NodeKind;
 use crate::oscillator::SineOsc;
-use crate::patch::{AudioPatch, Connection, GraphNode, NodeId, topo_sort};
+use crate::patch::{AudioPatch, Connection, GraphError, GraphNode, NodeGraph, NodeId, topo_sort};
 
 use super::EditorResponse;
 use super::evolve::{fresh_rng, mutate_node_kind, mutate_patch, randomize_seed};
@@ -248,6 +252,141 @@ fn compute_depths(patch: &AudioPatch) -> HashMap<NodeId, u32> {
     depth
 }
 
+/// The nodes on the canvas that `err` is about, in the patch's node order:
+/// the ones a user has to change to make the graph bake (#57).
+///
+/// - [`GraphError::UnknownNode`] names a node that is not in the patch, so
+///   the box to outline is every node holding a wire from it.
+/// - [`GraphError::DuplicateId`]: every node carrying that id.
+/// - [`GraphError::Cycle`]: the nodes on a loop — not the ones merely
+///   upstream or downstream of it, which `topo_sort` also leaves unsorted.
+/// - [`GraphError::MissingOutput`]: none; the output is not a box.
+pub(crate) fn nodes_at_fault(graph: &NodeGraph, err: &GraphError) -> Vec<NodeId> {
+    match err {
+        GraphError::UnknownNode(missing) => graph
+            .nodes
+            .iter()
+            .filter(|n| upstream_of(n).any(|up| up == *missing))
+            .map(|n| n.id)
+            .collect(),
+        GraphError::DuplicateId(id) => graph
+            .nodes
+            .iter()
+            .filter(|n| n.id == *id)
+            .map(|n| n.id)
+            .collect(),
+        GraphError::Cycle => cycle_nodes(graph),
+        GraphError::MissingOutput(_) => Vec::new(),
+    }
+}
+
+/// The ids `node` takes a wire from.
+fn upstream_of(node: &GraphNode) -> impl Iterator<Item = NodeId> + '_ {
+    node.inputs.values().flatten().filter_map(|c| match c {
+        Connection::Node { id, .. } => Some(*id),
+        Connection::Constant { .. } => None,
+    })
+}
+
+/// Every node that can reach itself along the wires: the nodes of the
+/// graph's loops, in node order. A depth-first walk downstream from each
+/// node; graphs are small enough that the walk from every node is cheap.
+fn cycle_nodes(graph: &NodeGraph) -> Vec<NodeId> {
+    let mut downstream: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for node in &graph.nodes {
+        for up in upstream_of(node) {
+            downstream.entry(up).or_default().push(node.id);
+        }
+    }
+    graph
+        .nodes
+        .iter()
+        .map(|n| n.id)
+        .filter(|&start| {
+            let mut seen = HashSet::new();
+            let mut stack: Vec<NodeId> = downstream.get(&start).cloned().unwrap_or_default();
+            while let Some(id) = stack.pop() {
+                if id == start {
+                    return true;
+                }
+                if seen.insert(id)
+                    && let Some(next) = downstream.get(&id)
+                {
+                    stack.extend(next);
+                }
+            }
+            false
+        })
+        .collect()
+}
+
+/// `"#2 Lowpass"`: a node as the canvas titles it, or `"#2"` when no node
+/// has that id.
+fn node_name(graph: &NodeGraph, id: NodeId) -> String {
+    match graph.nodes.iter().find(|n| n.id == id) {
+        Some(node) => format!("#{} {}", id.0, node_kind_label(&node.kind)),
+        None => format!("#{}", id.0),
+    }
+}
+
+/// `err` in words that name the nodes it is about, for the canvas's
+/// validity line and the audition strip's error. `GraphError`'s own
+/// `Display` ("graph contains a cycle") says what kind of fault it is and
+/// leaves the user to find it.
+pub(crate) fn describe_graph_error(graph: &NodeGraph, err: &GraphError) -> String {
+    match err {
+        GraphError::UnknownNode(missing) => match nodes_at_fault(graph, err).first() {
+            Some(&holder) => format!(
+                "{} is wired from #{}, which is not in the patch",
+                node_name(graph, holder),
+                missing.0
+            ),
+            None => format!(
+                "A wire comes from #{}, which is not in the patch",
+                missing.0
+            ),
+        },
+        GraphError::MissingOutput(id) => format!(
+            "The output is #{}, which is not in the patch: pick another in Output",
+            id.0
+        ),
+        GraphError::DuplicateId(id) => format!(
+            "{} nodes are numbered #{}; each node needs its own number",
+            nodes_at_fault(graph, err).len(),
+            id.0
+        ),
+        GraphError::Cycle => {
+            let names: Vec<String> = cycle_nodes(graph)
+                .into_iter()
+                .map(|id| node_name(graph, id))
+                .collect();
+            format!(
+                "{} feed each other in a loop, which cannot be baked: remove one of \
+                 their wires",
+                join_names(&names)
+            )
+        }
+    }
+}
+
+/// `"a"`, `"a and b"`, `"a, b and c"`; past four names, the first three and
+/// a count of the rest.
+fn join_names(names: &[String]) -> String {
+    const SHOWN: usize = 3;
+    match names {
+        [] => "Some nodes".to_string(),
+        [one] => one.clone(),
+        [init @ .., last] if names.len() <= SHOWN + 1 => {
+            format!("{} and {last}", init.join(", "))
+        }
+        _ => format!(
+            "{} and {} more",
+            names[..SHOWN].join(", "),
+            names.len() - SHOWN
+        ),
+    }
+}
+
 /// Remove `target` and every connection that referenced it; reassign the
 /// graph output if it pointed at the removed node.
 fn delete_node(patch: &mut AudioPatch, target: NodeId) {
@@ -427,7 +566,11 @@ fn toolbar(
             );
         }
         Err(e) => {
-            ui.colored_label(Color32::from_rgb(220, 120, 120), format!("\u{2716} {e}"));
+            // Named, and outlined on the canvas below (#57).
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("\u{2716} {}", describe_graph_error(&patch.graph, &e)),
+            );
         }
     }
     res
@@ -456,6 +599,14 @@ fn canvas_contents(
     let output_id = patch.graph.output;
     let selected = state.selected;
     let mutate_rate = state.mutate_rate;
+    // The boxes a broken graph is broken at, outlined in the host's error
+    // colour over the selection and output borders: they are what has to
+    // change before anything bakes.
+    let at_fault: HashSet<NodeId> = match topo_sort(&patch.graph) {
+        Ok(_) => HashSet::new(),
+        Err(e) => nodes_at_fault(&patch.graph, &e).into_iter().collect(),
+    };
+    let error_stroke = Stroke::new(2.0, ui.visuals().error_fg_color);
 
     // Reserve a shape slot up front; we backfill it with the wires after node
     // rects are known, so wires render *behind* the node boxes.
@@ -471,7 +622,9 @@ fn canvas_contents(
             .copied()
             .unwrap_or(Pos2::new(40.0, 40.0));
 
-        let stroke = if selected == Some(nid) {
+        let stroke = if at_fault.contains(&nid) {
+            error_stroke
+        } else if selected == Some(nid) {
             Stroke::new(2.0, Color32::from_rgb(90, 160, 250))
         } else if output_id == nid {
             Stroke::new(2.0, Color32::from_rgb(230, 190, 90))
@@ -1293,6 +1446,21 @@ mod tests {
                 })
                 .collect()
         }
+
+        /// Whether each node box, in drawing order (the patch's node order),
+        /// is outlined in the host's error colour.
+        fn outlined_in_error(&self) -> Vec<bool> {
+            let error = self.ctx.global_style().visuals.error_fg_color;
+            self.shapes()
+                .into_iter()
+                .filter_map(|s| match s {
+                    egui::Shape::Rect(r) if r.fill == Color32::from_gray(32) => {
+                        Some(r.stroke.color == error)
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
     }
 
     fn one_node(kind: NodeKind) -> AudioPatch {
@@ -1517,5 +1685,111 @@ mod tests {
                 audio_patch_canvas(ui, &mut patch, &mut state, egui::Id::new("smoke_bad"));
             });
         });
+    }
+
+    // -----------------------------------------------------------------------
+    // Where a broken graph is broken (#57, Overlands #1330 D4)
+    // -----------------------------------------------------------------------
+
+    /// A gain numbered `id` whose `in` port sums the outputs of `from`.
+    fn gain_from(id: u32, from: &[u32]) -> GraphNode {
+        let mut gain = node(id, NodeKind::Gain(Default::default()));
+        if !from.is_empty() {
+            gain.inputs.insert(
+                "in".into(),
+                from.iter()
+                    .map(|&up| Connection::from_node(NodeId(up)))
+                    .collect(),
+            );
+        }
+        gain
+    }
+
+    fn graph_of(nodes: Vec<GraphNode>, output: u32) -> AudioPatch {
+        AudioPatch {
+            seed: 0,
+            graph: crate::patch::NodeGraph {
+                nodes,
+                output: NodeId(output),
+            },
+        }
+    }
+
+    /// `#0` and `#1` feed each other. `#2` feeds the loop from outside it
+    /// and `#3` listens to it: both are stuck behind the loop, and neither
+    /// is part of it.
+    fn loop_with_a_source_and_a_listener() -> AudioPatch {
+        graph_of(
+            vec![
+                gain_from(0, &[1, 2]),
+                gain_from(1, &[0]),
+                gain_from(2, &[]),
+                gain_from(3, &[1]),
+            ],
+            3,
+        )
+    }
+
+    #[test]
+    fn the_canvas_outlines_the_nodes_of_a_cycle_and_no_others() {
+        let patch = loop_with_a_source_and_a_listener();
+        assert_eq!(topo_sort(&patch.graph), Err(GraphError::Cycle));
+        let canvas = Canvas::new(patch);
+        assert_eq!(canvas.outlined_in_error(), [true, true, false, false]);
+    }
+
+    #[test]
+    fn the_canvas_outlines_the_node_whose_wire_names_a_missing_node() {
+        let patch = graph_of(vec![gain_from(0, &[]), gain_from(1, &[0, 9])], 1);
+        assert_eq!(
+            topo_sort(&patch.graph),
+            Err(GraphError::UnknownNode(NodeId(9)))
+        );
+        let canvas = Canvas::new(patch);
+        assert_eq!(canvas.outlined_in_error(), [false, true]);
+    }
+
+    #[test]
+    fn the_canvas_outlines_every_node_that_shares_an_id() {
+        let patch = graph_of(
+            vec![gain_from(0, &[]), gain_from(4, &[0]), gain_from(4, &[])],
+            4,
+        );
+        assert_eq!(
+            topo_sort(&patch.graph),
+            Err(GraphError::DuplicateId(NodeId(4)))
+        );
+        let canvas = Canvas::new(patch);
+        assert_eq!(canvas.outlined_in_error(), [false, true, true]);
+    }
+
+    /// The control: a valid graph has no error outline, so the three tests
+    /// above cannot pass by outlining everything.
+    #[test]
+    fn a_valid_graph_outlines_no_node() {
+        let canvas = Canvas::new(three_node_patch());
+        assert_eq!(canvas.outlined_in_error(), [false, false, false]);
+    }
+
+    /// The validity line names the nodes, not just the kind of fault: "graph
+    /// contains a cycle" left the user to find the loop themselves.
+    #[test]
+    fn the_validity_line_names_the_nodes_of_a_cycle() {
+        let canvas = Canvas::new(loop_with_a_source_and_a_listener());
+        let text = canvas.painted_text().join("\n");
+        assert!(
+            text.contains("#0 Gain") && text.contains("#1 Gain"),
+            "the loop's nodes are named; painted:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_validity_line_names_the_node_holding_a_dangling_wire() {
+        let canvas = Canvas::new(graph_of(vec![gain_from(0, &[]), gain_from(1, &[9])], 1));
+        let text = canvas.painted_text().join("\n");
+        assert!(
+            text.contains("#1 Gain") && text.contains("#9"),
+            "the node and the missing one are named; painted:\n{text}"
+        );
     }
 }
