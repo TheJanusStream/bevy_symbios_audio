@@ -175,17 +175,32 @@ pub fn drag_debounced(
 ) -> EditorResponse {
     ui.horizontal(|ui| {
         ui.label(label);
-        let r = ui.add(egui::DragValue::new(val).speed(speed));
-        let res = EditorResponse {
-            changed: r.changed(),
-            rebake: r.drag_stopped() || (r.changed() && !r.dragged()),
-        };
-        if res.changed {
-            *val = val.clamp(*range.start(), *range.end());
-        }
-        res
+        drag_value_debounced(ui, val, speed, range, "")
     })
     .inner
+}
+
+/// The [`egui::DragValue`] of [`drag_debounced`] without its label, with
+/// `suffix` written into the value ("500 Hz").
+///
+/// This is the control half of a node body's grid row (#59): the label is
+/// the cell to its left, so every label in the box shares one edge.
+pub fn drag_value_debounced(
+    ui: &mut egui::Ui,
+    val: &mut f32,
+    speed: f32,
+    range: std::ops::RangeInclusive<f32>,
+    suffix: &str,
+) -> EditorResponse {
+    let r = ui.add(egui::DragValue::new(val).speed(speed).suffix(suffix));
+    let res = EditorResponse {
+        changed: r.changed(),
+        rebake: r.drag_stopped() || (r.changed() && !r.dragged()),
+    };
+    if res.changed {
+        *val = val.clamp(*range.start(), *range.end());
+    }
+    res
 }
 
 /// Checkbox that treats every toggle as both a change and a commit (booleans

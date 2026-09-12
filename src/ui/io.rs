@@ -26,7 +26,8 @@ pub struct JsonIoState {
 ///   point to tweak by hand).
 /// - **Apply** parses the text box; on success it replaces `value` and sets
 ///   `rebake`, on failure it shows the parse error inline, in the
-///   [`EditorStyle`](super::EditorStyle)'s error colour.
+///   [`EditorStyle`](super::EditorStyle)'s error colour — serde's account
+///   of where it stopped, inside a sentence that says what to do next.
 pub fn json_io<T: Serialize + DeserializeOwned>(
     ui: &mut egui::Ui,
     value: &mut T,
@@ -70,7 +71,15 @@ pub fn json_io<T: Serialize + DeserializeOwned>(
                         res.changed = true;
                         res.rebake = true;
                     }
-                    Err(e) => state.error = Some(e.to_string()),
+                    // In words that say what to do about it: serde's own
+                    // message names the fault and stops there (#59,
+                    // Overlands #1332 B16).
+                    Err(e) => {
+                        state.error = Some(format!(
+                            "That is not JSON this box can read ({e}). Load current \
+                             to see the shape it expects."
+                        ));
+                    }
                 }
             }
             if let Some(err) = &state.error {
@@ -205,6 +214,34 @@ mod tests {
             colour,
             Some(distinct_style().error),
             "the error {error:?}; painted {painted:?}"
+        );
+    }
+
+    /// B16 (#59, Overlands #1332): a paste that does not parse is answered
+    /// in a sentence that says what to do about it. serde's own message
+    /// ("expected value at line 1 column 3") names the fault and leaves the
+    /// reader with no next step.
+    #[test]
+    fn a_parse_error_says_what_to_do_about_it() {
+        let mut section = Section::open_with("{ not json");
+        section.click("Apply");
+        section.settle();
+        let error = section
+            .state
+            .error
+            .clone()
+            .expect("the paste did not parse");
+        assert!(
+            error.starts_with("That is not"),
+            "the error opens with serde's own words: {error:?}"
+        );
+        assert!(
+            error.contains("Load current"),
+            "the error does not say how to see the shape the box wants: {error:?}"
+        );
+        assert!(
+            error.contains("line 1 column 3"),
+            "the error drops serde's own account of where it stopped: {error:?}"
         );
     }
 

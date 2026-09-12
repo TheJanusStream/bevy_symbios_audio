@@ -191,8 +191,11 @@ Enable the `egui` feature to pull in
 set of composable editor widgets any `bevy_egui` host (Overlands) can
 embed:
 
-- per-node config editors (one widget group per `NodeKind`) plus a kind
-  picker (`node_kind_editor`),
+- per-node config editors (one widget group per `NodeKind`) — a
+  two-column grid, name on the left and control on the right, with the
+  unit written into the value — plus a kind picker, captioned
+  (`node_kind_editor`) or bare (`node_kind_picker`, for a host that puts
+  the name in a title of its own),
 - a pannable / zoomable node-graph canvas (`audio_patch_canvas`) that
   edits a whole `AudioPatch` — drag nodes, wire ports, choose the output.
   Each input port's dot sits beside its own named row in the node's

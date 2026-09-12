@@ -38,6 +38,9 @@ use bevy_egui::egui::{self, Color32};
 const OK_ON_DARK: Color32 = Color32::from_rgb(130, 200, 130);
 /// The success green on a light ground; see [`OK_ON_DARK`].
 const OK_ON_LIGHT: Color32 = Color32::from_rgb(30, 130, 50);
+/// How far the canvas grid leans from the canvas ground toward the text
+/// colour: visible as a ground, never a competitor to the wires on it.
+const GRID_CONTRAST: f32 = 0.10;
 /// How far the alternate lane stripe leans from the window fill toward the
 /// text colour: enough to tell two lanes apart, in either direction.
 const LANE_STRIPE: f32 = 0.06;
@@ -58,6 +61,11 @@ const TAIL_ALPHA: f32 = 0.35;
 pub struct EditorStyle {
     /// Behind the patch canvas's nodes.
     pub canvas_ground: Color32,
+    /// The canvas's border, which says where the pannable ground ends.
+    pub canvas_edge: Color32,
+    /// The canvas's grid, which says that the ground moves under a drag and
+    /// how far it has moved. Faint: the node boxes are the content.
+    pub canvas_grid: Color32,
     /// A node box. Its widgets draw with the host's `Visuals`, so this has to
     /// be a surface the host's text reads on; the default is `window_fill`.
     pub node_fill: Color32,
@@ -129,7 +137,8 @@ impl EditorStyle {
     /// - Edges and the grid are the separator colour. The selected node,
     ///   the dragged wire and the loop start are `hyperlink_color`, the
     ///   theme's interactive accent; the output node and the sequence end
-    ///   are `strong_text_color`.
+    ///   are `strong_text_color`. The canvas grid is its ground leaned a
+    ///   tenth of the way toward the text.
     /// - `warn` and `error` are the theme's. `Visuals` has no success
     ///   colour, so `ok` (and the waveform trace) is a green chosen for the
     ///   window: a pale one on a dark window, a deep one on a light window.
@@ -143,6 +152,8 @@ impl EditorStyle {
         let ok = ok_for(surface);
         Self {
             canvas_ground: ground,
+            canvas_edge: edge,
+            canvas_grid: ground.lerp_to_gamma(text, GRID_CONTRAST),
             node_fill: surface,
             node_stroke: edge,
             node_title: strong,
@@ -252,6 +263,8 @@ pub(crate) mod tests {
         let mut style = EditorStyle::from_visuals(&egui::Visuals::dark());
         let roles = [
             &mut style.canvas_ground,
+            &mut style.canvas_edge,
+            &mut style.canvas_grid,
             &mut style.node_fill,
             &mut style.node_stroke,
             &mut style.node_title,
@@ -280,10 +293,53 @@ pub(crate) mod tests {
             &mut style.waveform_trace,
         ];
         for (i, role) in roles.into_iter().enumerate() {
-            let step = u8::try_from(i).expect("fewer than 28 roles") * 9;
+            let step = u8::try_from(i).expect("fewer than 32 roles") * 8;
             *role = Color32::from_rgb(201, 3 + step, 57);
         }
         style
+    }
+
+    /// The canvas's border and grid are visible on its ground in both of
+    /// egui's themes, and neither competes with the wires drawn over them
+    /// (#59, Overlands #1332 B16).
+    ///
+    /// A grid nobody can see is a grid that does not say the ground moves;
+    /// one as strong as the content is a grid that gets in the way. So the
+    /// bar here is an ordering — ground, then grid, then border, then the
+    /// wires over them — and not the 3:1 WCAG asks of a non-text mark.
+    ///
+    /// Against egui's stock visuals that ordering is: grid 1.10:1 dark and
+    /// 1.16:1 light on the ground, border 1.79:1 and 1.86:1 over it, a
+    /// wire 5.33:1 and 6.95:1 over the grid. The border is the same
+    /// separator colour as a node's edge and inherits the same shortfall
+    /// against 3:1, which Overlands #1339 records for the crate's defaults
+    /// as a whole. A host that maps the style holds it to 3:1 —
+    /// Overlands' own mapping does — so the value is left consistent with
+    /// every other edge the crate draws rather than singled out here.
+    #[test]
+    fn the_canvas_border_and_grid_are_visible_on_the_ground_in_dark_and_light() {
+        for (theme, visuals) in both_themes() {
+            let s = EditorStyle::from_visuals(&visuals);
+            let edge = contrast_on(s.canvas_edge, s.canvas_ground);
+            assert!(
+                edge > 1.5,
+                "{theme}: the canvas border is {edge:.2}:1 on its ground"
+            );
+            let grid = contrast_on(s.canvas_grid, s.canvas_ground);
+            assert!(
+                grid > 1.05,
+                "{theme}: the canvas grid is {grid:.2}:1 on its ground — invisible"
+            );
+            assert!(
+                grid < edge,
+                "{theme}: the grid ({grid:.2}:1) is no fainter than the border \
+                 ({edge:.2}:1); it is meant to sit behind the content"
+            );
+            assert!(
+                contrast_on(s.wire, s.canvas_grid) > grid,
+                "{theme}: a wire does not stand out from the grid it crosses"
+            );
+        }
     }
 
     /// The acceptance of Overlands #1331: in egui's own dark and light

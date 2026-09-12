@@ -30,7 +30,7 @@ use crate::noise::{BrownNoise, PinkNoise, WhiteNoise};
 use crate::oscillator::{AntiAlias, SawPolarity, SawtoothOsc, SineOsc, SquareOsc, TriangleOsc};
 use crate::reverb::Reverb;
 
-use super::{EditorResponse, bool_instant, drag_debounced, slider_debounced};
+use super::{EditorResponse, bool_instant, drag_value_debounced, slider_debounced};
 
 // ---------------------------------------------------------------------------
 // Editor-generating macro
@@ -50,26 +50,42 @@ trait NodeConfigEditor {
 
 /// Generate a per-node editor function from a concise field description.
 ///
+/// The fields become the rows of a two-column grid — the name on the left,
+/// the control on the right, the unit written into the value ("500 Hz",
+/// "0.40 s") — so every name in a node box starts at the same edge (#59,
+/// Overlands #1332). `Slider::text` used to put the name *after* the value,
+/// which set each name's position by how wide its value happened to be and
+/// ran the long ones up against the box's border.
+///
 /// Widget kinds:
 ///
 /// | Kind | Widget |
 /// |------|--------|
-/// | `slider(label, field, range)` | linear `f32` slider |
-/// | `slider_log(label, field, range)` | logarithmic `f32` slider (freq/rate) |
-/// | `drag(label, field, speed, range)` | `f32` drag value, clamped to range |
+/// | `slider(label, unit, field, range)` | linear `f32` slider |
+/// | `slider_log(label, unit, field, range)` | logarithmic `f32` slider (freq/rate) |
+/// | `drag(label, unit, field, speed, range)` | `f32` drag value, clamped to range |
 /// | `bool(label, field)` | checkbox |
 /// | `enum_select(label, field, [(Btn, Variant), …])` | selectable-row picker |
+///
+/// A trailing `note "…"` writes one weak line under the grid — for what a
+/// node does that its parameters do not show (a [`Gate`]'s window).
 macro_rules! impl_node_editor {
     (
         $(#[doc = $doc:expr])*
         fn $fn_name:ident, $Config:ty =>
         { $( $w:ident $args:tt ),* $(,)? }
+        $( note $note:expr )?
     ) => {
         $(#[doc = $doc])*
         pub fn $fn_name(ui: &mut egui::Ui, cfg: &mut $Config) -> EditorResponse {
             #[allow(unused_mut)]
             let mut res = EditorResponse::NONE;
-            $( impl_node_editor!(@w ui, cfg, res, $w $args); )*
+            egui::Grid::new(concat!(stringify!($fn_name), "_rows"))
+                .num_columns(2)
+                .show(ui, |ui| {
+                    $( impl_node_editor!(@w ui, cfg, res, $w $args); )*
+                });
+            $( ui.label(egui::RichText::new($note).weak()); )?
             res
         }
 
@@ -81,34 +97,52 @@ macro_rules! impl_node_editor {
     };
 
     // f32 linear slider.
-    (@w $ui:ident, $cfg:ident, $res:ident, slider ($label:expr, $field:ident, $range:expr)) => {
+    (@w $ui:ident, $cfg:ident, $res:ident,
+     slider ($label:expr, $unit:expr, $field:ident, $range:expr)) => {
+        $ui.label($label);
         $res.merge(slider_debounced(
             $ui,
-            egui::Slider::new(&mut $cfg.$field, $range).text($label),
+            egui::Slider::new(&mut $cfg.$field, $range).suffix($unit),
         ));
+        $ui.end_row();
     };
     // f32 logarithmic slider — for frequencies / rates (matches `f32_log`).
-    (@w $ui:ident, $cfg:ident, $res:ident, slider_log ($label:expr, $field:ident, $range:expr)) => {
+    (@w $ui:ident, $cfg:ident, $res:ident,
+     slider_log ($label:expr, $unit:expr, $field:ident, $range:expr)) => {
+        $ui.label($label);
         $res.merge(slider_debounced(
             $ui,
             egui::Slider::new(&mut $cfg.$field, $range)
                 .logarithmic(true)
-                .text($label),
+                .suffix($unit),
         ));
+        $ui.end_row();
     };
     // f32 drag value (wide-range amounts), clamped to `range`.
-    (@w $ui:ident, $cfg:ident, $res:ident, drag ($label:expr, $field:ident, $speed:expr, $range:expr)) => {
-        $res.merge(drag_debounced($ui, $label, &mut $cfg.$field, $speed, $range));
+    (@w $ui:ident, $cfg:ident, $res:ident,
+     drag ($label:expr, $unit:expr, $field:ident, $speed:expr, $range:expr)) => {
+        $ui.label($label);
+        $res.merge(drag_value_debounced(
+            $ui,
+            &mut $cfg.$field,
+            $speed,
+            $range,
+            $unit,
+        ));
+        $ui.end_row();
     };
-    // bool checkbox.
+    // bool checkbox — the name is the grid's left cell, so the box itself
+    // carries no label of its own.
     (@w $ui:ident, $cfg:ident, $res:ident, bool ($label:expr, $field:ident)) => {
-        $res.merge(bool_instant($ui, &mut $cfg.$field, $label));
+        $ui.label($label);
+        $res.merge(bool_instant($ui, &mut $cfg.$field, ""));
+        $ui.end_row();
     };
     // enum selectable-row picker.  Variants must be `Copy + PartialEq`.
     (@w $ui:ident, $cfg:ident, $res:ident,
      enum_select ($label:expr, $field:ident, [ $(($btn:expr, $variant:expr)),+ $(,)? ])) => {
+        $ui.label($label);
         $ui.horizontal(|ui| {
-            ui.label($label);
             $(
                 let selected = $cfg.$field == $variant;
                 if ui.selectable_label(selected, $btn).clicked() && !selected {
@@ -118,6 +152,7 @@ macro_rules! impl_node_editor {
                 }
             )+
         });
+        $ui.end_row();
     };
 }
 
@@ -128,18 +163,18 @@ macro_rules! impl_node_editor {
 impl_node_editor!(
     /// Editor for a [`SineOsc`] — pure-tone sine oscillator.
     fn sine_osc_editor, SineOsc => {
-        slider_log("Freq (Hz)", freq_hz, 20.0..=20_000.0),
-        slider("Phase", phase_offset, 0.0..=1.0),
-        slider("Amplitude", amplitude, 0.0..=1.0),
+        slider_log("Frequency", " Hz", freq_hz, 20.0..=20_000.0),
+        slider("Phase", "", phase_offset, 0.0..=1.0),
+        slider("Amplitude", "", amplitude, 0.0..=1.0),
     }
 );
 
 impl_node_editor!(
     /// Editor for a [`SquareOsc`] — pulse-width square oscillator.
     fn square_osc_editor, SquareOsc => {
-        slider_log("Freq (Hz)", freq_hz, 20.0..=20_000.0),
-        slider("Duty", duty, 0.05..=0.95),
-        slider("Amplitude", amplitude, 0.0..=1.0),
+        slider_log("Frequency", " Hz", freq_hz, 20.0..=20_000.0),
+        slider("Duty", "", duty, 0.05..=0.95),
+        slider("Amplitude", "", amplitude, 0.0..=1.0),
         enum_select("Anti-alias", anti_alias, [
             ("Naive", AntiAlias::Naive),
             ("BLEP", AntiAlias::PolyBlep),
@@ -150,12 +185,12 @@ impl_node_editor!(
 impl_node_editor!(
     /// Editor for a [`SawtoothOsc`] — sawtooth with selectable polarity.
     fn sawtooth_osc_editor, SawtoothOsc => {
-        slider_log("Freq (Hz)", freq_hz, 20.0..=20_000.0),
+        slider_log("Frequency", " Hz", freq_hz, 20.0..=20_000.0),
         enum_select("Polarity", polarity, [
             ("Up", SawPolarity::Up),
             ("Down", SawPolarity::Down),
         ]),
-        slider("Amplitude", amplitude, 0.0..=1.0),
+        slider("Amplitude", "", amplitude, 0.0..=1.0),
         enum_select("Anti-alias", anti_alias, [
             ("Naive", AntiAlias::Naive),
             ("BLEP", AntiAlias::PolyBlep),
@@ -166,8 +201,8 @@ impl_node_editor!(
 impl_node_editor!(
     /// Editor for a [`TriangleOsc`] — symmetric triangle oscillator.
     fn triangle_osc_editor, TriangleOsc => {
-        slider_log("Freq (Hz)", freq_hz, 20.0..=20_000.0),
-        slider("Amplitude", amplitude, 0.0..=1.0),
+        slider_log("Frequency", " Hz", freq_hz, 20.0..=20_000.0),
+        slider("Amplitude", "", amplitude, 0.0..=1.0),
         enum_select("Anti-alias", anti_alias, [
             ("Naive", AntiAlias::Naive),
             ("BLEP", AntiAlias::PolyBlep),
@@ -178,21 +213,21 @@ impl_node_editor!(
 impl_node_editor!(
     /// Editor for [`WhiteNoise`].
     fn white_noise_editor, WhiteNoise => {
-        slider("Amplitude", amplitude, 0.0..=1.0),
+        slider("Amplitude", "", amplitude, 0.0..=1.0),
     }
 );
 
 impl_node_editor!(
     /// Editor for [`PinkNoise`].
     fn pink_noise_editor, PinkNoise => {
-        slider("Amplitude", amplitude, 0.0..=1.0),
+        slider("Amplitude", "", amplitude, 0.0..=1.0),
     }
 );
 
 impl_node_editor!(
     /// Editor for [`BrownNoise`].
     fn brown_noise_editor, BrownNoise => {
-        slider("Amplitude", amplitude, 0.0..=1.0),
+        slider("Amplitude", "", amplitude, 0.0..=1.0),
     }
 );
 
@@ -200,38 +235,41 @@ impl_node_editor!(
     /// Editor for an [`AdsrEnvelope`].  Times use logarithmic sliders (they
     /// mutate multiplicatively); sustain is a linear `[0, 1]` level.
     fn adsr_envelope_editor, AdsrEnvelope => {
-        slider_log("Attack (s)", attack_s, 0.001..=10.0),
-        slider_log("Decay (s)", decay_s, 0.001..=10.0),
-        slider("Sustain", sustain_level, 0.0..=1.0),
-        slider_log("Release (s)", release_s, 0.001..=10.0),
+        slider_log("Attack", " s", attack_s, 0.001..=10.0),
+        slider_log("Decay", " s", decay_s, 0.001..=10.0),
+        slider("Sustain", "", sustain_level, 0.0..=1.0),
+        slider_log("Release", " s", release_s, 0.001..=10.0),
         enum_select("Curve", curve, [
             ("Linear", AdsrCurve::Linear),
             ("Exp", AdsrCurve::Exponential),
         ]),
     }
+    note "The gate is always open in a standalone patch, so the envelope \
+          holds at sustain and its release is never heard; a sequence's \
+          notes open and close it."
 );
 
 impl_node_editor!(
     /// Editor for a [`BiquadLowpass`] filter.
     fn biquad_lowpass_editor, BiquadLowpass => {
-        slider_log("Cutoff (Hz)", cutoff_hz, 20.0..=20_000.0),
-        slider("Q", q, 0.1..=20.0),
+        slider_log("Cutoff", " Hz", cutoff_hz, 20.0..=20_000.0),
+        slider("Q", "", q, 0.1..=20.0),
     }
 );
 
 impl_node_editor!(
     /// Editor for a [`BiquadHighpass`] filter.
     fn biquad_highpass_editor, BiquadHighpass => {
-        slider_log("Cutoff (Hz)", cutoff_hz, 20.0..=20_000.0),
-        slider("Q", q, 0.1..=20.0),
+        slider_log("Cutoff", " Hz", cutoff_hz, 20.0..=20_000.0),
+        slider("Q", "", q, 0.1..=20.0),
     }
 );
 
 impl_node_editor!(
     /// Editor for a [`BiquadBandpass`] filter (constant-peak-gain variant).
     fn biquad_bandpass_editor, BiquadBandpass => {
-        slider_log("Center (Hz)", center_hz, 20.0..=20_000.0),
-        slider("Q", q, 0.1..=20.0),
+        slider_log("Center", " Hz", center_hz, 20.0..=20_000.0),
+        slider("Q", "", q, 0.1..=20.0),
     }
 );
 
@@ -239,7 +277,7 @@ impl_node_editor!(
     /// Editor for an [`Lfo`].  Depth/offset are wide-range drag values
     /// (an LFO routed to a filter cutoff sweeps thousands of Hz).
     fn lfo_editor, Lfo => {
-        slider_log("Rate (Hz)", rate_hz, 0.01..=30.0),
+        slider_log("Rate", " Hz", rate_hz, 0.01..=30.0),
         enum_select("Shape", shape, [
             ("Sine", LfoShape::Sine),
             ("Tri", LfoShape::Triangle),
@@ -247,22 +285,22 @@ impl_node_editor!(
             ("Saw", LfoShape::Saw),
             ("Rnd", LfoShape::Random),
         ]),
-        drag("Depth", depth, 1.0, 0.0..=10_000.0),
-        drag("Offset", offset, 1.0, (-10_000.0)..=10_000.0),
+        drag("Depth", "", depth, 1.0, 0.0..=10_000.0),
+        drag("Offset", "", offset, 1.0, (-10_000.0)..=10_000.0),
     }
 );
 
 impl_node_editor!(
     /// Editor for a [`Mix`] node (additive bus with a master gain).
     fn mix_editor, Mix => {
-        slider("Gain", gain, 0.0..=4.0),
+        slider("Gain", "", gain, 0.0..=4.0),
     }
 );
 
 impl_node_editor!(
     /// Editor for a [`Gain`] node (voltage-controlled amplifier).
     fn gain_editor, Gain => {
-        slider("Gain", gain, 0.0..=4.0),
+        slider("Gain", "", gain, 0.0..=4.0),
     }
 );
 
@@ -271,26 +309,28 @@ impl_node_editor!(
     fn gate_editor, Gate => {
         bool("Invert", invert),
     }
+    note "The gate is always open in a standalone patch, so this holds at \
+          1.0 throughout; a sequence's notes open and close it."
 );
 
 impl_node_editor!(
     /// Editor for a [`Chorus`] effect.  Rate uses a logarithmic slider (it
     /// mutates multiplicatively); the rest are linear.
     fn chorus_editor, Chorus => {
-        slider_log("Rate (Hz)", rate_hz, 0.05..=12.0),
-        slider("Depth (ms)", depth_ms, 0.0..=20.0),
-        slider("Base delay (ms)", base_delay_ms, 1.0..=40.0),
-        slider("Feedback", feedback, 0.0..=0.95),
-        slider("Mix", mix, 0.0..=1.0),
+        slider_log("Rate", " Hz", rate_hz, 0.05..=12.0),
+        slider("Depth", " ms", depth_ms, 0.0..=20.0),
+        slider("Base delay", " ms", base_delay_ms, 1.0..=40.0),
+        slider("Feedback", "", feedback, 0.0..=0.95),
+        slider("Mix", "", mix, 0.0..=1.0),
     }
 );
 
 impl_node_editor!(
     /// Editor for a [`Reverb`] effect (mono Freeverb).
     fn reverb_editor, Reverb => {
-        slider("Room size", room_size, 0.0..=1.0),
-        slider("Damping", damping, 0.0..=1.0),
-        slider("Mix", mix, 0.0..=1.0),
+        slider("Room size", "", room_size, 0.0..=1.0),
+        slider("Damping", "", damping, 0.0..=1.0),
+        slider("Mix", "", mix, 0.0..=1.0),
     }
 );
 
@@ -380,6 +420,33 @@ pub fn node_kind_label(kind: &NodeKind) -> &'static str {
     kind.label()
 }
 
+/// The kind picker alone: a combo whose selected text is the kind's name,
+/// with no caption of its own.
+///
+/// This is a node box's title on the canvas — the name *is* the title, and
+/// changing the kind is done where the name is written (#59, Overlands
+/// #1332 B5). The box used to carry both a title reading "#0 Sawtooth" and
+/// a captioned "Kind" combo under it reading "Sawtooth" again, which spent
+/// a third of the box's height saying one word twice.
+///
+/// `id` scopes the combo's widget ids, as for [`node_kind_editor`].
+pub fn node_kind_picker(ui: &mut egui::Ui, kind: &mut NodeKind, id: egui::Id) -> EditorResponse {
+    let mut res = EditorResponse::NONE;
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(node_kind_label(kind))
+        .show_ui(ui, |ui| {
+            for label in KIND_LABELS.iter().copied() {
+                let selected = node_kind_label(kind) == label;
+                if ui.selectable_label(selected, label).clicked() && !selected {
+                    *kind = default_kind_for(label);
+                    res.changed = true;
+                    res.rebake = true;
+                }
+            }
+        });
+    res
+}
+
 /// Full editor for one [`NodeKind`]: a kind-picker combo box plus the selected
 /// variant's parameter widgets.
 ///
@@ -410,6 +477,58 @@ pub fn node_kind_editor(ui: &mut egui::Ui, kind: &mut NodeKind, id: egui::Id) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::ui::test_paint::shapes;
+
+    /// Every string `body` paints for `kind`, on a headless context.
+    fn painted_body(kind: &mut NodeKind) -> Vec<String> {
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(600.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let out = ctx.run_ui(input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                node_kind_body(ui, kind);
+            });
+        });
+        shapes(&out)
+            .into_iter()
+            .filter_map(|s| match s {
+                egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// B15 (#59, Overlands #1332): a Gate in a patch with no sequence
+    /// behind it holds open for the whole bake, and an ADSR driven by one
+    /// therefore never releases — a pluck authored in a Patch slot hums.
+    /// The two bodies that depend on the gate window say so.
+    #[test]
+    fn the_gate_and_the_adsr_say_the_gate_is_always_open_in_a_standalone_patch() {
+        for mut kind in [
+            NodeKind::Gate(Gate::default()),
+            NodeKind::Adsr(AdsrEnvelope::default()),
+        ] {
+            let name = node_kind_label(&kind);
+            let painted = painted_body(&mut kind);
+            assert!(
+                painted
+                    .iter()
+                    .any(|t| t.contains("always open") && t.contains("standalone patch")),
+                "{name}'s body does not say its gate is always open in a standalone \
+                 patch; it paints {painted:?}"
+            );
+            assert!(
+                painted.iter().any(|t| t.contains("notes")),
+                "{name}'s body does not say a sequence's notes drive it: {painted:?}"
+            );
+        }
+    }
 
     #[test]
     fn label_round_trips_through_default_kind() {

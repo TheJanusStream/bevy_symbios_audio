@@ -70,20 +70,19 @@ pub fn waveform(ui: &mut egui::Ui, samples: &[f32]) -> egui::Response {
 /// audio device (wasm-safe).  Samples are clamped to `[-1, 1]` for display.
 ///
 /// Its ground, zero line and trace are the [`EditorStyle`](super::EditorStyle)'s
-/// `waveform_*` roles, and an empty buffer's "no signal" is its `ground_text`.
+/// `waveform_*` roles, and an empty buffer's "no signal" is its
+/// `ground_text`. An empty buffer draws no zero line: there is nothing for
+/// it to be the zero of, and it struck through the words.
 pub fn waveform_sized(ui: &mut egui::Ui, samples: &[f32], size: egui::Vec2) -> egui::Response {
     let style = super::style::editor_style(ui);
     let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 4.0, style.waveform_ground);
 
-    let mid = rect.center().y;
-    painter.line_segment(
-        [egui::pos2(rect.left(), mid), egui::pos2(rect.right(), mid)],
-        egui::Stroke::new(1.0, style.waveform_zero),
-    );
-
     if samples.is_empty() {
+        // No zero line: there is no signal for it to be the zero of, and it
+        // ran straight through the words saying so (#59, Overlands #1332
+        // B16).
         painter.text(
             rect.center(),
             egui::Align2::CENTER_CENTER,
@@ -93,6 +92,12 @@ pub fn waveform_sized(ui: &mut egui::Ui, samples: &[f32], size: egui::Vec2) -> e
         );
         return resp;
     }
+
+    let mid = rect.center().y;
+    painter.line_segment(
+        [egui::pos2(rect.left(), mid), egui::pos2(rect.right(), mid)],
+        egui::Stroke::new(1.0, style.waveform_zero),
+    );
 
     let half = rect.height() * 0.5 * 0.94;
     let cols = rect.width().max(1.0) as usize;
@@ -482,6 +487,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// B16 (#59, Overlands #1332): an empty waveform draws no zero line, so
+    /// "no signal" is not struck through by the one thing beside it.
+    #[test]
+    fn an_empty_waveform_draws_no_line_through_no_signal() {
+        use crate::ui::test_paint::text_painted;
+        let ctx = egui::Context::default();
+        let out = painted_waveform(&ctx, &[]);
+        let (label, _) = text_painted(&out, "no signal").expect("an empty waveform says so");
+        for shape in crate::ui::test_paint::shapes(&out) {
+            if let egui::Shape::LineSegment { points, .. } = shape {
+                let line = egui::Rect::from_two_pos(points[0], points[1]);
+                assert!(
+                    !line.intersects(label),
+                    "a line from {:?} to {:?} crosses {label:?}",
+                    points[0],
+                    points[1]
+                );
+            }
+        }
+        // The control: with samples the zero line is there to be crossed.
+        let out = painted_waveform(&ctx, &a_sine());
+        let horizontal = crate::ui::test_paint::shapes(&out).into_iter().any(
+            |s| matches!(s, egui::Shape::LineSegment { points, .. } if points[0].y == points[1].y),
+        );
+        assert!(horizontal, "a waveform with samples still has a zero line");
     }
 
     /// A style the host set is what the waveform paints: its ground, zero

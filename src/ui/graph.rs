@@ -14,9 +14,22 @@
 //! topological auto-layout for any node that doesn't have one yet (patches
 //! loaded from JSON or built in code).
 //!
+//! That layout is *measured*: each box's size is kept from the frame it was
+//! last drawn in, and a column is stacked by those sizes plus a gap. The
+//! first frame a box appears in has no measurement to go on, so it is
+//! placed at a guess and the auto-placed boxes are laid out again at the
+//! start of the next frame — not at the end of this one, because a
+//! position may not change between egui's passes over one frame. Toolbar
+//! Tidy re-lays every node. A fixed pitch of 190 units against boxes of
+//! 194 and up opened the starter patch with its boxes touching and a
+//! loaded patch with them on top of each other (#59, Overlands #1332).
+//!
 //! # How editing maps to the schema
 //!
-//! - **Move a node:** drag its title bar (scene-space delta → stored position).
+//! - **Move a node:** drag the number at the left of its title (scene-space
+//!   delta → stored position); click the number to select it. The rest of
+//!   the title is the kind picker, so a node is named and re-kinded in the
+//!   same place.
 //! - **Wire a port:** drag from a node's output dot (right edge, on the
 //!   title row) onto another node's input: its dot, or anywhere on its row
 //!   in the node's "Inputs" list, where the port is named. That appends a
@@ -32,16 +45,22 @@
 //!   out of reach.
 //! - **Amounts / constants / deletes:** the "Inputs" section inside each node
 //!   box edits each connection's `amount` (or a [`Connection::Constant`]'s
-//!   value) and removes connections.
-//! - **Add / remove nodes, set output:** the toolbar above the canvas.
+//!   value) and removes connections. Each wire's row names the node it
+//!   comes from ("from #1 LFO"), so nothing on the canvas asks the reader
+//!   to remember what a number stands for.
+//! - **Add / remove nodes, set output:** the one toolbar row above the
+//!   canvas — Add node, Delete, Tidy, Fit view, the Output picker and a
+//!   More menu holding the genetics controls and the JSON box.
 //!
 //! Structural edits are collected as deferred `Action`s while the node loop
 //! holds `&mut patch.graph.nodes`, then applied once the loop's borrow ends —
 //! the standard way to keep an immediate-mode graph editor borrow-clean.
 //!
-//! Validity ([`topo_sort`]) is shown live in the toolbar and the output node
-//! gets its own border, so cycles / missing-output / unknown-node are visible
-//! the moment they're created. A broken graph is also located: the toolbar
+//! Validity ([`topo_sort`]) is shown live at the right of the toolbar and
+//! the output node wears an OUT badge in its title, so cycles /
+//! missing-output / unknown-node are visible the moment they're created.
+//! The badge is a badge and not a border because the selection is a border
+//! — a thicker one — and a node can be both the output and selected. A broken graph is also located: the toolbar
 //! names the nodes at fault ("#0 Gain and #1 Gain feed each other in a
 //! loop…"), and the canvas outlines their boxes in the error colour — the
 //! nodes of a loop, the node holding a wire from a node that is not there,
@@ -49,14 +68,15 @@
 //!
 //! # Colours
 //!
-//! Everything the canvas paints itself — the ground, the node boxes and
-//! their edges and titles, wires, ports, the validity line — takes its colour
-//! from the [`EditorStyle`] in effect ([`crate::ui::style`]): the host's, if
-//! it set one, else one derived from the `Visuals` the canvas is drawn with.
+//! Everything the canvas paints itself — the ground, its border and grid,
+//! the node boxes and their edges, titles and rules, wires, ports, the
+//! validity line — takes its colour from the [`EditorStyle`] in effect
+//! ([`crate::ui::style`]): the host's, if it set one, else one derived from
+//! the `Visuals` the canvas is drawn with.
 //! A node box is filled with a surface the theme's text reads on, so the
 //! widgets inside it read in a light theme as well as a dark one (#58).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use bevy_egui::egui::{
     self, Align, Color32, Id, Layout, Pos2, Rect, Sense, Stroke, UiBuilder, Vec2,
@@ -69,17 +89,33 @@ use crate::patch::{AudioPatch, Connection, GraphError, GraphNode, NodeGraph, Nod
 use super::EditorResponse;
 use super::evolve::{fresh_rng, mutate_node_kind, mutate_patch, randomize_seed};
 use super::io::json_io;
-use super::node::{node_kind_editor, node_kind_label};
+use super::node::{node_kind_body, node_kind_label, node_kind_picker};
 use super::style::{EditorStyle, editor_style};
 
-const NODE_WIDTH: f32 = 210.0;
+/// The narrowest a node box is laid out at. A box whose content needs more
+/// takes more — `egui::Frame::group` sizes to what is in it — so this is a
+/// floor that keeps a one-parameter node from being a sliver, not a width.
+const NODE_MIN_WIDTH: f32 = 210.0;
 const PORT_RADIUS: f32 = 5.0;
 /// Opacity of the highlight over the row a dragged wire would connect to:
 /// the row's labels are under it and must still read.
 const DROP_ROW_ALPHA: f32 = 0.2;
-/// Horizontal / vertical spacing of the topological auto-layout grid.
-const COL_W: f32 = 280.0;
-const ROW_H: f32 = 190.0;
+/// Clear space between the boxes the auto-layout places, scene units.
+const NODE_GAP: f32 = 28.0;
+/// Where the auto-layout's first column begins.
+const LAYOUT_ORIGIN: Pos2 = Pos2::new(40.0, 40.0);
+/// The size the auto-layout assumes for a box it has never drawn. One
+/// frame's worth of guess: the real size is recorded the moment the box is
+/// drawn and the auto-placed boxes are laid out again from it.
+const UNMEASURED: Vec2 = Vec2::new(NODE_MIN_WIDTH, 210.0);
+/// The selected box's edge. Thicker than any other so the selection reads
+/// as well as the OUT badge beside it, and a node can wear both (#59).
+const SELECTED_STROKE: f32 = 2.5;
+/// The canvas grid's pitch, scene units.
+const GRID_STEP: f32 = 80.0;
+/// How many grid lines are ever drawn: zoomed far out the view covers more
+/// ground than there is any use in ruling.
+const GRID_MAX_LINES: usize = 240;
 /// How close (scene units) a wire drop must land to an input dot to connect
 /// when it is not on the port's row.
 const SNAP_DIST: f32 = 26.0;
@@ -93,6 +129,17 @@ const SNAP_DIST: f32 = 26.0;
 pub struct PatchEditorState {
     /// Node positions in scene-local coordinates.
     positions: HashMap<NodeId, Pos2>,
+    /// Each node box's size as the canvas last drew it — the pitch the
+    /// auto-layout stacks by.
+    sizes: HashMap<NodeId, Vec2>,
+    /// The nodes the canvas placed and the user has not moved. Only these
+    /// are re-laid out when their measured sizes arrive or a Tidy is asked
+    /// for; a box someone dragged somewhere stays there.
+    auto: HashSet<NodeId>,
+    /// A layout is owed once the boxes it placed have been measured.
+    relayout: bool,
+    /// Whether the JSON box is open, from the toolbar's More menu.
+    show_json: bool,
     /// The [`egui::Scene`] view rectangle — pan and zoom live here.
     scene_rect: Rect,
     /// Selected node (delete target + highlight).
@@ -114,6 +161,10 @@ impl Default for PatchEditorState {
     fn default() -> Self {
         Self {
             positions: HashMap::new(),
+            sizes: HashMap::new(),
+            auto: HashSet::new(),
+            relayout: false,
+            show_json: false,
             scene_rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0)),
             selected: None,
             mutate_rate: 0.3,
@@ -180,29 +231,108 @@ fn drop_target<'a>(
 }
 
 impl PatchEditorState {
-    /// Assign a position to every node that lacks one, laying fresh nodes out
-    /// in topological columns (sources left, output right).  Nodes the user
-    /// has already moved keep their stored position.
+    /// Give every node that lacks a position one, and lay the auto-placed
+    /// boxes out together so they read as a grid.
+    ///
+    /// A node the user has dragged, or one dropped by Add node, is not
+    /// auto-placed and is left where it is.
     fn ensure_layout(&mut self, patch: &AudioPatch) {
-        if patch
+        let fresh: Vec<NodeId> = patch
             .graph
             .nodes
             .iter()
-            .all(|n| self.positions.contains_key(&n.id))
-        {
+            .map(|n| n.id)
+            .filter(|id| !self.positions.contains_key(id))
+            .collect();
+        if fresh.is_empty() {
             return;
         }
+        self.auto.extend(fresh);
+        self.place_auto(patch);
+        // These boxes have never been drawn, so they were placed at a
+        // guessed size; lay them out again once the real one is known.
+        self.relayout = true;
+    }
+
+    /// Lay every auto-placed node out again — what Tidy does, and what the
+    /// canvas does itself once a box it placed has been measured.
+    fn place_auto(&mut self, patch: &AudioPatch) {
+        let auto = self.auto.clone();
+        self.place(patch, &auto);
+    }
+
+    /// Stack `place_me` into topological columns — sources left, output
+    /// right — each column as wide as its widest box and each box below the
+    /// one before it with [`NODE_GAP`] of clear space.
+    ///
+    /// The pitch is measured, not fixed. A fixed 190-unit row against boxes
+    /// of 194 and up opened the starter patch with the LFO lying over the
+    /// sine's amplitude row, and a patch loaded from a record opened with
+    /// its boxes on each other (#59, Overlands #1332 B4).
+    ///
+    /// A node not in `place_me` keeps its position, and a column's cursor
+    /// starts below any such box standing in that column's width, so a
+    /// freshly loaded patch does not land on one already parked there.
+    fn place(&mut self, patch: &AudioPatch, place_me: &HashSet<NodeId>) {
         let depths = compute_depths(patch);
-        let mut row_in_col: HashMap<u32, u32> = HashMap::new();
-        for node in &patch.graph.nodes {
-            if self.positions.contains_key(&node.id) {
-                continue;
+        let mut by_col: BTreeMap<u32, Vec<NodeId>> = BTreeMap::new();
+        for n in &patch.graph.nodes {
+            if place_me.contains(&n.id) {
+                by_col
+                    .entry(depths.get(&n.id).copied().unwrap_or(0))
+                    .or_default()
+                    .push(n.id);
             }
-            let col = depths.get(&node.id).copied().unwrap_or(0);
-            let row = row_in_col.entry(col).or_insert(0);
-            let pos = Pos2::new(40.0 + col as f32 * COL_W, 40.0 + *row as f32 * ROW_H);
-            self.positions.insert(node.id, pos);
-            *row += 1;
+        }
+        let parked: Vec<Rect> = patch
+            .graph
+            .nodes
+            .iter()
+            .filter(|n| !place_me.contains(&n.id))
+            .filter_map(|n| {
+                Some(Rect::from_min_size(
+                    *self.positions.get(&n.id)?,
+                    self.size_of(n.id),
+                ))
+            })
+            .collect();
+
+        let mut x = LAYOUT_ORIGIN.x;
+        for ids in by_col.into_values() {
+            let width = ids
+                .iter()
+                .map(|id| self.size_of(*id).x)
+                .fold(NODE_MIN_WIDTH, f32::max);
+            let mut y = LAYOUT_ORIGIN.y;
+            for rect in parked
+                .iter()
+                .filter(|r| r.right() > x && r.left() < x + width)
+            {
+                y = y.max(rect.bottom() + NODE_GAP);
+            }
+            for id in ids {
+                self.positions.insert(id, Pos2::new(x, y));
+                y += self.size_of(id).y + NODE_GAP;
+            }
+            x += width + NODE_GAP;
+        }
+    }
+
+    /// A node box's size as the canvas last drew it, or what to assume
+    /// until it has drawn one.
+    fn size_of(&self, id: NodeId) -> Vec2 {
+        self.sizes.get(&id).copied().unwrap_or(UNMEASURED)
+    }
+
+    /// Forget everything remembered about nodes the patch no longer has, so
+    /// a deleted node cannot hold a column open or block a re-layout.
+    fn forget_missing(&mut self, patch: &AudioPatch) {
+        let live: HashSet<NodeId> = patch.graph.nodes.iter().map(|n| n.id).collect();
+        self.positions.retain(|id, _| live.contains(id));
+        self.sizes.retain(|id, _| live.contains(id));
+        self.auto.retain(|id| live.contains(id));
+        if self.selected.is_some_and(|id| !live.contains(&id)) {
+            self.selected = None;
         }
     }
 }
@@ -466,14 +596,24 @@ pub fn audio_patch_canvas(
 ) -> EditorResponse {
     let style = editor_style(ui);
     let mut res = EditorResponse::NONE;
+    state.forget_missing(patch);
     res.merge(toolbar(ui, patch, state, &style));
-    res.merge(json_io(ui, patch, &mut state.json, id.with("patch_json")));
+    if state.show_json {
+        res.merge(json_io(ui, patch, &mut state.json, id.with("patch_json")));
+    }
     state.ensure_layout(patch);
 
     // The scene takes the rest of the `Ui`, and draws on a layer over this
-    // one: the ground goes under it, where it will be.
-    ui.painter()
-        .rect_filled(ui.available_rect_before_wrap(), 0.0, style.canvas_ground);
+    // one: the ground and the border that says where the ground ends go
+    // under it, where it will be.
+    let ground = ui.available_rect_before_wrap();
+    ui.painter().rect_filled(ground, 0.0, style.canvas_ground);
+    ui.painter().rect_stroke(
+        ground,
+        0.0,
+        Stroke::new(1.0, style.canvas_edge),
+        egui::StrokeKind::Inside,
+    );
     let mut scene_rect = state.scene_rect;
     let scene = egui::Scene::new().zoom_range(egui::Rangef::new(0.2, 2.0));
     let inner = scene.show(ui, &mut scene_rect, |ui| {
@@ -484,9 +624,46 @@ pub fn audio_patch_canvas(
     res
 }
 
-/// Fixed toolbar above the canvas: add / delete nodes, pick the output, fit
-/// the view, and a live validity readout. Its buttons say what they do in
-/// words (#58).
+/// The canvas's grid, drawn inside the scene so it moves with the ground:
+/// without it a drag on an empty canvas changed nothing anyone could see,
+/// and there was no way to tell how far the view had been carried (#59,
+/// Overlands #1332 B16).
+///
+/// Capped at [`GRID_MAX_LINES`]: zoomed right out the view covers more
+/// ground than there is any use in ruling.
+fn paint_grid(ui: &egui::Ui, style: &EditorStyle) {
+    let view = ui.clip_rect();
+    if !view.is_finite() || !view.is_positive() {
+        return;
+    }
+    let painter = ui.painter();
+    let stroke = Stroke::new(1.0, style.canvas_grid);
+    let first = |v: f32| (v / GRID_STEP).floor() * GRID_STEP;
+    let mut drawn = 0;
+    let mut x = first(view.left());
+    while x <= view.right() && drawn < GRID_MAX_LINES {
+        painter.vline(x, view.y_range(), stroke);
+        x += GRID_STEP;
+        drawn += 1;
+    }
+    let mut y = first(view.top());
+    while y <= view.bottom() && drawn < GRID_MAX_LINES {
+        painter.hline(view.x_range(), y, stroke);
+        y += GRID_STEP;
+        drawn += 1;
+    }
+}
+
+/// One toolbar row above the canvas: add, delete, tidy and fit, the output
+/// picker, a More menu for what is not needed every minute, and the live
+/// validity readout at the right.
+///
+/// It was four rows of chrome before the first node — the buttons, the
+/// genetics controls, the validity line and the JSON fold — which is what
+/// the canvas is for (#59, Overlands #1332 B9). Its buttons say what they
+/// do in words (#58), and a disabled Delete says why through
+/// `on_disabled_hover_text`, the only hover egui shows on a disabled
+/// widget (#1289).
 fn toolbar(
     ui: &mut egui::Ui,
     patch: &mut AudioPatch,
@@ -494,8 +671,37 @@ fn toolbar(
     style: &EditorStyle,
 ) -> EditorResponse {
     let mut res = EditorResponse::NONE;
+    // The check and the cross are Overlands' `affordances::CHECK` and
+    // `CROSS`, its glyphs for valid and failed.
+    let (colour, line) = match topo_sort(&patch.graph) {
+        Ok(order) => (
+            style.ok,
+            format!("\u{2714} valid graph \u{2014} {} nodes", order.len()),
+        ),
+        // Named, and outlined on the canvas below (#57).
+        Err(e) => (
+            style.error,
+            format!("\u{2716} {}", describe_graph_error(&patch.graph, &e)),
+        ),
+    };
+    let chip_width = ui
+        .painter()
+        .layout_no_wrap(
+            line.clone(),
+            egui::TextStyle::Body.resolve(ui.style()),
+            colour,
+        )
+        .rect
+        .width();
+    // Set inside the row, read after it: what was left of the row when the
+    // buttons had taken their share.
+    let mut room_left = 0.0;
     ui.horizontal_wrapped(|ui| {
-        if ui.button("Add node").clicked() {
+        if ui
+            .button("Add node")
+            .on_hover_text("Put a new node in the middle of the view")
+            .clicked()
+        {
             let new_id = NodeId(
                 patch
                     .graph
@@ -510,36 +716,62 @@ fn toolbar(
                 kind: NodeKind::Sine(SineOsc::default()),
                 inputs: Default::default(),
             });
-            // Drop it near the centre of the current view so it's visible.
+            // Drop it near the centre of the current view so it's visible,
+            // and leave it out of `auto`: the user put it there.
             state.positions.insert(new_id, state.scene_rect.center());
             state.selected = Some(new_id);
             res.changed = true;
             res.rebake = true;
         }
 
-        let can_delete = state.selected.is_some() && patch.graph.nodes.len() > 1;
+        let last_node = patch.graph.nodes.len() <= 1;
+        let can_delete = state.selected.is_some() && !last_node;
+        let why_not = if last_node {
+            "A patch keeps at least one node"
+        } else {
+            "Select a node first: click its number"
+        };
         if ui
             .add_enabled(can_delete, egui::Button::new("Delete"))
             .on_hover_text("Remove the selected node and any wires into it")
+            .on_disabled_hover_text(why_not)
             .clicked()
             && let Some(sel) = state.selected
         {
             delete_node(patch, sel);
-            state.positions.remove(&sel);
-            state.selected = None;
+            state.forget_missing(patch);
             res.changed = true;
             res.rebake = true;
+        }
+
+        if ui
+            .button("Tidy")
+            .on_hover_text("Lay every node out again in columns, sources to output")
+            .clicked()
+        {
+            state.auto = patch.graph.nodes.iter().map(|n| n.id).collect();
+            state.place_auto(patch);
+        }
+
+        if ui
+            .button("Fit view")
+            .on_hover_text("Pan and zoom so every node is in view")
+            .clicked()
+        {
+            // A zero-size rect makes Scene auto-fit to the content next frame.
+            state.scene_rect = Rect::ZERO;
         }
 
         ui.separator();
         ui.label("Output:");
         let ids: Vec<NodeId> = patch.graph.nodes.iter().map(|n| n.id).collect();
         egui::ComboBox::from_id_salt("canvas_output_select")
-            .selected_text(format!("#{}", patch.graph.output.0))
+            .selected_text(node_name(&patch.graph, patch.graph.output))
             .show_ui(ui, |ui| {
                 for nid in ids {
+                    let name = node_name(&patch.graph, nid);
                     if ui
-                        .selectable_label(nid == patch.graph.output, format!("#{}", nid.0))
+                        .selectable_label(nid == patch.graph.output, name)
                         .clicked()
                     {
                         patch.graph.output = nid;
@@ -550,17 +782,40 @@ fn toolbar(
             });
 
         ui.separator();
-        if ui
-            .button("Fit view")
-            .on_hover_text("Pan and zoom so every node is in view")
-            .clicked()
-        {
-            // A zero-size rect makes Scene auto-fit to the content next frame.
-            state.scene_rect = Rect::ZERO;
+        res.merge(more_menu(ui, patch, state));
+
+        // Room for the validity line at the right of the row?
+        room_left = ui.max_rect().right() - ui.next_widget_position().x;
+        if room_left >= chip_width + ui.spacing().item_spacing.x {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.colored_label(colour, line.clone());
+            });
         }
     });
+    // Too narrow a row to hold it: under the row, on a line of its own.
+    //
+    // Neither of the obvious ways works here. A right-to-left layout takes
+    // whatever width is left however little that is and draws inside it,
+    // which on the sequence editor's side panel (about 480 points) drew the
+    // whole line across the Output picker and the More button. Appending it
+    // to the wrapping row instead wraps the *text*, which spreads it over
+    // the buttons rather than moving it off them.
+    if room_left < chip_width + ui.spacing().item_spacing.x {
+        ui.colored_label(colour, line);
+    }
+    res
+}
 
-    ui.horizontal_wrapped(|ui| {
+/// The toolbar's More menu: the genetics controls and the JSON box, which
+/// are not wanted every minute and cost two of the four rows the toolbar
+/// used to be.
+fn more_menu(
+    ui: &mut egui::Ui,
+    patch: &mut AudioPatch,
+    state: &mut PatchEditorState,
+) -> EditorResponse {
+    let mut res = EditorResponse::NONE;
+    ui.menu_button("More", |ui| {
         if ui
             .button("Mutate")
             .on_hover_text("Nudge every node's parameters via symbios-genetics")
@@ -583,25 +838,15 @@ fn toolbar(
             res.changed = true;
             res.rebake = true;
         }
+        ui.separator();
+        if ui
+            .selectable_label(state.show_json, "Import / Export JSON")
+            .on_hover_text("Show the JSON box under the toolbar")
+            .clicked()
+        {
+            state.show_json = !state.show_json;
+        }
     });
-
-    // The check and the cross are Overlands' `affordances::CHECK` and
-    // `CROSS`, its glyphs for valid and failed.
-    match topo_sort(&patch.graph) {
-        Ok(order) => {
-            ui.colored_label(
-                style.ok,
-                format!("\u{2714} valid graph \u{2014} {} nodes", order.len()),
-            );
-        }
-        Err(e) => {
-            // Named, and outlined on the canvas below (#57).
-            ui.colored_label(
-                style.error,
-                format!("\u{2716} {}", describe_graph_error(&patch.graph, &e)),
-            );
-        }
-    }
     res
 }
 
@@ -616,6 +861,19 @@ fn canvas_contents(
     let mut res = EditorResponse::NONE;
     let mut actions: Vec<Action> = Vec::new();
 
+    paint_grid(ui, style);
+
+    // Any layout owed from the last frame, before a box is drawn: a
+    // position may not change between egui's passes over one frame. egui
+    // runs the frame a second time whenever something in it asks for one —
+    // a `Grid` measuring its columns does, and every node body is one — and
+    // a box that moved in between left a widget's rect holding a different
+    // widget's id, which egui reports pass by pass.
+    if state.relayout && state.auto.iter().all(|id| state.sizes.contains_key(id)) {
+        state.place_auto(patch);
+        state.relayout = false;
+    }
+
     // This frame's ports and output dots are drawn from, and kept in, the
     // state.
     state.ports.clear();
@@ -629,6 +887,14 @@ fn canvas_contents(
     let output_id = patch.graph.output;
     let selected = state.selected;
     let mutate_rate = state.mutate_rate;
+    // Every node's name, taken before the loop borrows the nodes mutably:
+    // a wire row says where it comes from by name, not by number (#59 B3).
+    let names: HashMap<NodeId, String> = patch
+        .graph
+        .nodes
+        .iter()
+        .map(|n| (n.id, format!("#{} {}", n.id.0, node_kind_label(&n.kind))))
+        .collect();
     // The boxes a broken graph is broken at, outlined in the host's error
     // colour over the selection and output borders: they are what has to
     // change before anything bakes.
@@ -655,39 +921,53 @@ fn canvas_contents(
         let stroke = if at_fault.contains(&nid) {
             error_stroke
         } else if selected == Some(nid) {
-            Stroke::new(2.0, style.node_selected)
-        } else if output_id == nid {
-            Stroke::new(2.0, style.node_output)
+            // Thicker, not just another colour: the output's mark is the
+            // OUT badge in its title, so one node can show both (#59 B8).
+            Stroke::new(SELECTED_STROKE, style.node_selected)
         } else {
             Stroke::new(1.0, style.node_stroke)
         };
 
         let mut child = ui.new_child(
             UiBuilder::new()
-                .max_rect(Rect::from_min_size(pos, Vec2::new(NODE_WIDTH, 10.0)))
+                .max_rect(Rect::from_min_size(pos, Vec2::new(NODE_MIN_WIDTH, 10.0)))
                 .id_salt(("patch_node", nid.0))
                 .layout(Layout::top_down(Align::Min)),
         );
-        child.set_width(NODE_WIDTH);
+        child.set_width(NODE_MIN_WIDTH);
 
         let frame = egui::Frame::group(child.style())
             .fill(style.node_fill)
             .stroke(stroke);
+        // Where the box's rules go. They are painted after the frame is
+        // measured: `Ui::separator` is only as wide as the `Ui` it is in,
+        // which is the box's minimum width, so on every box that grew past
+        // it the rule stopped short of the border.
+        let mut rules: Vec<f32> = Vec::new();
         let fr = frame.show(&mut child, |ui| {
-            ui.set_width(NODE_WIDTH);
-            // Title bar: drag to move, click to select, Mutate to mutate
-            // this node.
+            // Title bar: the number is the grip (drag to move, click to
+            // select), the kind beside it is the picker, and the badge says
+            // whether the patch plays this node.
             let title_row = ui.horizontal(|ui| {
-                let title = format!("#{}  {}", nid.0, node_kind_label(&node.kind));
-                let title_resp = ui.add(
-                    egui::Label::new(egui::RichText::new(title).strong().color(style.node_title))
+                let grip = ui
+                    .add(
+                        egui::Label::new(
+                            egui::RichText::new(format!("#{}", nid.0))
+                                .strong()
+                                .color(style.node_title),
+                        )
                         .sense(Sense::click_and_drag()),
-                );
-                if title_resp.dragged() {
-                    actions.push(Action::Move(nid, title_resp.drag_delta()));
+                    )
+                    .on_hover_text("Drag to move this node, click to select it");
+                if grip.dragged() {
+                    actions.push(Action::Move(nid, grip.drag_delta()));
                 }
-                if title_resp.clicked() {
+                if grip.clicked() {
                     actions.push(Action::Select(nid));
+                }
+                res.merge(node_kind_picker(ui, &mut node.kind, Id::new(("nk", nid.0))));
+                if output_id == nid {
+                    out_badge(ui, style);
                 }
                 if ui
                     .small_button("Mutate")
@@ -699,15 +979,24 @@ fn canvas_contents(
                     res.rebake = true;
                 }
             });
-            ui.separator();
-            res.merge(node_kind_editor(ui, &mut node.kind, Id::new(("nk", nid.0))));
-            let (conn_res, rows) = connection_editor(ui, node);
+            rule(ui, &mut rules);
+            res.merge(node_kind_body(ui, &mut node.kind));
+            let (conn_res, rows) = connection_editor(ui, node, &names, &mut rules);
             res.merge(conn_res);
             (title_row.response.rect, rows)
         });
 
         let rect = fr.response.rect;
         let (title_rect, rows) = fr.inner;
+        // The rules, now that the box's width is known.
+        let inset = f32::from(egui::Frame::group(ui.style()).inner_margin.left);
+        for y in rules {
+            painter.hline(
+                (rect.left() + inset)..=(rect.right() - inset),
+                y,
+                Stroke::new(1.0, style.node_stroke),
+            );
+        }
         state.boxes.push((nid, rect));
         titles.insert(nid, node_kind_label(&node.kind));
         // The output leaves from the title row, where the node is named.
@@ -861,6 +1150,20 @@ fn canvas_contents(
         }
     }
 
+    // This frame's box sizes. A box placed before it had ever been drawn
+    // was placed at a guessed size, and a box whose kind changed under the
+    // title picker is a different size than it was; either way the
+    // auto-placed boxes owe a layout, which the next frame opens with
+    // (#59 B4).
+    for (id, rect) in &state.boxes {
+        let size = rect.size();
+        let moved = state
+            .sizes
+            .insert(*id, size)
+            .is_none_or(|was| (was - size).length() > 0.5);
+        state.relayout |= moved && state.auto.contains(id);
+    }
+
     // Claim the bounding area so Scene's "reset view" can fit the content.
     if let Some(bounds) = state
         .boxes
@@ -886,7 +1189,12 @@ struct PortRow {
 /// The "Inputs" section inside a node box: per-connection amount/value editing,
 /// per-port "add constant", and per-connection delete. Returns where each
 /// port's rows went, so the canvas can put the port's dot beside its name.
-fn connection_editor(ui: &mut egui::Ui, node: &mut GraphNode) -> (EditorResponse, Vec<PortRow>) {
+fn connection_editor(
+    ui: &mut egui::Ui,
+    node: &mut GraphNode,
+    names: &HashMap<NodeId, String>,
+    rules: &mut Vec<f32>,
+) -> (EditorResponse, Vec<PortRow>) {
     let mut res = EditorResponse::NONE;
     let mut rows = Vec::new();
 
@@ -905,7 +1213,7 @@ fn connection_editor(ui: &mut egui::Ui, node: &mut GraphNode) -> (EditorResponse
         return (res, rows);
     }
 
-    ui.separator();
+    rule(ui, rules);
     ui.label(egui::RichText::new("Inputs").weak());
 
     let mut to_delete: Vec<(String, usize)> = Vec::new();
@@ -915,7 +1223,11 @@ fn connection_editor(ui: &mut egui::Ui, node: &mut GraphNode) -> (EditorResponse
         let name_row = ui
             .horizontal(|ui| {
                 ui.label(format!("{port}:"));
-                if ui.small_button("Add constant").clicked() {
+                if ui
+                    .small_button("Add constant")
+                    .on_hover_text(format!("Drive {port} with a fixed value instead of a wire"))
+                    .clicked()
+                {
                     to_add_const.push(port.clone());
                     res.changed = true;
                     res.rebake = true;
@@ -929,7 +1241,14 @@ fn connection_editor(ui: &mut egui::Ui, node: &mut GraphNode) -> (EditorResponse
                 let row = ui.horizontal(|ui| {
                     match c {
                         Connection::Node { id, amount } => {
-                            ui.label(format!("  \u{2B05} #{}", id.0));
+                            // Named, not pointed at: "from #1 LFO" says
+                            // which node without the reader going to look
+                            // up what #1 is (#59 B3).
+                            let from = names
+                                .get(id)
+                                .cloned()
+                                .unwrap_or_else(|| format!("#{}", id.0));
+                            ui.label(format!("from {from}"));
                             let r = ui.add(egui::DragValue::new(amount).speed(0.05).prefix("amt "));
                             res.changed |= r.changed();
                             res.rebake |= r.drag_stopped() || (r.changed() && !r.dragged());
@@ -977,6 +1296,43 @@ fn connection_editor(ui: &mut egui::Ui, node: &mut GraphNode) -> (EditorResponse
     }
 
     (res, rows)
+}
+
+/// Note where a rule across the node box goes, and leave room for it.
+///
+/// The line itself is painted once the frame has been measured: a rule is
+/// as wide as the box, and `Ui::separator` can only be as wide as the `Ui`
+/// it is in.
+fn rule(ui: &mut egui::Ui, at: &mut Vec<f32>) {
+    let space = ui.spacing().item_spacing.y;
+    ui.add_space(space);
+    at.push(ui.cursor().top());
+    ui.add_space(space);
+}
+
+/// The badge on the title of the node the patch plays.
+///
+/// A badge and not a border, because the selection is a border: they were
+/// one border in two colours, so the output stopped saying it was the
+/// output the moment it was clicked (#59, Overlands #1332 B8).
+fn out_badge(ui: &mut egui::Ui, style: &EditorStyle) {
+    let resp = ui
+        .add(
+            egui::Label::new(
+                egui::RichText::new("OUT")
+                    .small()
+                    .strong()
+                    .color(style.node_output),
+            )
+            .sense(Sense::hover()),
+        )
+        .on_hover_text("The patch plays this node");
+    ui.painter().rect_stroke(
+        resp.rect.expand2(Vec2::new(3.0, 1.0)),
+        3.0,
+        Stroke::new(1.0, style.node_output),
+        egui::StrokeKind::Outside,
+    );
 }
 
 /// A cubic-bezier wire from `a` to `b`, sampled to a polyline with horizontal
@@ -1328,6 +1684,20 @@ mod tests {
         button_labels, colours, contrast_on, glyph_labels, shapes, text_painted,
     };
 
+    /// How far the driver's clock moves per frame. Long enough that two
+    /// still frames outlast egui's tooltip delay.
+    const FRAME_DT: f64 = 0.25;
+
+    /// An AccessKit node's bounds as an egui [`Rect`], in whatever space
+    /// its layer uses.
+    fn accesskit_rect(node: &accesskit::Node) -> Option<Rect> {
+        let b = node.bounds()?;
+        Some(Rect::from_min_max(
+            Pos2::new(b.x0 as f32, b.y0 as f32),
+            Pos2::new(b.x1 as f32, b.y1 as f32),
+        ))
+    }
+
     /// The canvas on a headless context, large enough to show a few nodes.
     ///
     /// [`Canvas::new`] sets [`distinct_style`] on the context, so every role
@@ -1339,6 +1709,12 @@ mod tests {
         patch: AudioPatch,
         state: PatchEditorState,
         out: egui::FullOutput,
+        /// Wall clock for the frames driven so far. egui holds a tooltip
+        /// back by `interaction.tooltip_delay`, so a frame clock that never
+        /// moves is a frame clock in which no hover text is ever shown.
+        time: f64,
+        /// The screen the canvas is drawn on.
+        screen: Vec2,
     }
 
     impl Canvas {
@@ -1348,6 +1724,19 @@ mod tests {
             Self::on(ctx, patch)
         }
 
+        /// The canvas on a screen `width` points wide: the sequence
+        /// editor's side panel gives its patch canvas about 480.
+        fn narrow(patch: AudioPatch, width: f32) -> Self {
+            let ctx = egui::Context::default();
+            set_editor_style(&ctx, distinct_style());
+            let mut canvas = Self::on_for(ctx, patch, 0);
+            canvas.screen = Vec2::new(width, 800.0);
+            for _ in 0..3 {
+                canvas.frame(Vec::new());
+            }
+            canvas
+        }
+
         /// The canvas under `visuals`, with no style set.
         fn themed(patch: AudioPatch, visuals: egui::Visuals) -> Self {
             let ctx = egui::Context::default();
@@ -1355,31 +1744,52 @@ mod tests {
             Self::on(ctx, patch)
         }
 
+        /// The canvas after exactly `frames` frames. The measured
+        /// auto-layout settles in two (#59): the first frame places boxes
+        /// at a guessed size and records the real one, the second re-places
+        /// them and draws them there.
+        fn after(patch: AudioPatch, frames: usize) -> Self {
+            let ctx = egui::Context::default();
+            set_editor_style(&ctx, distinct_style());
+            Self::on_for(ctx, patch, frames)
+        }
+
         fn on(ctx: egui::Context, patch: AudioPatch) -> Self {
+            Self::on_for(ctx, patch, 3)
+        }
+
+        fn on_for(ctx: egui::Context, patch: AudioPatch, frames: usize) -> Self {
             ctx.enable_accesskit();
             let mut canvas = Self {
                 ctx,
                 patch,
                 state: PatchEditorState::default(),
                 out: egui::FullOutput::default(),
+                time: 0.0,
+                screen: Vec2::new(1600.0, 1200.0),
             };
-            for _ in 0..3 {
+            for _ in 0..frames {
                 canvas.frame(Vec::new());
             }
             canvas
         }
 
         fn frame(&mut self, events: Vec<egui::Event>) -> EditorResponse {
+            self.time += FRAME_DT;
             let Self {
                 ctx,
                 patch,
                 state,
                 out,
+                time,
+                screen,
             } = self;
             let mut res = EditorResponse::NONE;
             let input = egui::RawInput {
-                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(1600.0, 1200.0))),
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, *screen)),
                 events,
+                time: Some(*time),
+                predicted_dt: FRAME_DT as f32,
                 ..Default::default()
             };
             *out = ctx.run_ui(input, |root| {
@@ -1416,6 +1826,58 @@ mod tests {
                     Some((n.value()?.to_owned(), to_screen * rect))
                 })
                 .collect()
+        }
+
+        /// Every label's text and its rect as egui laid it out, with no
+        /// transform applied.
+        ///
+        /// For a label inside the canvas that is scene-local (what
+        /// [`PatchEditorState::boxes`] is in); for the toolbar, which is
+        /// drawn in the untransformed base layer, it is the screen rect.
+        /// [`Canvas::labels`] is the same list put in screen coordinates,
+        /// which is right for the canvas and wrong for the toolbar.
+        fn labels_untransformed(&self) -> Vec<(String, Rect)> {
+            self.out
+                .platform_output
+                .accesskit_update
+                .iter()
+                .flat_map(|update| &update.nodes)
+                .filter(|(_, n)| n.role() == accesskit::Role::Label)
+                .filter_map(|(_, n)| Some((n.value()?.to_owned(), accesskit_rect(n)?)))
+                .collect()
+        }
+
+        /// Every widget of `role` in the chrome above the canvas, with its
+        /// screen rect: the toolbar's layer carries no transform.
+        fn chrome(&self, role: accesskit::Role) -> Vec<(String, Rect)> {
+            self.out
+                .platform_output
+                .accesskit_update
+                .iter()
+                .flat_map(|update| &update.nodes)
+                .filter(|(_, n)| n.role() == role)
+                .filter_map(|(_, n)| {
+                    let text = n.label().or_else(|| n.value())?.to_owned();
+                    Some((text, accesskit_rect(n)?))
+                })
+                .collect()
+        }
+
+        /// The one widget of `role` whose text is exactly `text`.
+        fn chrome_rect(&self, role: accesskit::Role, text: &str) -> Rect {
+            let found: Vec<Rect> = self
+                .chrome(role)
+                .into_iter()
+                .filter(|(t, _)| t == text)
+                .map(|(_, r)| r)
+                .collect();
+            assert_eq!(
+                found.len(),
+                1,
+                "{role:?} reading {text:?}; all of them: {:?}",
+                self.chrome(role)
+            );
+            found[0]
         }
 
         /// The one label reading exactly `text`.
@@ -1513,6 +1975,33 @@ mod tests {
                 .collect()
         }
 
+        /// The part of a node box its content may use: the painted frame
+        /// inside the padding `egui::Frame::group` puts there, at this
+        /// canvas's zoom.
+        fn content_area(&self, node_box: Rect) -> Rect {
+            let margin = f32::from(
+                egui::Frame::group(&self.ctx.global_style())
+                    .inner_margin
+                    .left,
+            );
+            node_box.shrink(margin * self.to_screen().scaling)
+        }
+
+        /// Every text the frame painted and the rect its glyphs cover, on
+        /// screen. A galley's bounding rect is its whole extent, clipped or
+        /// not, so text that runs off a node box is visible here.
+        fn painted_text_rects(&self) -> Vec<(String, Rect)> {
+            self.shapes()
+                .into_iter()
+                .filter_map(|s| match s {
+                    egui::Shape::Text(t) => {
+                        Some((t.galley.text().to_owned(), t.visual_bounding_rect()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
         fn painted_text(&self) -> Vec<String> {
             self.shapes()
                 .into_iter()
@@ -1540,6 +2029,49 @@ mod tests {
 
         fn buttons(&self) -> Vec<String> {
             button_labels(&self.out)
+        }
+
+        /// Click the widget labelled `label`, wherever it is: an AccessKit
+        /// click needs no coordinates, so it reaches a widget inside the
+        /// canvas's transformed layer as readily as one in the toolbar.
+        fn click(&mut self, label: &str) {
+            let target = self
+                .out
+                .platform_output
+                .accesskit_update
+                .iter()
+                .flat_map(|update| &update.nodes)
+                .find(|(_, n)| n.label() == Some(label))
+                .map(|(id, _)| *id)
+                .unwrap_or_else(|| panic!("no widget labelled {label:?}"));
+            self.frame(vec![egui::Event::AccessKitActionRequest(
+                accesskit::ActionRequest {
+                    action: accesskit::Action::Click,
+                    target_tree: accesskit::TreeId::ROOT,
+                    target_node: target,
+                    data: None,
+                },
+            )]);
+            self.frame(Vec::new());
+        }
+
+        /// Hold the pointer at `at` until egui's tooltip delay has passed,
+        /// and return the text that appeared while it was there.
+        ///
+        /// One move, then still frames: egui holds a tooltip back until the
+        /// pointer has been *still* for `interaction.tooltip_delay`, and a
+        /// `PointerMoved` re-sent at the same position still counts as a
+        /// move, so a loop of them shows nothing however long it runs.
+        fn hover_text_at(&mut self, at: Pos2) -> Vec<String> {
+            let before = self.painted_text();
+            self.frame(vec![egui::Event::PointerMoved(at)]);
+            for _ in 0..6 {
+                self.frame(Vec::new());
+            }
+            self.painted_text()
+                .into_iter()
+                .filter(|t| !before.contains(t))
+                .collect()
         }
     }
 
@@ -1589,7 +2121,7 @@ mod tests {
             let name = node_kind_label(&kind);
             let canvas = Canvas::new(one_node(kind.clone()));
             let node_box = canvas.boxes()[0];
-            let title = canvas.label(&format!("#0  {name}"));
+            let title = canvas.label("#0");
             assert!(
                 canvas
                     .dots()
@@ -1889,10 +2421,9 @@ mod tests {
         ] {
             let canvas = Canvas::themed(three_node_patch(), visuals);
             let boxes = canvas.painted_boxes();
-            for (i, name) in ["#0  Sine", "#1  LFO", "#2  Lowpass"]
-                .into_iter()
-                .enumerate()
-            {
+            // The title is the number (the grip) beside the kind picker,
+            // and the number is what the canvas paints itself (#59).
+            for (i, name) in ["#0", "#1", "#2"].into_iter().enumerate() {
                 let (_, title) = text_painted(&canvas.out, name)
                     .unwrap_or_else(|| panic!("{theme}: no title {name:?}"));
                 let ratio = contrast_on(title, boxes[i].fill);
@@ -1923,15 +2454,21 @@ mod tests {
         ] {
             assert!(painted.contains(&colour), "{role} is not painted");
         }
-        // #0 selected, #1 plain, #2 the output.
+        // #0 selected, #1 and #2 plain: the output is marked by its OUT
+        // badge now, not by a border it cannot show while selected (#59).
         let edges: Vec<Color32> = canvas
             .painted_boxes()
             .iter()
             .map(|b| b.stroke.color)
             .collect();
-        assert_eq!(edges, [s.node_selected, s.node_stroke, s.node_output]);
+        assert_eq!(edges, [s.node_selected, s.node_stroke, s.node_stroke]);
         assert!(canvas.painted_boxes().iter().all(|b| b.fill == s.node_fill));
-        let (_, title) = text_painted(&canvas.out, "#1  LFO").expect("a title");
+        assert_eq!(
+            text_painted(&canvas.out, "OUT").map(|(_, c)| c),
+            Some(s.node_output),
+            "the output's badge"
+        );
+        let (_, title) = text_painted(&canvas.out, "#1").expect("a title");
         assert_eq!(title, s.node_title);
         let (_, valid) =
             text_painted(&canvas.out, "\u{2714} valid graph \u{2014} 3 nodes").expect("the line");
@@ -1973,12 +2510,17 @@ mod tests {
     /// `affordances::CROSS` uses for the same act.
     #[test]
     fn the_canvas_buttons_say_what_they_do_in_words() {
-        let canvas = Canvas::new(three_node_patch());
+        let mut canvas = Canvas::new(three_node_patch());
+        // The genetics controls moved into the More menu (#59 B9), so open
+        // it: its buttons are drawn only while it is.
+        canvas.click("More");
         let labels = canvas.buttons();
         for word in [
             "Add node",
             "Delete",
+            "Tidy",
             "Fit view",
+            "More",
             "Mutate",
             "Reroll seed",
             "Add constant",
@@ -2005,5 +2547,445 @@ mod tests {
             "Fit view".to_string(),
         ];
         assert_eq!(glyph_labels(&labels, &['\u{2716}']), ["\u{1F3B2} Mutate"]);
+    }
+
+    // ---- step 6: the node box (#59, Overlands #1332) --------------------
+
+    /// A chain of `n` nodes running through the kinds upstream ships, each
+    /// wired into the next: boxes of every height the canvas can meet, all
+    /// of them placed by the auto-layout. A patch built from a record's
+    /// seed arrives exactly like this — no stored positions, one column per
+    /// link.
+    fn seeded_size_patch(n: usize) -> AudioPatch {
+        let kinds = NodeKind::defaults();
+        let mut nodes: Vec<GraphNode> = Vec::new();
+        for i in 0..n {
+            let kind = kinds[i % kinds.len()].clone();
+            let mut gn = node(i as u32, kind);
+            if let (Some(prev), Some(port)) =
+                (i.checked_sub(1), input_ports(&gn.kind).first().copied())
+            {
+                gn.inputs.insert(
+                    port.to_string(),
+                    vec![Connection::from_node(NodeId(prev as u32))],
+                );
+            }
+            nodes.push(gn);
+        }
+        AudioPatch {
+            seed: 7,
+            graph: crate::patch::NodeGraph {
+                nodes,
+                output: NodeId(n as u32 - 1),
+            },
+        }
+    }
+
+    /// The node boxes of `canvas` in the canvas's own coordinates, which is
+    /// what the state records and what the labels below are read in.
+    fn node_rects(canvas: &Canvas) -> Vec<(NodeId, Rect)> {
+        canvas.state.boxes.clone()
+    }
+
+    /// B5: a node box writes nothing over its own border, and nothing on it.
+    ///
+    /// Read from the text the frame painted, not from the AccessKit tree: a
+    /// slider's label is part of the slider, so it is not a node of its own
+    /// there, and it was exactly the text that overflowed — `Slider::text`
+    /// put "Freq (Hz)" to the right of the value, off the edge of a box
+    /// fixed at 210 units. A galley's bounding rect is its full extent
+    /// whatever the clip rect hid, so an overflow is visible here.
+    ///
+    /// The bar is the box's content area — the frame inside its own padding
+    /// — not the frame rect: "Cutoff (Hz)" did not cross the border, it ran
+    /// up to it, and its closing bracket merged with the line.
+    #[test]
+    fn every_label_in_a_node_box_lies_inside_it() {
+        let mut checked = 0;
+        for kind in NodeKind::defaults() {
+            let name = node_kind_label(&kind);
+            let canvas = Canvas::new(one_node(kind.clone()));
+            let boxes = canvas.painted_boxes();
+            assert_eq!(boxes.len(), 1, "{name}: one node box");
+            let node_box = boxes[0].rect;
+            let content = canvas.content_area(node_box);
+            let mut inside = 0;
+            for (text, rect) in canvas.painted_text_rects() {
+                if !node_box.contains(rect.min) {
+                    continue;
+                }
+                inside += 1;
+                assert!(
+                    content.contains_rect(rect),
+                    "{name}: {text:?} at {rect:?} is outside the content area \
+                     {content:?} of its box {node_box:?}"
+                );
+            }
+            assert!(
+                inside >= 2,
+                "{name}: only {inside} texts found in the box — the filter found \
+                 nothing to check"
+            );
+            checked += inside;
+        }
+        assert!(checked >= 40, "only {checked} texts were checked");
+    }
+
+    /// B5: a node's parameters read as two columns — every label at one
+    /// left edge, its control to the right — where `Slider::text` put the
+    /// label *after* the value, so the names ran down a ragged edge set by
+    /// how wide each value happened to be and ended 2 units from the
+    /// border.
+    ///
+    /// A grid's labels are `ui.label` calls, so they are the box's
+    /// `Role::Label` nodes; the port rows and the title are filtered out by
+    /// name.
+    #[test]
+    fn a_node_body_is_a_column_of_labels_and_a_column_of_controls() {
+        let mut checked = 0;
+        for kind in NodeKind::defaults() {
+            let name = node_kind_label(&kind);
+            let canvas = Canvas::new(one_node(kind.clone()));
+            let node_box = canvas.state.boxes[0].1;
+            let labels: Vec<(String, Rect)> = canvas
+                .labels_untransformed()
+                .into_iter()
+                .filter(|(t, r)| {
+                    node_box.contains(r.min)
+                        // The title row: the grip, the OUT badge.
+                        && !t.starts_with('#')
+                        && t != "OUT"
+                        // The "Inputs" heading and its port rows, which are
+                        // a list and not a grid.
+                        && !t.ends_with(':')
+                        && t != "Inputs"
+                })
+                .collect();
+            // Silence has no parameters, and says so.
+            if labels.len() < 2 {
+                continue;
+            }
+            let left = labels[0].1.left();
+            for (text, rect) in &labels {
+                assert!(
+                    (rect.left() - left).abs() < 1.0,
+                    "{name}: {text:?} starts at {} where the label column is at \
+                     {left}; labels {labels:?}",
+                    rect.left()
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked >= 30, "only {checked} labels were checked");
+    }
+
+    /// B5: a box writes its kind once. The title said "#0 Sawtooth" and the
+    /// combo directly under it said "Sawtooth" again — a third of the box's
+    /// first two rows spent saying the same word twice.
+    #[test]
+    fn a_node_box_names_its_kind_once() {
+        for kind in NodeKind::defaults() {
+            let name = node_kind_label(&kind);
+            let canvas = Canvas::new(one_node(kind.clone()));
+            let node_box = canvas.painted_boxes()[0].rect;
+            // The title row, found by the grip that sits on it. Further
+            // down a parameter may fairly carry the kind's own name —
+            // Gain's gain, Mix's gain — so only the title is counted.
+            let title_row = canvas.label("#0").y_range();
+            let said: Vec<String> = canvas
+                .painted_text_rects()
+                .into_iter()
+                .filter(|(t, r)| {
+                    node_box.contains(r.min) && title_row.contains(r.center().y) && t.contains(name)
+                })
+                .map(|(t, _)| t)
+                .collect();
+            assert_eq!(
+                said.len(),
+                1,
+                "{name} is written twice in its title: {said:?}"
+            );
+        }
+        // And the picker's own "Kind" caption, which cost a column of the
+        // title row to say what the row already showed, is gone with it.
+        let canvas = Canvas::new(one_node(NodeKind::Lfo(Default::default())));
+        assert!(
+            !canvas.painted_text().iter().any(|t| t == "Kind"),
+            "the kind picker still carries a separate caption"
+        );
+    }
+
+    /// B4: the boxes the canvas places itself never lie on one another.
+    ///
+    /// The old layout stacked a column on a fixed 190-unit pitch against
+    /// boxes of about 210 and more, so the starter patch opened with the
+    /// LFO's box over the sine's "amplitude" row.
+    #[test]
+    fn no_two_node_boxes_overlap_after_two_frames() {
+        let patches: [(&str, AudioPatch); 4] = [
+            ("three_node_patch", three_node_patch()),
+            ("sine_into_gain", sine_into_gain(false)),
+            ("seeded 9", seeded_size_patch(9)),
+            ("seeded 17", seeded_size_patch(17)),
+        ];
+        for (name, patch) in patches {
+            let canvas = Canvas::after(patch, 2);
+            let rects = node_rects(&canvas);
+            for (i, (a_id, a)) in rects.iter().enumerate() {
+                for (b_id, b) in &rects[i + 1..] {
+                    let overlap = a.intersect(*b);
+                    assert!(
+                        !overlap.is_positive(),
+                        "{name}: #{} {a:?} and #{} {b:?} overlap over {overlap:?}",
+                        a_id.0,
+                        b_id.0
+                    );
+                }
+            }
+        }
+    }
+
+    /// The measured layout settles: once the boxes have been drawn once,
+    /// a quiet frame moves nothing.
+    ///
+    /// A box that moves while a frame is being drawn is worse than untidy.
+    /// egui runs a frame a second time whenever something in it asks for
+    /// one — a `Grid` measuring its columns does, and every node body is a
+    /// grid — so a position changed at the end of a pass leaves a widget's
+    /// rect holding another widget's id on the next.
+    #[test]
+    fn the_measured_layout_settles_and_a_quiet_frame_moves_nothing() {
+        for (name, patch) in [
+            ("three_node_patch", three_node_patch()),
+            ("seeded 9", seeded_size_patch(9)),
+        ] {
+            let mut canvas = Canvas::after(patch, 2);
+            let settled = canvas.state.positions.clone();
+            for frame in 0..3 {
+                canvas.frame(Vec::new());
+                assert_eq!(
+                    canvas.state.positions, settled,
+                    "{name}: quiet frame {frame} moved a box"
+                );
+                assert!(
+                    !canvas.state.relayout,
+                    "{name}: quiet frame {frame} left a layout owed"
+                );
+            }
+        }
+    }
+
+    /// B3: a node is named by its kind wherever it is referred to — the
+    /// Output picker and the row of every wire into a port — not by a bare
+    /// number the user has to go and look up.
+    #[test]
+    fn the_output_picker_and_the_wire_rows_name_the_kind() {
+        let canvas = Canvas::new(three_node_patch());
+        let texts = canvas.painted_text();
+        assert!(
+            texts.iter().any(|t| t == "#2 Lowpass"),
+            "the Output picker does not name the output's kind; painted {texts:?}"
+        );
+        for row in ["from #0 Sine", "from #1 LFO"] {
+            assert!(
+                texts.iter().any(|t| t == row),
+                "no wire row reading {row:?}; painted {texts:?}"
+            );
+        }
+        assert!(
+            !texts.iter().any(|t| t.contains('\u{2B05}')),
+            "a wire row still points with an arrow instead of naming its source"
+        );
+    }
+
+    /// B10 / #1289: `on_hover_text` never fires on a disabled widget, so a
+    /// disabled Delete has to say why through `on_disabled_hover_text`.
+    /// Two reasons, because there are two ways to be disabled.
+    #[test]
+    fn a_disabled_delete_says_why_where_egui_will_show_it() {
+        // Nothing selected, three nodes: "select something first".
+        let mut canvas = Canvas::new(three_node_patch());
+        assert!(canvas.state.selected.is_none(), "nothing is selected yet");
+        let reason = hover_text_over(&mut canvas, "Delete");
+        assert!(
+            reason.iter().any(|t| t.contains("Select a node")),
+            "a disabled Delete with nothing selected says {reason:?}"
+        );
+
+        // One node, and it is selected: the patch may not go empty.
+        let mut canvas = Canvas::new(one_node(NodeKind::Sine(SineOsc::default())));
+        canvas.state.selected = Some(NodeId(0));
+        canvas.frame(Vec::new());
+        let reason = hover_text_over(&mut canvas, "Delete");
+        assert!(
+            reason.iter().any(|t| t.contains("at least one node")),
+            "a disabled Delete on a one-node patch says {reason:?}"
+        );
+    }
+
+    /// Hold the pointer over the toolbar button labelled `button` and
+    /// return the text that appeared. The toolbar is drawn in the base
+    /// layer, so its AccessKit rect is already a screen rect.
+    fn hover_text_over(canvas: &mut Canvas, button: &str) -> Vec<String> {
+        let at = canvas.chrome_rect(accesskit::Role::Button, button).center();
+        canvas.hover_text_at(at)
+    }
+
+    /// B8: which node the patch plays and which node is selected were one
+    /// border in two colours, so the output stopped saying so the moment it
+    /// was clicked. They are two marks now and a node can wear both.
+    #[test]
+    fn the_output_wears_a_badge_and_the_selection_is_a_thicker_stroke() {
+        let mut canvas = Canvas::new(three_node_patch());
+        assert_eq!(
+            canvas.painted_text().iter().filter(|t| *t == "OUT").count(),
+            1,
+            "exactly one box is badged as the output"
+        );
+
+        // Select the output itself: both marks are on it at once.
+        canvas.state.selected = Some(canvas.patch.graph.output);
+        canvas.frame(Vec::new());
+        assert_eq!(
+            canvas.painted_text().iter().filter(|t| *t == "OUT").count(),
+            1,
+            "the badge survives being selected"
+        );
+        let style = canvas.style();
+        let widths: Vec<f32> = canvas
+            .painted_boxes()
+            .iter()
+            .map(|r| r.stroke.width)
+            .collect();
+        let selected = canvas
+            .state
+            .boxes
+            .iter()
+            .position(|(id, _)| Some(*id) == canvas.state.selected)
+            .expect("the selected box is drawn");
+        for (i, w) in widths.iter().enumerate() {
+            if i == selected {
+                assert!(
+                    *w > widths
+                        .iter()
+                        .enumerate()
+                        .filter(|(j, _)| *j != selected)
+                        .map(|(_, w)| *w)
+                        .fold(0.0, f32::max),
+                    "the selected box's edge is not the thickest: {widths:?}"
+                );
+            }
+        }
+        assert_eq!(
+            canvas.painted_boxes()[selected].stroke.color,
+            style.node_selected,
+            "the selected box's edge is the style's selection colour"
+        );
+    }
+
+    /// B9: one row of chrome above the canvas, not four. The genetics
+    /// controls and the JSON box moved into its More menu.
+    #[test]
+    fn the_toolbar_is_one_row() {
+        let canvas = Canvas::new(three_node_patch());
+        let rows: Vec<Rect> = ["Add node", "Delete", "Tidy", "Fit view", "More"]
+            .into_iter()
+            .map(|b| canvas.chrome_rect(accesskit::Role::Button, b))
+            .collect();
+        let first = rows[0];
+        for (name, rect) in ["Add node", "Delete", "Tidy", "Fit view", "More"]
+            .into_iter()
+            .zip(&rows)
+        {
+            assert!(
+                (rect.center().y - first.center().y).abs() < 1.0,
+                "{name} is not on the toolbar's one row: {rect:?} against {first:?}"
+            );
+        }
+        let buttons = canvas.buttons();
+        // The per-node Mutate button stays in each box; these are the
+        // front row's.
+        for gone in ["Copy JSON", "Load current", "Apply", "Reroll seed"] {
+            assert!(
+                !buttons.iter().any(|l| l == gone),
+                "{gone:?} is still on the front row; buttons: {buttons:?}"
+            );
+        }
+    }
+
+    /// B9, and the trap in it: putting the validity readout at the right
+    /// of the row must not put it *over* the row.
+    ///
+    /// A right-to-left layout takes whatever width is left however little
+    /// that is, so on the sequence editor's side panel — about 480 points
+    /// — the line drew straight across the Output picker and the More
+    /// button. The picture showed it; no test did.
+    #[test]
+    fn the_toolbar_never_draws_the_validity_line_over_itself() {
+        for width in [480.0, 560.0, 720.0, 1000.0] {
+            let canvas = Canvas::narrow(three_node_patch(), width);
+            let chip = canvas
+                .painted_text_rects()
+                .into_iter()
+                .find(|(t, _)| t.starts_with('\u{2714}'))
+                .map(|(_, r)| r)
+                .expect("the validity line");
+            for button in ["Add node", "Delete", "Tidy", "Fit view", "More"] {
+                let rect = canvas.chrome_rect(accesskit::Role::Button, button);
+                assert!(
+                    !chip.intersects(rect),
+                    "at {width}: the validity line {chip:?} covers {button} {rect:?}"
+                );
+            }
+            let output = canvas
+                .painted_text_rects()
+                .into_iter()
+                .find(|(t, _)| t == "#2 Lowpass")
+                .map(|(_, r)| r)
+                .expect("the Output picker");
+            assert!(
+                !chip.intersects(output),
+                "at {width}: the validity line {chip:?} covers the Output picker {output:?}"
+            );
+        }
+    }
+
+    /// B16: the canvas has an edge and a grid, so there is something to see
+    /// that it pans and how far it has been panned.
+    #[test]
+    fn the_canvas_has_an_edge_and_a_grid_in_the_styles_colours() {
+        let s = distinct_style();
+        let canvas = Canvas::new(three_node_patch());
+        let painted = colours(&canvas.out);
+        assert!(
+            painted.contains(&s.canvas_edge),
+            "no edge around the canvas"
+        );
+        assert!(painted.contains(&s.canvas_grid), "no grid on the canvas");
+    }
+
+    /// B16: what a constant does to a port is said where it is offered, not
+    /// left for the reader to guess from "+ const".
+    #[test]
+    fn add_constant_says_what_a_constant_does_to_the_port() {
+        let mut canvas = Canvas::new(sine_into_gain(false));
+        // The "Add constant" button on the gain port's own row — there is
+        // one per port, so it is found by the row it shares.
+        let row = canvas.label("gain:");
+        let at = canvas
+            .chrome(accesskit::Role::Button)
+            .into_iter()
+            .filter(|(text, _)| text == "Add constant")
+            .map(|(_, rect)| canvas.to_screen() * rect)
+            .find(|rect| beside(rect.center(), row))
+            .expect("an Add constant button on the gain row")
+            .center();
+        let shown = canvas.hover_text_at(at);
+        assert!(
+            shown
+                .iter()
+                .any(|t| t.contains("fixed value") && t.contains("gain")),
+            "hovering Add constant on the gain port says {shown:?}"
+        );
     }
 }

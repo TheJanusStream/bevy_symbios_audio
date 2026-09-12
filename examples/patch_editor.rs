@@ -1,6 +1,6 @@
 //! `patch_editor` — interactive visual editor for an [`AudioPatch`].
 //!
-//! A pannable / zoomable node-graph canvas (Phase 2): drag node title bars to
+//! A pannable / zoomable node-graph canvas (Phase 2): drag node numbers to
 //! move them, drag from a node's output dot (right edge) onto another node's
 //! input dot (left edge) to wire them, edit each node's parameters in place,
 //! and use the toolbar to add / delete nodes and choose the graph output. The
