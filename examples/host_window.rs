@@ -144,14 +144,14 @@ use bevy_egui::{
 };
 
 use bevy_symbios_audio::{
-    AdsrEnvelope, AudioPatch, BiquadLowpass, BrownNoise, Connection, Gate, GraphNode, Instrument,
-    Lfo, LfoShape, NodeGraph, NodeId, NodeKind, PinkNoise, SawtoothOsc, SequenceRecipe, SineOsc,
-    Track, TriangleOsc,
+    AdsrEnvelope, AudioPatch, BiquadLowpass, BrownNoise, Connection, Envelope, Gate, GraphNode,
+    Instrument, Lfo, LfoShape, NodeGraph, NodeId, NodeKind, PinkNoise, SawtoothOsc, SequenceRecipe,
+    SineOsc, Track, TriangleOsc,
     sequence::Event,
     ui::{
-        AudioEditorPlugin, AudioMonitor, AuditionSource, AuditionState, MonitorRequest,
-        MonitorStatus, PatchEditorState, SequenceEditorState, active_instrument_canvas,
-        audio_patch_canvas, audition_strip, sequence_recipe_editor,
+        AudioEditorPlugin, AudioMonitor, AuditionSource, AuditionState, EditorLimits,
+        MonitorRequest, MonitorStatus, PatchEditorState, SequenceEditorState,
+        active_instrument_canvas, audio_patch_canvas, audition_strip, sequence_recipe_editor,
     },
 };
 
@@ -227,6 +227,8 @@ fn main() -> AppExit {
         .init_resource::<Hoverer>()
         .init_resource::<Menuer>()
         .init_resource::<Noter>()
+        .init_resource::<Asker>()
+        .init_resource::<Parker>()
         .add_systems(Startup, setup_camera)
         .add_systems(
             PreUpdate,
@@ -236,6 +238,8 @@ fn main() -> AppExit {
                 hover_a_wire,
                 open_a_menu,
                 work_the_timeline,
+                ask_to_remove_a_track,
+                park_on_a_widget,
             )
                 .after(EguiPreUpdateSet::ProcessInput)
                 .before(EguiPreUpdateSet::BeginPass),
@@ -254,7 +258,8 @@ fn main() -> AppExit {
 }
 
 /// The command line: `--light`, `--orphan`, `--rename <name>`, `--drag`,
-/// `--wire`, `--menu <which>`, `--broken`, `--status <state>` and
+/// `--wire`, `--menu <which>`, `--notes <what>`, `--limits`, `--confirm`,
+/// `--beyond`, `--hover <label>`, `--broken`, `--status <state>` and
 /// `--shot <path>`.
 #[derive(Resource)]
 struct Args {
@@ -268,6 +273,17 @@ struct Args {
     unheard: bool,
     menu: Option<Menu>,
     notes: Option<Notes>,
+    /// `--limits`: hold both slots to caps the seeded content already
+    /// fills, so every Add is disabled and every readout is at its number.
+    limits: bool,
+    /// `--confirm`: press a track's gutter cross and leave the question up.
+    confirm: bool,
+    /// `--beyond`: put a value outside its slider's track into the patch
+    /// slot, which is what an editor that never rewrites one looks like.
+    beyond: bool,
+    /// `--hover <label>`: park the pointer on the widget whose label starts
+    /// with this, so its tooltip is in the picture.
+    hover: Option<String>,
     broken: bool,
     status: Option<Status>,
     shot: Option<String>,
@@ -376,6 +392,10 @@ impl Args {
             unheard: args.iter().any(|a| a == "--unheard"),
             menu: value("--menu", "add").as_deref().map(Menu::parse),
             notes: value("--notes", "picked").as_deref().map(Notes::parse),
+            limits: args.iter().any(|a| a == "--limits"),
+            confirm: args.iter().any(|a| a == "--confirm"),
+            beyond: args.iter().any(|a| a == "--beyond"),
+            hover: value("--hover", "Add track"),
             broken: args.iter().any(|a| a == "--broken") || status == Some(Status::Error),
             status,
             shot,
@@ -391,6 +411,8 @@ impl Args {
             || self.wire
             || self.menu.is_some()
             || self.notes.is_some()
+            || self.confirm
+            || self.hover.is_some()
     }
 
     /// Whether the gesture this run asked for is in place, so `--shot` can
@@ -401,6 +423,8 @@ impl Args {
             && (!self.wire || matches!(*gestures.hoverer, Hoverer::Parked(_)))
             && (self.menu.is_none() || matches!(*gestures.menuer, Menuer::Open(_)))
             && (self.notes.is_none() || matches!(*gestures.noter, Noter::Done(_)))
+            && (!self.confirm || matches!(*gestures.asker, Asker::Asked))
+            && (self.hover.is_none() || matches!(*gestures.parker, Parker::Parked(_)))
     }
 }
 
@@ -412,7 +436,44 @@ struct Gestures<'w> {
     hoverer: Res<'w, Hoverer>,
     menuer: Res<'w, Menuer>,
     noter: Res<'w, Noter>,
+    asker: Res<'w, Asker>,
+    parker: Res<'w, Parker>,
 }
+
+/// `--confirm`: where the gesture that asks to remove a track has got to.
+#[derive(Resource, Default, Clone, Copy, PartialEq, Eq, Debug)]
+enum Asker {
+    #[default]
+    Finding,
+    /// Pressed the cross; the question comes up on the next frame.
+    Pressed,
+    /// The question is up and the pointer is parked off every control.
+    Asked,
+}
+
+/// `--hover`: where the gesture that parks the pointer on a widget has got
+/// to.
+#[derive(Resource, Default, Clone, Copy, PartialEq, Debug)]
+enum Parker {
+    #[default]
+    Finding,
+    /// On the widget, holding still while egui's tooltip delay runs out.
+    Waiting(egui::Pos2, u32),
+    /// Held still long enough that the tooltip is up.
+    Parked(egui::Pos2),
+}
+
+/// Frames the pointer is held on a widget before its hover is counted as
+/// shown.
+///
+/// egui's `interaction.tooltip_delay` is half a second, so a picture taken
+/// on the frame the pointer arrives is a picture of no tooltip — which is
+/// what the first run of `--hover` produced.
+const HOVER_FRAMES: u32 = 48;
+
+/// Frames the parked position is re-sent before the pointer is left alone,
+/// so it lands even if the real cursor is still being fed in.
+const SETTLE_MOVES: u32 = 4;
 
 /// The toolbar button that adds a node, by the label it wears: the harness
 /// finds it in the AccessKit tree, and the canvas's own tests look for the
@@ -455,6 +516,22 @@ impl Editor {
             orphan_the_pluck(&mut recipe);
             sequence_state.set_selected_event(Some((ORPHAN_TRACK, 0)));
         }
+        let mut patch_state = PatchEditorState::default();
+        if args.limits {
+            // The seeded recipe's own size, so every cap is reached by
+            // what the picture already shows rather than by a wall of
+            // filler: five instruments, five tracks, and the open
+            // instrument's three nodes.
+            let caps = EditorLimits::from_envelope(Envelope {
+                max_instruments: recipe.instruments.len(),
+                max_tracks: recipe.tracks.len(),
+                max_nodes: 3,
+                max_track_events: 4,
+                ..Envelope::default()
+            });
+            sequence_state.set_limits(caps);
+            patch_state.set_limits(caps);
+        }
         Self {
             patch: match () {
                 _ if args.broken => looped_drone_patch(),
@@ -466,9 +543,10 @@ impl Editor {
                     patch.graph.output = NodeId(0);
                     patch
                 }
+                _ if args.beyond => beyond_the_track_patch(),
                 _ => filtered_drone_patch(),
             },
-            patch_state: PatchEditorState::default(),
+            patch_state,
             patch_audition: AuditionState::default(),
             patch_committed: false,
             recipe,
@@ -1186,6 +1264,129 @@ enum Menuer {
 /// and not so far as to be over an item it might look chosen.
 const MENU_PARK: egui::Vec2 = egui::vec2(12.0, 14.0);
 
+/// `--confirm`: press a track's gutter cross so the question it now asks is
+/// in the picture, and park the pointer clear of everything.
+///
+/// The cross is painted geometry, not a widget: its rect comes from
+/// [`SequenceEditorState::removal_asks`], the same list the geometry test
+/// measures the question against. Working it out again from the lane pitch
+/// and the gutter width would be a second answer waiting to disagree
+/// (crate #67).
+fn ask_to_remove_a_track(
+    args: Res<Args>,
+    editor: Res<Editor>,
+    monitor: Res<AudioMonitor>,
+    mut asker: ResMut<Asker>,
+    mut settle: Local<Settle>,
+    mut contexts: Query<&mut EguiInput, With<PrimaryEguiContext>>,
+) {
+    if !args.confirm {
+        return;
+    }
+    let Ok(mut input) = contexts.single_mut() else {
+        return;
+    };
+    match *asker {
+        Asker::Asked => return,
+        Asker::Pressed => {
+            // Off every control, so nothing in the picture is drawn hovered
+            // and no hover text covers the question.
+            if let Some(window) = editor.shown[1] {
+                input
+                    .0
+                    .events
+                    .push(egui::Event::PointerMoved(window.right_bottom()));
+            }
+            info!("--confirm: the question is up");
+            *asker = Asker::Asked;
+            return;
+        }
+        Asker::Finding => {}
+    }
+    if editor.shown[1].is_none() || !layout_is_final(&args, &editor, &monitor) {
+        return;
+    }
+    // The first track's cross. The instrument rows are published first, so
+    // the tracks start after them.
+    let rows = editor.recipe.instruments.len();
+    let Some(cross) = editor.sequence_state.removal_asks().get(rows).copied() else {
+        return;
+    };
+    let Some(points) = settle.settled(vec![cross.center()]) else {
+        return;
+    };
+    info!("--confirm: pressing track 1's cross at {:?}", points[0]);
+    input.0.events.push(egui::Event::PointerMoved(points[0]));
+    press_at(&mut input, points[0], egui::PointerButton::Primary);
+    release_at(&mut input, points[0], egui::PointerButton::Primary);
+    *asker = Asker::Pressed;
+}
+
+/// `--hover <label>`: park the pointer on the widget whose label starts
+/// with that, so egui's tooltip delay runs out and the hover is in the
+/// picture.
+///
+/// The reason a disabled control gives is only ever shown on hover (#1289),
+/// so a picture of a refusal is a picture of a hover or it is a picture of
+/// a grey button and nothing else.
+fn park_on_a_widget(
+    args: Res<Args>,
+    editor: Res<Editor>,
+    monitor: Res<AudioMonitor>,
+    mut parker: ResMut<Parker>,
+    mut settle: Local<Settle>,
+    mut contexts: Query<(&mut EguiInput, &EguiOutput), With<PrimaryEguiContext>>,
+) {
+    let Some(label) = args.hover.as_deref() else {
+        return;
+    };
+    let Ok((mut input, output)) = contexts.single_mut() else {
+        return;
+    };
+    match *parker {
+        // Nothing more is sent: the pointer is where it was put, and
+        // saying so again would restart egui's movement clock and close
+        // the tooltip this gesture exists to photograph.
+        Parker::Parked(_) => return,
+        Parker::Waiting(at, held) => {
+            // Sent for the first few frames only, and then the pointer is
+            // left alone. egui stamps its movement clock on *every*
+            // `PointerMoved`, whether or not the position changed
+            // (`InputState`), and holds a tooltip back until the pointer
+            // has been still for `tooltip_delay` — so a position re-sent
+            // every frame is a pointer that never rests and a hover that
+            // never opens. The first run of this parked perfectly and
+            // photographed no tooltip at all.
+            if held < SETTLE_MOVES {
+                input.0.events.push(egui::Event::PointerMoved(at));
+            }
+            *parker = if held >= HOVER_FRAMES {
+                info!("--hover {label:?}: its hover has had time to open");
+                Parker::Parked(at)
+            } else {
+                Parker::Waiting(at, held + 1)
+            };
+            return;
+        }
+        Parker::Finding => {}
+    }
+    if !layout_is_final(&args, &editor, &monitor) {
+        return;
+    }
+    // Whatever role it wears: the marker beside an out-of-track slider is a
+    // label, not a button.
+    let found = accesskit_bounds(output, &|n| n.label().is_some_and(|l| l.starts_with(label)));
+    let Some(rect) = found.first().copied() else {
+        return;
+    };
+    let Some(points) = settle.settled(vec![rect.center()]) else {
+        return;
+    };
+    info!("--hover {label:?}: parking on it at {:?}", points[0]);
+    input.0.events.push(egui::Event::PointerMoved(points[0]));
+    *parker = Parker::Waiting(points[0], 0);
+}
+
 /// `--menu`: open a menu and hold it open for the picture.
 ///
 /// egui closes a menu on a click outside it, and bevy_egui feeds the real
@@ -1605,6 +1806,25 @@ fn shoot(
 
 /// Sawtooth into a lowpass with an LFO on the cutoff: a wired patch for the
 /// patch slot.
+/// The drone holding values the record allows and the sliders' tracks do
+/// not: an amplitude of 2.5 against a 0-1 track, a Q of 40 against 0.1-20.
+///
+/// What #1336 B11 is about. egui's default clamping rewrote both by drawing
+/// them, with no `changed` flag, and the next commit wrote the loss into the
+/// record; the editor now shows them as they are and marks the ones that
+/// are off their track.
+fn beyond_the_track_patch() -> AudioPatch {
+    let mut patch = filtered_drone_patch();
+    for node in &mut patch.graph.nodes {
+        match &mut node.kind {
+            NodeKind::Sawtooth(c) => c.amplitude = 2.5,
+            NodeKind::BiquadLowpass(c) => c.q = 40.0,
+            _ => {}
+        }
+    }
+    patch
+}
+
 fn filtered_drone_patch() -> AudioPatch {
     let saw = NodeId(0);
     let lfo = NodeId(1);

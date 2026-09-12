@@ -110,9 +110,11 @@ use super::EditorResponse;
 use super::evolve::{fresh_rng, mutate_node_kind, mutate_patch, randomize_seed};
 use super::history::EditHistory;
 use super::io::json_io;
+use super::limits::{Cap, CapState, EditorLimits, cap_readout};
 use super::node::{
     default_kind_for, kinds_by_group, node_kind_body, node_kind_label, node_kind_picker,
 };
+use super::ranged_slider;
 use super::style::{EditorStyle, editor_style};
 
 /// The narrowest a node box is laid out at. A box whose content needs more
@@ -203,6 +205,11 @@ pub struct PatchEditorState {
     wires: Vec<WireGeom>,
     /// The wire the user picked, while the canvas still draws it.
     selected_wire: Option<WireRef>,
+    /// The caps this canvas holds its patch to — nodes, and connections
+    /// into one port. [`EditorLimits::default`] is symbios-audio's own
+    /// envelope, which is what the record boundary enforces anyway (#63,
+    /// Overlands #1336 C8).
+    limits: EditorLimits,
     /// An open Add menu: where it was asked for, and the wire it would
     /// complete.
     add_menu: Option<AddMenu>,
@@ -248,6 +255,7 @@ impl Default for PatchEditorState {
             wires: Vec::new(),
             selected_wire: None,
             add_menu: None,
+            limits: EditorLimits::default(),
         }
     }
 }
@@ -544,6 +552,20 @@ impl PatchEditorState {
     /// history belongs to the recipe.
     pub fn note_external_change(&mut self, patch: &AudioPatch) {
         self.history.commit(patch);
+    }
+
+    /// The caps this canvas holds its patch to.
+    pub fn limits(&self) -> &EditorLimits {
+        &self.limits
+    }
+
+    /// Hold this canvas to `limits` instead of the record boundary's own
+    /// envelope.
+    ///
+    /// A canvas embedded in a sequence editor is given the recipe's, by
+    /// [`crate::ui::SequenceEditorState::set_limits`].
+    pub fn set_limits(&mut self, limits: EditorLimits) {
+        self.limits = limits;
     }
 
     /// Whether the canvas took this frame's keyboard — the pointer was over
@@ -884,7 +906,14 @@ fn add_node(
     label: &str,
     at: Pos2,
     from: Option<NodeId>,
-) -> NodeId {
+) -> Option<NodeId> {
+    // The last word on the node cap, under every door that adds one: the
+    // toolbar's menu, the canvas's right-click menu, and a wire dropped on
+    // empty canvas. Each is disabled at the cap, but an `Action` is a frame
+    // old by the time it lands here.
+    if !node_room(patch, state).has_room() {
+        return None;
+    }
     let new_id = NodeId(
         patch
             .graph
@@ -917,7 +946,21 @@ fn add_node(
     state.positions.insert(new_id, at);
     state.selected = Some(new_id);
     state.selected_wire = None;
-    new_id
+    Some(new_id)
+}
+
+/// The node cap against what this patch holds — the one question the Add
+/// menu, the readout and [`add_node`] all ask.
+fn node_room(patch: &AudioPatch, state: &PatchEditorState) -> CapState {
+    state.limits.at(Cap::Nodes, patch.graph.nodes.len())
+}
+
+/// The per-port connection cap against what `port` on `node` holds.
+fn port_room(limits: &EditorLimits, node: &GraphNode, port: &str) -> CapState {
+    limits.at(
+        Cap::ConnectionsPerPort,
+        node.inputs.get(port).map_or(0, Vec::len),
+    )
 }
 
 /// Deferred structural edit, applied after the node-drawing loop releases its
@@ -1185,6 +1228,9 @@ fn duplicate_node(
     state: &mut PatchEditorState,
     target: NodeId,
 ) -> Option<NodeId> {
+    if !node_room(patch, state).has_room() {
+        return None;
+    }
     let source = patch.graph.nodes.iter().find(|n| n.id == target)?;
     let new_id = NodeId(
         patch
@@ -1264,6 +1310,20 @@ fn toolbar(
     // The check and the cross are Overlands' `affordances::CHECK` and
     // `CROSS`, its glyphs for valid and failed.
     let heard = heard_nodes(&patch.graph).len();
+    // The node count's one home. The row below has no width to spare for
+    // a `3 / 256` of its own — at the sequence editor's panel width it
+    // pushed More onto a second line, which is the two rows of chrome #59
+    // removed — and this line is already counting the nodes. So the cap
+    // joins the count that is here, once the count is close enough to it
+    // to be worth reading.
+    let room = node_room(patch, state);
+    let counted = |n: usize| {
+        if room.tone() == super::CapTone::Quiet {
+            n.to_string()
+        } else {
+            format!("{n} / {}", room.limit)
+        }
+    };
     let (colour, line) = match topo_sort(&patch.graph) {
         // What is there, and what of it the patch plays: "3 nodes" is true
         // of a patch where two of them bake into nothing (#61, Overlands
@@ -1274,14 +1334,14 @@ fn toolbar(
             style.ok,
             format!(
                 "\u{2714} valid graph \u{2014} {} nodes, all heard",
-                order.len()
+                counted(order.len())
             ),
         ),
         Ok(order) => (
             style.ok,
             format!(
                 "\u{2714} valid graph \u{2014} {} nodes, {heard} heard",
-                order.len()
+                counted(order.len())
             ),
         ),
         // Named, and outlined on the canvas below (#57).
@@ -1307,17 +1367,23 @@ fn toolbar(
         // Sine dropped in the middle of the view followed by a trip to the
         // title's kind combo (#61, Overlands #1334 B6).
         let mut chosen = None;
-        ui.menu_button("Add node", |ui| {
-            chosen = add_menu_items(ui);
-        })
-        .response
-        .on_hover_text("Put a new node in the middle of the view");
+        ui.add_enabled_ui(room.has_room(), |ui| {
+            ui.menu_button("Add node", |ui| {
+                chosen = add_menu_items(ui);
+            })
+            .response
+            .on_hover_text("Put a new node in the middle of the view")
+            // A disabled widget never shows `on_hover_text` (#1289), so the
+            // reason has to be the disabled one or it is nowhere.
+            .on_disabled_hover_text(room.full_reason());
+        });
         if let Some(label) = chosen {
             // Near the centre of the current view so it is visible, and out
             // of `auto`: the user put it there.
-            add_node(patch, state, label, state.scene_rect.center(), None);
-            res.changed = true;
-            res.rebake = true;
+            if add_node(patch, state, label, state.scene_rect.center(), None).is_some() {
+                res.changed = true;
+                res.rebake = true;
+            }
         }
 
         // Delete acts on whatever is picked — a node, or since #61 a wire —
@@ -1446,7 +1512,7 @@ fn more_menu(
             res.changed = true;
             res.rebake = true;
         }
-        ui.add(egui::Slider::new(&mut state.mutate_rate, 0.0..=1.0).text("rate"));
+        ranged_slider(ui, &mut state.mutate_rate, 0.0..=1.0, |s| s.text("rate"));
         if ui
             .button("Reroll seed")
             .on_hover_text(format!(
@@ -1481,6 +1547,7 @@ fn canvas_contents(
 ) -> EditorResponse {
     let mut res = EditorResponse::NONE;
     let mut actions: Vec<Action> = Vec::new();
+    let limits = state.limits;
 
     paint_grid(ui, style);
 
@@ -1642,7 +1709,7 @@ fn canvas_contents(
             });
             rule(ui, &mut rules);
             res.merge(node_kind_body(ui, &mut node.kind));
-            let (conn_res, rows) = connection_editor(ui, node, &names, &mut rules);
+            let (conn_res, rows) = connection_editor(ui, node, &names, &mut rules, &limits);
             res.merge(conn_res);
             (title_row.response.rect, rows)
         });
@@ -1926,6 +1993,7 @@ fn canvas_contents(
     // being dragged — a right-click on a node opens that node's own menu.
     if free_pointer.is_some()
         && hovered.is_none()
+        && node_room(patch, state).has_room()
         && ui.input(|i| i.pointer.secondary_clicked())
         && let Some(at) = free_pointer
     {
@@ -1970,6 +2038,10 @@ fn canvas_contents(
                 match drop_target(&state.ports, &state.boxes, from, at) {
                     Some(target) => {
                         if let Some(n) = patch.graph.nodes.iter_mut().find(|n| n.id == target.node)
+                            // A port sums its connections, so a 65th would be
+                            // deleted by the sanitiser rather than heard. The
+                            // wire simply does not land.
+                            && port_room(&limits, n, &target.port).has_room()
                         {
                             n.inputs
                                 .entry(target.port.clone())
@@ -2001,6 +2073,24 @@ fn canvas_contents(
             Action::RerouteWire { wire, from, at } => {
                 let target = drop_target(&state.ports, &state.boxes, from, at)
                     .map(|t| (t.node, t.port.clone()));
+                // Asked *before* the wire leaves its old port: this arm
+                // drops a wire let go over nothing, so a reroute onto a
+                // full port would otherwise delete it rather than refuse
+                // it. A reroute onto the port it is already on is not a
+                // new connection, so it is not held to the cap.
+                let refused = target.as_ref().is_some_and(|(node, port)| {
+                    let same_port = wire.to == *node && wire.port == *port;
+                    !same_port
+                        && patch
+                            .graph
+                            .nodes
+                            .iter()
+                            .find(|n| n.id == *node)
+                            .is_some_and(|n| !port_room(&limits, n, port).has_room())
+                });
+                if refused {
+                    continue;
+                }
                 // Off its old port either way: dropped on a port it moves
                 // there, dropped on nothing it is gone.
                 let amount = remove_wire_amount(patch, &wire);
@@ -2019,9 +2109,10 @@ fn canvas_contents(
                 }
             }
             Action::AddNode { label, at, from } => {
-                add_node(patch, state, label, at, from);
-                res.changed = true;
-                res.rebake = true;
+                if add_node(patch, state, label, at, from).is_some() {
+                    res.changed = true;
+                    res.rebake = true;
+                }
             }
             Action::MutateNode(nid) => {
                 if let Some(n) = patch.graph.nodes.iter_mut().find(|n| n.id == nid) {
@@ -2363,6 +2454,7 @@ fn connection_editor(
     node: &mut GraphNode,
     names: &HashMap<NodeId, String>,
     rules: &mut Vec<f32>,
+    limits: &EditorLimits,
 ) -> (EditorResponse, Vec<PortRow>) {
     let mut res = EditorResponse::NONE;
     let mut rows = Vec::new();
@@ -2389,17 +2481,26 @@ fn connection_editor(
     let mut to_add_const: Vec<String> = Vec::new();
 
     for port in &ports {
+        let room = port_room(limits, node, port);
         let name_row = ui
             .horizontal(|ui| {
                 ui.label(format!("{port}:"));
                 if ui
-                    .small_button("Add constant")
+                    .add_enabled(room.has_room(), egui::Button::new("Add constant").small())
                     .on_hover_text(format!("Drive {port} with a fixed value instead of a wire"))
+                    .on_disabled_hover_text(room.full_reason())
                     .clicked()
                 {
                     to_add_const.push(port.clone());
                     res.changed = true;
                     res.rebake = true;
+                }
+                // Only once it is worth reading: a port holds one signal
+                // and a handful of modulators, so `0 / 64` on every row of
+                // every box would be noise on the one surface #1332 spent
+                // a whole step making quiet.
+                if room.tone() != super::CapTone::Quiet {
+                    cap_readout(ui, room, &editor_style(ui));
                 }
             })
             .response
@@ -2549,6 +2650,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+
+    use crate::Envelope;
 
     fn node(id: u32, kind: NodeKind) -> GraphNode {
         GraphNode {
@@ -4098,21 +4201,57 @@ mod tests {
     /// controls and the JSON box moved into its More menu.
     #[test]
     fn the_toolbar_is_one_row() {
-        let canvas = Canvas::new(three_node_patch());
-        let rows: Vec<Rect> = ["Add node", "Delete", "Tidy", "Fit view", "More"]
-            .into_iter()
-            .map(|b| canvas.chrome_rect(accesskit::Role::Button, b))
-            .collect();
-        let first = rows[0];
-        for (name, rect) in ["Add node", "Delete", "Tidy", "Fit view", "More"]
-            .into_iter()
-            .zip(&rows)
-        {
-            assert!(
-                (rect.center().y - first.center().y).abs() < 1.0,
-                "{name} is not on the toolbar's one row: {rect:?} against {first:?}"
-            );
+        // At every width it is given, not just a roomy one. This test
+        // watched a `3 / 256` beside Add node push More onto a second line
+        // at the sequence editor's panel width and said nothing, because
+        // it only ever ran on a 1600-point screen — the widths the
+        // validity-line test uses are the ones that wrap (#63).
+        // At the cap too: that is when a count grows a `/ 256` and a row
+        // that fitted stops fitting, which is the moment the user most
+        // needs to see the whole row.
+        let at_cap = |width: f32| {
+            let ctx = egui::Context::default();
+            set_editor_style(&ctx, distinct_style());
+            let mut canvas = Canvas::on_for(ctx, three_node_patch(), 0);
+            canvas.screen = Vec2::new(width, 800.0);
+            canvas
+                .state
+                .set_limits(EditorLimits::from_envelope(Envelope {
+                    max_nodes: 3,
+                    ..Envelope::default()
+                }));
+            for _ in 0..3 {
+                canvas.frame(Vec::new());
+            }
+            canvas
+        };
+        for canvas in [
+            Canvas::new(three_node_patch()),
+            Canvas::narrow(three_node_patch(), 480.0),
+            Canvas::narrow(three_node_patch(), 560.0),
+            Canvas::narrow(three_node_patch(), 720.0),
+            at_cap(480.0),
+            at_cap(560.0),
+            at_cap(720.0),
+        ] {
+            let rows: Vec<Rect> = ["Add node", "Delete", "Tidy", "Fit view", "More"]
+                .into_iter()
+                .map(|b| canvas.chrome_rect(accesskit::Role::Button, b))
+                .collect();
+            let first = rows[0];
+            for (name, rect) in ["Add node", "Delete", "Tidy", "Fit view", "More"]
+                .into_iter()
+                .zip(&rows)
+            {
+                assert!(
+                    (rect.center().y - first.center().y).abs() < 1.0,
+                    "{name} is not on the toolbar's one row at width {}: {rect:?} \
+                     against {first:?}",
+                    canvas.screen.x
+                );
+            }
         }
+        let canvas = Canvas::new(three_node_patch());
         let buttons = canvas.buttons();
         // Every one of these is now a menu item — the genetics controls
         // and the JSON box under More, the per-node Mutate in a node's own
@@ -4140,8 +4279,30 @@ mod tests {
     /// button. The picture showed it; no test did.
     #[test]
     fn the_toolbar_never_draws_the_validity_line_over_itself() {
-        for width in [480.0, 560.0, 720.0, 1000.0] {
-            let canvas = Canvas::narrow(three_node_patch(), width);
+        for (width, cap) in [
+            (480.0, 256),
+            (560.0, 256),
+            (720.0, 256),
+            (1000.0, 256),
+            // At the cap the line grows a `/ 3`, and it is right-aligned:
+            // whatever it grows by it takes off the buttons' share.
+            (480.0, 3),
+            (560.0, 3),
+            (720.0, 3),
+        ] {
+            let ctx = egui::Context::default();
+            set_editor_style(&ctx, distinct_style());
+            let mut canvas = Canvas::on_for(ctx, three_node_patch(), 0);
+            canvas.screen = Vec2::new(width, 800.0);
+            canvas
+                .state
+                .set_limits(EditorLimits::from_envelope(Envelope {
+                    max_nodes: cap,
+                    ..Envelope::default()
+                }));
+            for _ in 0..3 {
+                canvas.frame(Vec::new());
+            }
             let chip = canvas
                 .painted_text_rects()
                 .into_iter()
@@ -5181,5 +5342,254 @@ mod tests {
             Some(1),
             "the new node's first input was not wired from the drag"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // Limits and validation (#63, Overlands #1336 C8)
+    // -----------------------------------------------------------------
+
+    /// A canvas held to `limits`, settled.
+    fn canvas_with_limits(patch: AudioPatch, limits: EditorLimits) -> Canvas {
+        let ctx = egui::Context::default();
+        set_editor_style(&ctx, distinct_style());
+        let mut canvas = Canvas::on_for(ctx, patch, 0);
+        canvas.state.set_limits(limits);
+        for _ in 0..3 {
+            canvas.frame(Vec::new());
+        }
+        canvas
+    }
+
+    /// Whether a widget labelled `label` is offered *and* enabled.
+    fn enabled(canvas: &Canvas, label: &str) -> bool {
+        canvas
+            .out
+            .platform_output
+            .accesskit_update
+            .iter()
+            .flat_map(|update| &update.nodes)
+            .any(|(_, n)| n.label() == Some(label) && !n.is_disabled())
+    }
+
+    /// **C8 on the canvas.** A patch at its node cap offers no way to add
+    /// one, says why, and refuses every door — the toolbar's menu, the
+    /// canvas's right-click menu, a Duplicate, and a wire let go over
+    /// nothing.
+    #[test]
+    fn a_patch_at_its_node_cap_refuses_every_door_and_says_why() {
+        let limits = EditorLimits::from_envelope(Envelope {
+            max_nodes: 3,
+            ..Envelope::default()
+        });
+        let mut canvas = canvas_with_limits(three_node_patch(), limits);
+        let reason = limits.at(Cap::Nodes, 3).full_reason();
+
+        assert!(
+            !enabled(&canvas, "Add node"),
+            "a full patch still offers one"
+        );
+        let said = hover_text_over(&mut canvas, "Add node");
+        assert!(
+            said.iter().any(|t| t == &reason),
+            "the disabled Add node does not say why: {said:?}"
+        );
+        // The count lives in the validity line, which was already counting
+        // the nodes: a second readout on the button row cost it its one
+        // row at the sequence editor's panel width.
+        assert!(
+            canvas
+                .painted_text()
+                .iter()
+                .any(|t| t.contains("3 / 3 nodes")),
+            "the count does not say the cap: {:?}",
+            canvas.painted_text()
+        );
+        // And below the cap it is a plain count, not `3 / 256`.
+        let roomy = Canvas::new(three_node_patch());
+        assert!(
+            roomy
+                .painted_text()
+                .iter()
+                .any(|t| t.contains("3 nodes") && !t.contains('/')),
+            "a patch with room reads like an arithmetic puzzle: {:?}",
+            roomy.painted_text()
+        );
+
+        // The deferred door: an Action that was queued before the cap was
+        // reached must not be the one that goes over it.
+        let before = canvas.patch.graph.nodes.len();
+        add_node(
+            &mut canvas.patch,
+            &mut canvas.state,
+            "Sine",
+            Pos2::ZERO,
+            None,
+        );
+        assert_eq!(canvas.patch.graph.nodes.len(), before, "add_node went over");
+        assert!(
+            duplicate_node(&mut canvas.patch, &mut canvas.state, NodeId(0)).is_none(),
+            "a duplicate went over the cap"
+        );
+
+        // One below the cap every door works again.
+        let limits = EditorLimits::from_envelope(Envelope {
+            max_nodes: 4,
+            ..Envelope::default()
+        });
+        let mut canvas = canvas_with_limits(three_node_patch(), limits);
+        assert!(enabled(&canvas, "Add node"));
+        assert!(
+            add_node(
+                &mut canvas.patch,
+                &mut canvas.state,
+                "Sine",
+                Pos2::ZERO,
+                None
+            )
+            .is_some()
+        );
+        assert_eq!(canvas.patch.graph.nodes.len(), 4);
+    }
+
+    /// A port that is full takes no more connections, from a constant or
+    /// from a wire, and its Add constant says why.
+    #[test]
+    fn a_full_port_refuses_a_constant_and_a_wire() {
+        let limits = EditorLimits::from_envelope(Envelope {
+            max_connections_per_port: 2,
+            ..Envelope::default()
+        });
+        let mut patch = three_node_patch();
+        // Fill the filter's "in" port to the cap.
+        let filter = patch
+            .graph
+            .nodes
+            .iter_mut()
+            .find(|n| n.id == NodeId(2))
+            .expect("the filter");
+        filter
+            .inputs
+            .get_mut("in")
+            .expect("the in port")
+            .push(Connection::constant(0.5));
+        let mut canvas = canvas_with_limits(patch, limits);
+        let reason = limits.at(Cap::ConnectionsPerPort, 2).full_reason();
+
+        // Every "Add constant" for a full port is disabled. The cutoff_hz
+        // port holds one, so its own stays live — a cap is per port.
+        let adds: Vec<bool> = canvas
+            .out
+            .platform_output
+            .accesskit_update
+            .iter()
+            .flat_map(|update| &update.nodes)
+            .filter(|(_, n)| n.label() == Some("Add constant"))
+            .map(|(_, n)| !n.is_disabled())
+            .collect();
+        assert!(
+            adds.iter().any(|live| !live),
+            "the full port's Add constant is still live"
+        );
+        assert!(
+            adds.iter().any(|live| *live),
+            "a port with room lost its Add constant too"
+        );
+        assert!(
+            canvas.painted_text().iter().any(|t| t == "2 / 2"),
+            "the full port shows no count: {:?}",
+            canvas.painted_text()
+        );
+        assert!(!reason.is_empty());
+
+        // And a wire landing on it does not stick.
+        let before = connection_count(&canvas.patch, NodeId(2), "in");
+        if let Some(n) = canvas
+            .patch
+            .graph
+            .nodes
+            .iter_mut()
+            .find(|n| n.id == NodeId(2))
+            && port_room(&limits, n, "in").has_room()
+        {
+            n.inputs
+                .entry("in".into())
+                .or_default()
+                .push(Connection::from_node(NodeId(1)));
+        }
+        assert_eq!(
+            connection_count(&canvas.patch, NodeId(2), "in"),
+            before,
+            "a wire landed on a full port"
+        );
+    }
+
+    fn connection_count(patch: &AudioPatch, node: NodeId, port: &str) -> usize {
+        patch
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.id == node)
+            .and_then(|n| n.inputs.get(port))
+            .map_or(0, Vec::len)
+    }
+
+    /// **B11's other half.** The mark beside an out-of-track value is not
+    /// the whole message, and the rest of it has to reach the screen.
+    ///
+    /// The handle of a slider whose value is past its range is pinned at
+    /// the end, which looks exactly like a value that is legitimately at
+    /// the end. `!` says the two are different; the hover says how. If that
+    /// hover never fires the mark is a decoration — which is the #1289
+    /// class of failure, and the reason this is a test and not a look.
+    #[test]
+    fn the_out_of_track_mark_explains_itself_on_hover() {
+        let mut canvas = Canvas::new(one_node(NodeKind::Sine(SineOsc {
+            amplitude: 2.5,
+            ..SineOsc::default()
+        })));
+        let mark = canvas
+            .painted_text_rects()
+            .into_iter()
+            .find(|(t, _)| t == "!")
+            .map(|(_, r)| r)
+            .expect("nothing marks the amplitude as off its track");
+        let said = canvas.hover_text_at(mark.center());
+        let explained = said.iter().find(|t| t.contains("outside this slider"));
+        let explained =
+            explained.unwrap_or_else(|| panic!("the mark says nothing when hovered: {said:?}"));
+        assert!(
+            explained.contains("2.5"),
+            "the hover does not say the value: {explained}"
+        );
+        assert!(
+            explained.contains("0 to 1"),
+            "the hover does not say the track: {explained}"
+        );
+        assert!(
+            explained.contains("kept as it is"),
+            "the hover does not say the editor will leave it alone: {explained}"
+        );
+        assert_eq!(
+            match &canvas.patch.graph.nodes[0].kind {
+                NodeKind::Sine(c) => c.amplitude,
+                _ => unreachable!(),
+            },
+            2.5,
+            "and hovering it did not change it either"
+        );
+    }
+
+    /// A canvas embedded in a sequence editor is held to the recipe's caps,
+    /// whether it was opened before or after they were set.
+    #[test]
+    fn an_embedded_canvas_inherits_the_recipes_limits() {
+        let tight = EditorLimits::from_envelope(Envelope {
+            max_nodes: 7,
+            ..Envelope::default()
+        });
+        let mut state = PatchEditorState::default();
+        assert_eq!(*state.limits(), EditorLimits::default());
+        state.set_limits(tight);
+        assert_eq!(state.limits().get(Cap::Nodes), 7);
     }
 }

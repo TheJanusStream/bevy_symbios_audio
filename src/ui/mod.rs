@@ -30,6 +30,11 @@
 //! - [`evolve`] / [`io`] — cross-cutting polish wired into the editors above:
 //!   `symbios_genetics`-backed Mutate / Reroll seed helpers ([`evolve`]) and
 //!   a reusable JSON copy/paste section ([`io::json_io`]).
+//! - [`limits`] — [`EditorLimits`], the caps every Add above is held to and
+//!   every `N / cap` readout counts against. They default to
+//!   symbios-audio's [`crate::Envelope`], which is what the record boundary
+//!   enforces anyway, so an editor nobody configured refuses exactly what
+//!   the sanitiser would otherwise have deleted after the edit.
 //! - [`style`] — [`EditorStyle`], the named colour roles every widget above
 //!   paints with. A host sets its own with [`set_editor_style`] when its
 //!   theme changes; with none set, the widgets derive one from the `Visuals`
@@ -68,6 +73,21 @@
 //! This matches texture's `(writeback, regen)` tuple, recast as a named struct
 //! so the many sub-editors of a graph compose cleanly via [`EditorResponse::merge`].
 //!
+//! # Values the editor does not change
+//!
+//! An editor shows a document; it does not quietly edit one. Two rules hold
+//! it to that, and both were broken before #63:
+//!
+//! - A slider whose value is outside its own track leaves it alone and
+//!   marks it, rather than clamping it on the frame it is drawn. Use
+//!   [`ranged_slider`], which owns that setting.
+//! - An Add that would go past a cap is disabled *with the reason*, rather
+//!   than allowed and the excess deleted afterwards at the record boundary.
+//!   See [`limits`].
+//!
+//! Both are the same principle: whatever the editor does to a document, the
+//! user asked for.
+//!
 //! All egui access goes through `bevy_egui::egui` (never a direct `egui`
 //! dependency) so the widgets stay pinned to the host's `bevy_egui` version.
 
@@ -78,6 +98,7 @@ pub mod evolve;
 pub mod graph;
 mod history;
 pub mod io;
+pub mod limits;
 pub mod node;
 pub mod preview;
 pub mod sequence;
@@ -89,6 +110,7 @@ pub use audition::{AUTO_QUIET_SECS, AuditionSource, AuditionState, audition_stri
 pub use evolve::{mutate_node_kind, mutate_patch, randomize_seed};
 pub use graph::{PatchEditorState, WireGeom, audio_patch_canvas};
 pub use io::{JsonIoState, json_io};
+pub use limits::{Cap, CapState, CapTone, EditorLimits, cap_readout};
 pub use node::{
     adsr_envelope_editor, biquad_bandpass_editor, biquad_highpass_editor, biquad_lowpass_editor,
     brown_noise_editor, gain_editor, gate_editor, lfo_editor, mix_editor, node_kind_body,
@@ -150,7 +172,87 @@ impl EditorResponse {
 // phases (graph canvas, sequence timeline) and external hosts can reuse the
 // exact same debouncing.
 
+/// A slider over `range` that never rewrites the value it is shown.
+///
+/// **This is the one to use.** egui's default is
+/// [`egui::SliderClamping::Always`], which writes the clamped value back on
+/// the frame the slider is *drawn* — so a patch holding an amplitude of 2.5
+/// was changed to 1.0 by opening it, with no `changed` flag to say so and
+/// the next commit writing the loss into the record (#63, Overlands #1336
+/// B11). The editors' ranges are the genetics bounds; the record boundary
+/// allows wider. [`egui::SliderClamping::Edits`] keeps the widget honest:
+/// a value the user *types or drags* is held to `range`, and a value that
+/// was already there is left alone.
+///
+/// Set here rather than at each call site because the failure is invisible:
+/// a slider missing the setting looks and behaves identically until someone
+/// opens a document that was outside its track.
+///
+/// `build` decorates the slider — `.suffix(" Hz")`, `.logarithmic(true)`,
+/// `.show_value(false)` — everything except its value, its range and its
+/// clamping, which are this helper's.
+///
+/// A value outside `range` is marked, because the handle is pinned at the
+/// end of the track and a pinned handle is indistinguishable from a value
+/// that really is at the end.
+pub fn ranged_slider(
+    ui: &mut egui::Ui,
+    val: &mut f32,
+    range: std::ops::RangeInclusive<f32>,
+    build: impl FnOnce(egui::Slider<'_>) -> egui::Slider<'_>,
+) -> EditorResponse {
+    let (lo, hi) = (*range.start(), *range.end());
+    let value = *val;
+    // The extra row only exists when there is something to mark: the node
+    // box's grid was measured column by column (#59), and wrapping every
+    // slider in a layout it does not need would move all of it.
+    if value < lo || value > hi {
+        ui.horizontal(|ui| {
+            let res = slider_debounced(
+                ui,
+                build(egui::Slider::new(val, lo..=hi).clamping(egui::SliderClamping::Edits)),
+            );
+            out_of_track_marker(ui, value, lo, hi);
+            res
+        })
+        .inner
+    } else {
+        slider_debounced(
+            ui,
+            build(egui::Slider::new(val, lo..=hi).clamping(egui::SliderClamping::Edits)),
+        )
+    }
+}
+
+/// The mark beside a slider whose value is off its track, and the hover
+/// saying what the handle's position is not telling you.
+///
+/// `!` rather than a symbol: the editors' glyph vocabulary is a short list
+/// every host has to carry a font for (#52, #58), `✖` in it already means
+/// *remove*, and a plain ASCII mark costs a host nothing.
+///
+/// The hover says the value and the track, and stops there. How much wider
+/// the record itself allows is not the editor's to say: those bounds are
+/// hard-coded per field inside symbios-audio's `ClampToEnvelope for
+/// NodeKind`, with no public table, and a copy of them here would be a
+/// second answer with nothing keeping it honest.
+fn out_of_track_marker(ui: &mut egui::Ui, value: f32, lo: f32, hi: f32) {
+    let warn = style::editor_style(ui).warn;
+    ui.label(egui::RichText::new("!").strong().color(warn))
+        .on_hover_text(format!(
+            "{value} is outside this slider's range ({lo} to {hi}). It is kept as it is — \
+             the slider will not change it."
+        ));
+}
+
 /// Add a slider and report drag-aware change/commit flags.
+///
+/// Prefer [`ranged_slider`], which owns the clamping this cannot set: a
+/// slider passed here as an `impl Widget` is already built, so its
+/// [`egui::SliderClamping`] is whatever the caller chose — and egui's
+/// default rewrites values (#63). This stays for hosts that pass a
+/// non-slider widget, and narrowing it is collected for 0.5 with the
+/// epic's other breaking changes.
 ///
 /// `changed` fires on any movement (including mid-drag) so the caller can
 /// write the value back; `rebake` fires only when the drag stops or a

@@ -12,8 +12,10 @@
 //!   events on every track, and its canvas layout, to the new id. It applies
 //!   on Enter or when the field loses focus, never per keystroke, and only
 //!   for a name that is non-empty after trimming, unique, and within
-//!   symbios-audio's [`Envelope`] byte limit; until then the field shows the
-//!   reason in the error colour, and Esc puts the name back.
+//!   this editor's [`EditorLimits`] byte cap — which defaults to
+//!   symbios-audio's own [`crate::Envelope`], the bound the record
+//!   sanitiser holds a recipe to. Until then the field shows the reason in
+//!   the error colour, and Esc puts the name back.
 //! - **Timeline** — one lane per track, named in its gutter after the
 //!   instrument most of it plays. A note is a block whose x is `time_beats`
 //!   and width is `gate_beats`, with a translucent tail for `release_beats`,
@@ -67,17 +69,17 @@ use bevy_egui::egui::{self, Align2, Color32, Id, Pos2, Rect, Sense, Stroke, Stro
 
 use symbios_genetics::Genotype;
 
-use crate::Envelope;
 use crate::patch::AudioPatch;
 use crate::sequence::{Event, Instrument, PitchMode, SequenceRecipe, Track};
 
 use super::evolve::fresh_rng;
 use super::history::EditHistory;
 use super::io::json_io;
+use super::limits::{Cap, CapState, EditorLimits, cap_readout};
 use super::style::{EditorStyle, editor_style, relative_luminance};
 use super::{
     EditorResponse, JsonIoState, PatchEditorState, audio_patch_canvas, drag_value_debounced,
-    slider_debounced,
+    ranged_slider,
 };
 
 /// The header above the lanes: the beat numbers on its first line, the loop
@@ -211,6 +213,59 @@ pub struct SequenceEditorState {
     owns_keys: bool,
     /// It acted on an Escape this frame.
     took_escape: bool,
+    /// The caps every Add is held to, and the byte limit the name field
+    /// refuses past. [`EditorLimits::default`] is the record boundary's own
+    /// envelope, so an editor nobody configured refuses exactly what the
+    /// sanitiser would have deleted (#63, Overlands #1336 C8).
+    limits: EditorLimits,
+    /// A removal that has been asked for and not yet answered.
+    ///
+    /// State that outlives the frame it was asked in, so it lives here
+    /// beside [`Self::menu_at`] and [`Self::marquee`] rather than in a
+    /// widget: the click that asks happens deep inside the lane loop or an
+    /// instrument's row, and the question is drawn at the top of that
+    /// section on the *next* frame — a position that is the same in both of
+    /// egui's passes (#1332) and nowhere near the cross that was pressed.
+    pending_removal: Option<PendingRemoval>,
+    /// Where every control that *asks* for a removal was last drawn, in
+    /// screen points: each instrument row's cross, then each track
+    /// gutter's, in the order they are drawn.
+    ///
+    /// Published rather than re-derived, the way [`Self::notes`] is: the
+    /// gutter's cross is painted geometry that only the lane loop knows the
+    /// position of, and a test or a harness that worked it out again would
+    /// be a second answer waiting to disagree (crate #67).
+    removal_asks: Vec<Rect>,
+    /// Where the confirmation was last drawn, or [`Rect::NOTHING`] if none
+    /// is up — so "the buttons are nowhere near the cross that asked" is a
+    /// thing a test can measure rather than a thing a screenshot suggests.
+    confirmation_rect: Rect,
+}
+
+/// A removal waiting to be confirmed.
+///
+/// Only removals that lose something ask: an empty track and an instrument
+/// no note names go at once, because a confirmation for a no-op is the
+/// dialog everyone learns to dismiss without reading.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PendingRemoval {
+    /// A track with notes on it.
+    Track {
+        /// Which track, by index.
+        track: usize,
+        /// How many notes go with it.
+        notes: usize,
+    },
+    /// An instrument some notes name.
+    Instrument {
+        /// Which instrument, by row.
+        row: usize,
+        /// Its id, so a row that has moved or been renamed under the
+        /// question can be recognised and the question dropped.
+        id: String,
+        /// How many notes across the recipe name it.
+        notes: usize,
+    },
 }
 
 impl Default for SequenceEditorState {
@@ -235,6 +290,10 @@ impl Default for SequenceEditorState {
             history: EditHistory::default(),
             owns_keys: false,
             took_escape: false,
+            limits: EditorLimits::default(),
+            pending_removal: None,
+            removal_asks: Vec::new(),
+            confirmation_rect: Rect::NOTHING,
         }
     }
 }
@@ -283,13 +342,6 @@ impl std::fmt::Display for NameRefusal {
             Self::Taken(name) => write!(f, "Another instrument is called '{name}'"),
         }
     }
-}
-
-/// The longest instrument id, in bytes: the bound the record sanitiser
-/// holds a recipe to (symbios-audio's [`Envelope`]), so a name the editor
-/// accepts is never cut short on its way into a record.
-fn instrument_id_byte_limit() -> usize {
-    Envelope::default().max_instrument_id_bytes
 }
 
 /// The id `text` would give instrument `row`, trimmed, or why it can't.
@@ -938,6 +990,50 @@ impl SequenceEditorState {
         self.history.commit(recipe);
     }
 
+    /// The caps this editor holds its recipe to.
+    pub fn limits(&self) -> &EditorLimits {
+        &self.limits
+    }
+
+    /// Hold this editor — and every instrument patch opened inside it — to
+    /// `limits` instead of the record boundary's own envelope.
+    ///
+    /// The embedded canvases get them too, and so does every canvas opened
+    /// later: an instrument's patch is part of the recipe, so a host that
+    /// tightens the recipe's caps and leaves a patch on the defaults has
+    /// two answers to one question.
+    pub fn set_limits(&mut self, limits: EditorLimits) {
+        self.limits = limits;
+        for canvas in self.canvas_states.values_mut() {
+            canvas.set_limits(limits);
+        }
+    }
+
+    /// Whether a removal is waiting to be confirmed — the host's cue that
+    /// the editor has a question on screen.
+    pub fn awaiting_confirmation(&self) -> bool {
+        self.pending_removal.is_some()
+    }
+
+    /// Where the confirmation was drawn on the last frame, if one is up.
+    ///
+    /// In screen points, re-measured every frame.
+    pub fn confirmation_rect(&self) -> Option<Rect> {
+        (self.confirmation_rect != Rect::NOTHING).then_some(self.confirmation_rect)
+    }
+
+    /// Where every control that asks for a removal was drawn on the last
+    /// frame, in screen points: each instrument row's cross in row order,
+    /// then each track gutter's in track order — the order they are drawn
+    /// in.
+    ///
+    /// An affordance at the point the user clicks is hovered by that same
+    /// click, so what a confirmation must not do is put its buttons where
+    /// the cross that summoned it was. This is what makes that checkable.
+    pub fn removal_asks(&self) -> &[Rect] {
+        &self.removal_asks
+    }
+
     /// Whether the sequence editor took this frame's keyboard. See
     /// [`crate::ui::PatchEditorState::wants_keyboard`].
     pub fn wants_keyboard(&self) -> bool {
@@ -966,6 +1062,8 @@ pub fn sequence_recipe_editor(
     let mut res = EditorResponse::NONE;
     let style = editor_style(ui);
     state.history.begin(recipe);
+    state.removal_asks.clear();
+    state.confirmation_rect = Rect::NOTHING;
 
     egui::CollapsingHeader::new("Transport")
         .default_open(true)
@@ -1043,10 +1141,17 @@ fn recipe_keys(
         res.changed = res.rebake;
         return res;
     }
-    // One step per press, most recent gesture first: a marquee being
-    // dragged out, then the notes it or a click picked (#61's ladder, now
-    // two rungs deep on the timeline too).
-    if escape && (state.marquee.take().is_some() || !state.selection.is_empty()) {
+    // One step per press, most recent gesture first: a question waiting to
+    // be answered, then a marquee being dragged out, then the notes it or a
+    // click picked (#61's ladder, three rungs deep on the timeline now).
+    //
+    // Escape means Keep — the reading every other dialog has taught — and
+    // it spends exactly one press and says so through `took_escape`, or the
+    // host's own Esc ladder loses a rung and the pop-out closes under the
+    // question.
+    if escape && state.pending_removal.take().is_some() {
+        state.took_escape = true;
+    } else if escape && (state.marquee.take().is_some() || !state.selection.is_empty()) {
         state.clear_selection();
         state.took_escape = true;
     }
@@ -1106,7 +1211,11 @@ pub fn active_instrument_canvas(
     let inst_id = recipe.instruments[i].id.clone();
     ui.label(format!("Patch for instrument \u{201C}{inst_id}\u{201D}"));
     state.history.begin(recipe);
+    let limits = state.limits;
     let canvas_state = state.canvas_states.entry(inst_id).or_default();
+    // A patch opened for the first time inherits the recipe's caps; one
+    // opened before already has them from `set_limits`.
+    canvas_state.set_limits(limits);
     // This patch is part of the recipe, so the recipe's history owns it.
     // With both on, one Ctrl+Z would walk two stacks at once and the
     // recipe's would go stale (#60, Overlands #1333).
@@ -1134,12 +1243,9 @@ pub fn active_instrument_canvas(
 fn transport(ui: &mut egui::Ui, recipe: &mut SequenceRecipe) -> EditorResponse {
     let mut res = EditorResponse::NONE;
 
-    res.merge(slider_debounced(
-        ui,
-        egui::Slider::new(&mut recipe.bpm, 20.0..=300.0)
-            .logarithmic(true)
-            .text("BPM"),
-    ));
+    res.merge(ranged_slider(ui, &mut recipe.bpm, 20.0..=300.0, |s| {
+        s.logarithmic(true).text("BPM")
+    }));
 
     ui.horizontal(|ui| {
         ui.label("Sample rate");
@@ -1247,14 +1353,38 @@ fn instruments_panel(
     let mut res = EditorResponse::NONE;
     let mut add = false;
     let mut remove: Option<usize> = None;
+    let mut remove_now: Option<usize> = None;
     let mut rename: Option<(usize, String)> = None;
+    let limits = state.limits;
 
+    let room = limits.at(Cap::Instruments, recipe.instruments.len());
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new("Instruments").strong());
-        if ui.button("Add instrument").clicked() {
+        cap_readout(ui, room, style);
+        if ui
+            .add_enabled(room.has_room(), egui::Button::new("Add instrument"))
+            .on_hover_text("A new instrument with an empty patch")
+            // The only hover a disabled widget ever shows (#1289): its
+            // `on_hover_text` never fires, so the reason goes here or
+            // nowhere.
+            .on_disabled_hover_text(room.full_reason())
+            .clicked()
+        {
             add = true;
         }
     });
+    // Drawn here, at the top of the section, on the frame *after* the cross
+    // was pressed: a fixed position in both of egui's passes, and one no
+    // click of the user's is already sitting on.
+    res.merge(confirm_instrument_removal(
+        ui,
+        recipe,
+        state,
+        style,
+        &mut remove_now,
+    ));
+    let asking = state.pending_removal.is_some();
+    let mut asks: Vec<Rect> = Vec::new();
 
     state.name_edits.retain(|row, edit| {
         recipe
@@ -1284,14 +1414,20 @@ fn instruments_panel(
                 &mut state.name_edits,
                 id.with(("instrument_name", i)),
                 style.error,
+                limits.get(Cap::InstrumentIdBytes),
             );
             let nodes = recipe.instruments[i].patch.graph.nodes.len();
             ui.label(egui::RichText::new(format!("{nodes} node(s)")).weak());
-            if ui
-                .button("\u{2716}")
+            // Disabled while a question is up: the bar pushed these rows
+            // down, so the pointer that pressed this cross is now resting
+            // on a *different* instrument's, and the second click of an
+            // impatient double would remove the wrong one.
+            let cross = ui
+                .add_enabled(!asking, egui::Button::new("\u{2716}"))
                 .on_hover_text("Remove instrument")
-                .clicked()
-            {
+                .on_disabled_hover_text("Answer the question above first");
+            asks.push(cross.rect);
+            if cross.clicked() {
                 remove = Some(i);
             }
             field
@@ -1309,7 +1445,12 @@ fn instruments_panel(
         // a refused name became valid because another instrument moved out
         // of its way; it waits for the user rather than apply itself.
         let note = state.name_edits.get(&i).and_then(|edit| {
-            match check_name(recipe, i, &edit.text, instrument_id_byte_limit()) {
+            match check_name(
+                recipe,
+                i,
+                &edit.text,
+                state.limits.get(Cap::InstrumentIdBytes),
+            ) {
                 Err(refusal) => Some((refusal.to_string(), style.error)),
                 Ok(_) if !focused => Some((
                     "Not applied yet: Enter in the field applies it, Esc puts the name back"
@@ -1342,6 +1483,19 @@ fn instruments_panel(
         res.rebake = true;
     }
     if let Some(i) = remove {
+        // An instrument no note names is nothing to lose, so it goes at
+        // once; one that notes depend on asks, and says how many (#63,
+        // Overlands #1336 C2).
+        let id = recipe.instruments[i].id.clone();
+        let notes = notes_naming(recipe, &id);
+        if notes == 0 {
+            remove_now = Some(i);
+        } else {
+            state.pending_removal = Some(PendingRemoval::Instrument { row: i, id, notes });
+        }
+    }
+    if let Some(i) = remove_now {
+        state.pending_removal = None;
         recipe.instruments.remove(i);
         match state.active_instrument {
             Some(a) if a == i => state.active_instrument = None,
@@ -1361,7 +1515,189 @@ fn instruments_panel(
         res.rebake = true;
     }
 
+    state.removal_asks.extend(asks);
     res
+}
+
+// ---------------------------------------------------------------------------
+// Confirming a removal
+// ---------------------------------------------------------------------------
+
+/// How many notes across the whole recipe name instrument `id`.
+///
+/// The number the question is about: a lane's gutter already counts its own
+/// notes, but an instrument is used by any track, so this walks all of them.
+fn notes_naming(recipe: &SequenceRecipe, id: &str) -> usize {
+    recipe
+        .tracks
+        .iter()
+        .flat_map(|t| &t.events)
+        .filter(|e| e.instrument_id == id)
+        .count()
+}
+
+/// `n` notes, said as a sentence rather than as a field label.
+///
+/// The editor writes "2 node(s)" beside a count in a row, where the
+/// brackets are read as shorthand. A question is a sentence, and "Its 1
+/// note(s) go with it" is not one.
+fn notes_phrase(n: usize) -> String {
+    if n == 1 {
+        "1 note".to_owned()
+    } else {
+        format!("{n} notes")
+    }
+}
+
+/// What the user said to a pending removal.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Answer {
+    /// Still on screen.
+    Waiting,
+    /// Put it back.
+    Keep,
+    /// Go ahead.
+    Remove,
+}
+
+/// The question, and the two answers.
+///
+/// Drawn at the top of the section that owns the thing, on the frame after
+/// the cross was pressed — a row that is in the same place in both of
+/// egui's passes (#1332), and a long way from the 14 px cross the pointer
+/// is still sitting on. While it is up, every removal control in the editor
+/// is disabled: the bar pushes the rows below it down, so a pointer left
+/// where it clicked would otherwise be resting on some *other* row's cross.
+fn confirm_bar(
+    ui: &mut egui::Ui,
+    question: &str,
+    remove_hover: &str,
+    style: &EditorStyle,
+) -> (Answer, Rect) {
+    let mut answer = Answer::Waiting;
+    let drawn = egui::Frame::group(ui.style())
+        .stroke(egui::Stroke::new(1.0, style.warn))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new(question).color(style.warn));
+                if ui
+                    .button("Keep")
+                    .on_hover_text("Leave it where it is and put the question away")
+                    .clicked()
+                {
+                    answer = Answer::Keep;
+                }
+                if ui.button("Remove").on_hover_text(remove_hover).clicked() {
+                    answer = Answer::Remove;
+                }
+            });
+        })
+        .response
+        .rect;
+    (answer, drawn)
+}
+
+/// The pending instrument removal, if there is one and it still makes
+/// sense; `remove_now` is set when it is confirmed.
+///
+/// Re-checked against the recipe every frame rather than trusted: the host
+/// can put a different recipe under the editor between frames (#1333 A9),
+/// and a row index that outlived its instrument would otherwise ask about
+/// one thing and remove another.
+fn confirm_instrument_removal(
+    ui: &mut egui::Ui,
+    recipe: &SequenceRecipe,
+    state: &mut SequenceEditorState,
+    style: &EditorStyle,
+    remove_now: &mut Option<usize>,
+) -> EditorResponse {
+    let Some(PendingRemoval::Instrument { row, id, .. }) = &state.pending_removal else {
+        return EditorResponse::NONE;
+    };
+    let (row, id) = (*row, id.clone());
+    if recipe.instruments.get(row).map(|i| i.id.as_str()) != Some(id.as_str()) {
+        state.pending_removal = None;
+        return EditorResponse::NONE;
+    }
+    // Counted again now, not when the question was asked: an edit made
+    // while it was up would otherwise have the bar quoting a stale number.
+    let notes = notes_naming(recipe, &id);
+    if notes == 0 {
+        state.pending_removal = None;
+        *remove_now = Some(row);
+        return EditorResponse::NONE;
+    }
+    let question = format!(
+        "Remove \u{201C}{id}\u{201D}? {} {} it, and will be left naming an \
+         instrument that is not there.",
+        notes_phrase(notes),
+        if notes == 1 { "plays" } else { "play" }
+    );
+    let (answer, drawn) = confirm_bar(
+        ui,
+        &question,
+        &format!(
+            "Remove \u{201C}{id}\u{201D} and leave its {} naming nothing",
+            notes_phrase(notes)
+        ),
+        style,
+    );
+    state.confirmation_rect = drawn;
+    match answer {
+        Answer::Remove => *remove_now = Some(row),
+        Answer::Keep => state.pending_removal = None,
+        Answer::Waiting => {}
+    }
+    EditorResponse::NONE
+}
+
+/// The pending track removal, if there is one and it still makes sense.
+///
+/// Pushes [`Action::RemoveTrackNow`] rather than removing here, so every
+/// edit to `recipe.tracks` still goes through [`apply_actions`] — one place
+/// that mutates the tracks, whichever of the three doors asked.
+fn confirm_track_removal(
+    ui: &mut egui::Ui,
+    recipe: &SequenceRecipe,
+    state: &mut SequenceEditorState,
+    style: &EditorStyle,
+    actions: &mut Vec<Action>,
+) {
+    let Some(PendingRemoval::Track { track, .. }) = &state.pending_removal else {
+        return;
+    };
+    let track = *track;
+    let Some(events) = recipe.tracks.get(track).map(|t| t.events.len()) else {
+        state.pending_removal = None;
+        return;
+    };
+    if events == 0 {
+        state.pending_removal = None;
+        actions.push(Action::RemoveTrackNow(track));
+        return;
+    }
+    let question = format!(
+        "Remove track {}? Its {} {} with it.",
+        track + 1,
+        notes_phrase(events),
+        if events == 1 { "goes" } else { "go" }
+    );
+    let (answer, drawn) = confirm_bar(
+        ui,
+        &question,
+        &format!(
+            "Remove track {} and its {}",
+            track + 1,
+            notes_phrase(events)
+        ),
+        style,
+    );
+    state.confirmation_rect = drawn;
+    match answer {
+        Answer::Remove => actions.push(Action::RemoveTrackNow(track)),
+        Answer::Keep => state.pending_removal = None,
+        Answer::Waiting => {}
+    }
 }
 
 /// What one instrument row's name field did this frame.
@@ -1384,9 +1720,9 @@ fn name_field(
     edits: &mut HashMap<usize, NameEdit>,
     field_id: Id,
     error: Color32,
+    limit: usize,
 ) -> NameField {
     let current = &recipe.instruments[row].id;
-    let limit = instrument_id_byte_limit();
     let refused = |edits: &HashMap<usize, NameEdit>| {
         edits
             .get(&row)
@@ -1474,11 +1810,14 @@ fn name_field(
 /// let go of its borrow — the shape the canvas uses for the same reason.
 enum Action {
     /// A note of the lane's dominant instrument at this beat.
-    AddNote {
-        track: usize,
-        beat: f32,
-    },
+    AddNote { track: usize, beat: f32 },
+    /// The user asked to remove a track — from the gutter's cross or the
+    /// track's own menu. Whether it goes at once or asks first is decided
+    /// in [`apply_actions`], because both doors arrive here (#63, Overlands
+    /// #1336 C2).
     RemoveTrack(usize),
+    /// A removal the user has confirmed.
+    RemoveTrackNow(usize),
     /// Copy every selected note in place, and drag the copies instead of
     /// the originals (an Alt-drag).
     DuplicateSelection,
@@ -1535,8 +1874,18 @@ fn timeline(
         ppb,
         fitted,
         total,
+        style,
         &mut actions,
     ));
+    // The question, if one is up, between the toolbar and the ruler: a row
+    // that is in the same place in both of egui's passes and is nowhere
+    // near the gutter cross or the track menu that asked.
+    confirm_track_removal(ui, recipe, state, style, &mut actions);
+    // Read once, after the question has had its say: every removal control
+    // below is inert while one is up, and every Add is held to these.
+    let asking = state.pending_removal.is_some();
+    let limits = state.limits;
+    let mut asks: Vec<Rect> = Vec::new();
     if state.show_json {
         res.merge(json_io(ui, recipe, &mut state.json, id.with("recipe_json")));
     }
@@ -1584,6 +1933,7 @@ fn timeline(
 
             let lanes_top = rect.top() + RULER_H;
             for (ti, track) in recipe.tracks.iter_mut().enumerate() {
+                let track_events = track.events.len();
                 let lane_top = lanes_top + ti as f32 * LANE_H;
                 let lane = Rect::from_min_max(
                     Pos2::new(rect.left(), lane_top),
@@ -1608,6 +1958,8 @@ fn timeline(
                     name,
                     id,
                     style,
+                    asking,
+                    &mut asks,
                     &mut actions,
                 ));
 
@@ -1636,8 +1988,21 @@ fn timeline(
                     .menu_at
                     .filter(|(track, _)| *track == ti)
                     .map(|(_, beat)| beat);
-                res.merge(lane_menu(&bg_resp, ti, name, menu_beat, &mut actions));
+                let note_room = limits.at(Cap::TrackEvents, track_events);
+                res.merge(lane_menu(
+                    &bg_resp,
+                    ti,
+                    name,
+                    menu_beat,
+                    note_room,
+                    asking,
+                    &mut actions,
+                ));
+                // The other door to a new note, and it has to be held to
+                // the same cap: a double-click that added a 4 097th note
+                // would be truncated away by the sanitiser a moment later.
                 if bg_resp.double_clicked()
+                    && note_room.has_room()
                     && let Some(p) = bg_resp.interact_pointer_pos()
                 {
                     actions.push(Action::AddNote {
@@ -1803,6 +2168,7 @@ fn timeline(
         state.marquee = None;
     }
 
+    state.removal_asks.extend(asks);
     res.merge(apply_actions(recipe, state, actions, &lane_names));
     res
 }
@@ -1827,19 +2193,24 @@ fn timeline_toolbar(
     ppb: f32,
     fitted: f32,
     total: f32,
+    style: &EditorStyle,
     actions: &mut Vec<Action>,
 ) -> EditorResponse {
     let mut res = EditorResponse::NONE;
+    let limits = state.limits;
     ui.horizontal_wrapped(|ui| {
+        let room = limits.at(Cap::Tracks, recipe.tracks.len());
         if ui
-            .button("Add track")
+            .add_enabled(room.has_room(), egui::Button::new("Add track"))
             .on_hover_text("A new empty track at the bottom of the timeline")
+            .on_disabled_hover_text(room.full_reason())
             .clicked()
         {
             recipe.tracks.push(Track::default());
             res.changed = true;
             res.rebake = true;
         }
+        cap_readout(ui, room, style);
 
         ui.label("Zoom")
             .on_hover_text("How wide one beat is drawn, in points");
@@ -1849,10 +2220,7 @@ fn timeline_toolbar(
         // again.
         ui.spacing_mut().slider_width = 64.0;
         let mut zoom = ppb;
-        if ui
-            .add(egui::Slider::new(&mut zoom, MIN_PPB..=MAX_PPB).show_value(false))
-            .changed()
-        {
+        if ranged_slider(ui, &mut zoom, MIN_PPB..=MAX_PPB, |s| s.show_value(false)).changed {
             state.zoom = Some(zoom);
             res.changed = true;
         }
@@ -1916,7 +2284,7 @@ fn timeline_more_menu(
             res.changed = true;
             res.rebake = true;
         }
-        ui.add(egui::Slider::new(&mut state.mutate_rate, 0.0..=1.0).text("rate"));
+        ranged_slider(ui, &mut state.mutate_rate, 0.0..=1.0, |s| s.text("rate"));
         ui.separator();
         let picked = state.selection.len();
         if ui
@@ -2106,21 +2474,41 @@ fn lane_gutter(
     name: Option<&(String, usize)>,
     id: Id,
     style: &EditorStyle,
+    asking: bool,
+    asks: &mut Vec<Rect>,
     actions: &mut Vec<Action>,
 ) -> EditorResponse {
     let cross = Rect::from_min_size(
         Pos2::new(lane.left() + 3.0, lane.center().y - 7.0),
         Vec2::splat(14.0),
     );
+    asks.push(cross);
+    // Inert while a question is up: the bar above pushed every lane down,
+    // so the pointer that pressed this cross is now over the lane before
+    // it, and a second click would ask about the wrong track.
     let cross_resp = ui
-        .interact(cross, id.with(("rm_track", track)), Sense::click())
-        .on_hover_text(format!("Remove track {} and its notes", track + 1));
+        .interact(
+            cross,
+            id.with(("rm_track", track)),
+            if asking {
+                Sense::hover()
+            } else {
+                Sense::click()
+            },
+        )
+        .on_hover_text(if asking {
+            "Answer the question above the timeline first".to_owned()
+        } else {
+            format!("Remove track {} and its notes", track + 1)
+        });
     painter.text(
         cross.center(),
         Align2::CENTER_CENTER,
         "\u{2716}",
         egui::FontId::proportional(13.0),
-        if cross_resp.hovered() {
+        if asking {
+            style.ground_text.gamma_multiply(0.4)
+        } else if cross_resp.hovered() {
             style.error
         } else {
             style.ground_text
@@ -2177,6 +2565,8 @@ fn lane_menu(
     track: usize,
     name: Option<&(String, usize)>,
     beat: Option<f32>,
+    room: CapState,
+    asking: bool,
     actions: &mut Vec<Action>,
 ) -> EditorResponse {
     let whose = match name {
@@ -2189,18 +2579,44 @@ fn lane_menu(
                 .weak()
                 .small(),
         );
-        if ui
-            .add_enabled(beat.is_some(), egui::Button::new(whose))
-            .on_hover_text("At the beat you right-clicked, on this track's grid")
-            .on_disabled_hover_text("Right-click the track to say where the note goes")
-            .clicked()
-            && let Some(beat) = beat
-        {
-            actions.push(Action::AddNote { track, beat });
-            ui.close();
+        let style = editor_style(ui);
+        let can_add = beat.is_some() && room.has_room();
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(can_add, egui::Button::new(whose))
+                .on_hover_text("At the beat you right-clicked, on this track's grid")
+                .clicked()
+                && let Some(beat) = beat
+            {
+                actions.push(Action::AddNote { track, beat });
+                ui.close();
+            }
+            cap_readout(ui, room, &style);
+        });
+        // Written into the menu rather than left to a hover. #1289's rule
+        // is that a disabled widget shows only `on_disabled_hover_text` —
+        // but inside an open menu egui shows no tooltip at all, because a
+        // popup in the layer suppresses them
+        // (`Tooltip::should_show_tooltip`). So a refusal explained only by
+        // a disabled hover is explained nowhere, which a probe caught and
+        // no amount of hovering by hand would have.
+        if !can_add {
+            ui.label(
+                egui::RichText::new(if room.has_room() {
+                    "Right-click the track to say where the note goes".to_owned()
+                } else {
+                    room.full_reason()
+                })
+                .small()
+                .color(style.error),
+            );
         }
         ui.separator();
-        if ui.button("Remove this track").clicked() {
+        if ui
+            .add_enabled(!asking, egui::Button::new("Remove this track"))
+            .on_disabled_hover_text("Answer the question above the timeline first")
+            .clicked()
+        {
             actions.push(Action::RemoveTrack(track));
             ui.close();
         }
@@ -2348,10 +2764,21 @@ fn apply_actions(
     lane_names: &[Option<(String, usize)>],
 ) -> EditorResponse {
     let mut res = EditorResponse::NONE;
+    let limits = state.limits;
     for action in actions {
         match action {
             Action::AddNote { track, beat } => {
                 if track >= recipe.tracks.len() {
+                    continue;
+                }
+                // The last word on the cap. The two doors that offer a note
+                // are both disabled at it, but an Action is a frame old by
+                // the time it lands, and the recipe can have changed under
+                // it — a queued add must not be the one that goes over.
+                if !limits
+                    .at(Cap::TrackEvents, recipe.tracks[track].events.len())
+                    .has_room()
+                {
                     continue;
                 }
                 // The lane's own instrument, not the recipe's first: a note
@@ -2373,12 +2800,30 @@ fn apply_actions(
                 res.rebake = true;
             }
             Action::RemoveTrack(track) => {
-                if track < recipe.tracks.len() {
-                    recipe.tracks.remove(track);
+                let Some(events) = recipe.tracks.get(track).map(|t| t.events.len()) else {
+                    continue;
+                };
+                // An empty track is nothing to lose, so it goes at once. A
+                // track with notes asks, and the question is drawn at the
+                // top of the timeline next frame.
+                if events == 0 {
+                    remove_track(recipe, state, track);
+                    res.changed = true;
+                    res.rebake = true;
+                } else {
+                    state.pending_removal = Some(PendingRemoval::Track {
+                        track,
+                        notes: events,
+                    });
                 }
-                state.clear_selection();
-                res.changed = true;
-                res.rebake = true;
+            }
+            Action::RemoveTrackNow(track) => {
+                state.pending_removal = None;
+                if track < recipe.tracks.len() {
+                    remove_track(recipe, state, track);
+                    res.changed = true;
+                    res.rebake = true;
+                }
             }
             Action::DuplicateSelection => {
                 if duplicate_selection(recipe, state) {
@@ -2389,6 +2834,15 @@ fn apply_actions(
         }
     }
     res
+}
+
+/// Take track `track` out of the recipe.
+///
+/// One place, so the gutter's cross, the track's menu and a confirmed
+/// removal all leave the editor in the same state.
+fn remove_track(recipe: &mut SequenceRecipe, state: &mut SequenceEditorState, track: usize) {
+    recipe.tracks.remove(track);
+    state.clear_selection();
 }
 
 /// Copy every selected note, and leave the copies selected.
@@ -2404,6 +2858,7 @@ fn duplicate_selection(recipe: &mut SequenceRecipe, state: &mut SequenceEditorSt
         return false;
     }
     let anchor = state.selected_event;
+    let limits = state.limits;
     let mut copies: HashSet<(usize, usize)> = HashSet::new();
     let mut new_anchor = None;
     for (ti, ei) in picked {
@@ -2413,6 +2868,12 @@ fn duplicate_selection(recipe: &mut SequenceRecipe, state: &mut SequenceEditorSt
         let Some(event) = track.events.get(ei).cloned() else {
             continue;
         };
+        // Held to the cap per track, copy by copy: a duplicate of a large
+        // selection is the likeliest way to walk over it, and the ones that
+        // fit still land rather than the whole gesture being refused.
+        if !limits.at(Cap::TrackEvents, track.events.len()).has_room() {
+            continue;
+        }
         track.events.push(event);
         let at = (ti, track.events.len() - 1);
         if anchor == Some((ti, ei)) {
@@ -2574,11 +3035,11 @@ fn event_inspector(
                 "How far the note is shifted from the instrument's own \
                  pitch: 2 is an octave up, 0.5 an octave down",
             );
-            res.merge(slider_debounced(
+            res.merge(ranged_slider(
                 ui,
-                egui::Slider::new(&mut ev.pitch_multiplier, 0.25..=4.0)
-                    .logarithmic(true)
-                    .show_value(true),
+                &mut ev.pitch_multiplier,
+                0.25..=4.0,
+                |s| s.logarithmic(true).show_value(true),
             ));
         });
         // Pitch mode: tape varispeed (pitch and time coupled) vs.
@@ -2616,10 +3077,9 @@ fn event_inspector(
         ui.horizontal(|ui| {
             ui.label("Volume")
                 .on_hover_text("How loud the note is in the mix, and how solid its block is drawn");
-            res.merge(slider_debounced(
-                ui,
-                egui::Slider::new(&mut ev.volume, 0.0..=1.0).show_value(true),
-            ));
+            res.merge(ranged_slider(ui, &mut ev.volume, 0.0..=1.0, |s| {
+                s.show_value(true)
+            }));
         });
 
         if ui
@@ -2662,6 +3122,10 @@ fn event_inspector(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::Envelope;
+    use crate::ui::CapTone;
+    use crate::ui::test_paint::text_painted;
 
     fn recipe_with(instruments: &[&str], tracks: usize) -> SequenceRecipe {
         SequenceRecipe {
@@ -2912,6 +3376,13 @@ mod tests {
 
         fn on(ctx: egui::Context, recipe: SequenceRecipe, state: SequenceEditorState) -> Self {
             ctx.enable_accesskit();
+            // A hover's own text is half of what this step draws, and a
+            // test that waits out egui's half-second would be a test of the
+            // clock.
+            ctx.all_styles_mut(|s| {
+                s.interaction.tooltip_delay = 0.0;
+                s.interaction.tooltip_grace_time = 0.0;
+            });
             let mut driver = Self {
                 ctx,
                 recipe,
@@ -3066,6 +3537,144 @@ mod tests {
             // altogether, where the pointer is over nothing.
             let at = self.state.timeline_rect().intersect(self.panel).center();
             self.frame(vec![egui::Event::PointerMoved(at)]);
+        }
+
+        /// Where a removal was asked from: `instrument(row)` and
+        /// `track(index)` into the rects the editor published.
+        ///
+        /// Read from [`SequenceEditorState::removal_asks`] rather than
+        /// worked out here: a gutter cross is painted geometry, and a test
+        /// that re-derives it is testing its own arithmetic.
+        fn ask_rect(&self, instrument: Option<usize>, track: Option<usize>) -> Rect {
+            let asks = self.state.removal_asks();
+            let instruments = self.recipe.instruments.len();
+            let i = match (instrument, track) {
+                (Some(row), _) => row,
+                (_, Some(t)) => instruments + t,
+                _ => unreachable!(),
+            };
+            *asks.get(i).unwrap_or_else(|| {
+                panic!(
+                    "nothing published for {instrument:?}/{track:?}; {} asks",
+                    asks.len()
+                )
+            })
+        }
+
+        /// Click at `at` with `button`, as a user does: move, press,
+        /// release.
+        fn click_at(&mut self, at: Pos2, button: egui::PointerButton) -> EditorResponse {
+            self.frame(vec![egui::Event::PointerMoved(at)]);
+            let mut res = EditorResponse::NONE;
+            for pressed in [true, false] {
+                res.merge(self.frame(vec![egui::Event::PointerButton {
+                    pos: at,
+                    button,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }]));
+            }
+            res.merge(self.frame(Vec::new()));
+            res
+        }
+
+        /// Press the cross in track `track`'s gutter.
+        fn remove_track_by_cross(&mut self, track: usize) -> EditorResponse {
+            let at = self.ask_rect(None, Some(track)).center();
+            self.click_at(at, egui::PointerButton::Primary)
+        }
+
+        /// Press the cross on instrument `row`'s line.
+        fn remove_instrument_by_cross(&mut self, row: usize) -> EditorResponse {
+            let at = self.ask_rect(Some(row), None).center();
+            self.click_at(at, egui::PointerButton::Primary)
+        }
+
+        /// Open track `track`'s menu on clear ground and choose an item
+        /// whose label starts with `prefix`.
+        ///
+        /// The pointer is moved *into* the menu first, as anyone choosing
+        /// from it must: an item that re-reads the lane under the pointer
+        /// greys out the instant it can be reached (#62).
+        fn open_track_menu(&mut self, track: usize) {
+            // Clear ground: to the right of every note the track holds,
+            // found from the published geometry rather than guessed at a
+            // beat the recipe might have filled.
+            let visible = self.state.timeline_rect().intersect(self.panel);
+            let past_notes = self
+                .state
+                .notes()
+                .iter()
+                .filter(|n| n.track == track)
+                .map(|n| n.extent.right())
+                .fold(visible.left() + GUTTER, f32::max);
+            let at = Pos2::new(
+                (past_notes + 12.0).min(visible.right() - 8.0),
+                visible.top() + RULER_H + (track as f32 + 0.5) * LANE_H,
+            );
+            self.frame(vec![egui::Event::PointerMoved(at)]);
+            for pressed in [true, false] {
+                self.frame(vec![egui::Event::PointerButton {
+                    pos: at,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                }]);
+            }
+            // The menu is an Area of its own, painted the frame after the
+            // click that opened it.
+            self.frame(Vec::new());
+            // Into the menu, as anyone choosing from it must (#62).
+            self.frame(vec![egui::Event::PointerMoved(at + Vec2::new(14.0, 18.0))]);
+        }
+
+        fn remove_track_by_menu(&mut self, track: usize) -> EditorResponse {
+            self.open_track_menu(track);
+            let res = self.click("Remove this track");
+            self.frame(Vec::new());
+            res
+        }
+
+        fn add_note_by_menu(&mut self, track: usize) -> EditorResponse {
+            self.open_track_menu(track);
+            let res = self.click("Add a");
+            self.frame(Vec::new());
+            res
+        }
+
+        /// Rest the pointer on the topmost control whose label starts with
+        /// `prefix` until its tooltip opens, and return what was painted.
+        ///
+        /// A disabled widget never shows `on_hover_text` and only ever
+        /// shows `on_disabled_hover_text` (#1289), so the only honest way
+        /// to ask whether a refusal explains itself is to hover it.
+        fn hover_texts(&mut self, prefix: &str) -> Vec<String> {
+            let node = self
+                .button(prefix)
+                .unwrap_or_else(|| panic!("no control labelled {prefix:?}\u{2026}"));
+            let b = self
+                .nodes()
+                .find(|(id, _)| *id == node)
+                .and_then(|(_, n)| n.bounds())
+                .expect("the control has no bounds");
+            let at = Pos2::new(0.5 * (b.x0 + b.x1) as f32, 0.5 * (b.y0 + b.y1) as f32);
+            // egui hides tooltips while a click is more recent than the
+            // last pointer movement — "it is common to click a widget and
+            // then rest the mouse there" (Tooltip::should_show_tooltip). A
+            // menu is opened by a click, so the click has to be let go
+            // stale *before* the pointer moves onto the item, or the
+            // reason never appears and the test reads that as a missing
+            // hover. A dozen frames is a fifth of a second at the harness's
+            // predicted frame time; the gate needs a tenth.
+            for _ in 0..12 {
+                self.frame(Vec::new());
+            }
+            self.frame(vec![egui::Event::PointerMoved(at)]);
+            // And egui opens a tooltip on the frame after the hover is
+            // established, not on the frame the pointer arrives.
+            self.frame(Vec::new());
+            self.frame(Vec::new());
+            self.texts()
         }
 
         /// The text of everything the last frame painted.
@@ -3356,7 +3965,12 @@ mod tests {
 
         // Removing inst1 frees the name and moves inst2's row up; the typed
         // name moves with it but waits for the user.
+        //
+        // Notes play inst1, so the cross asks rather than removes (#63,
+        // Overlands #1336 C2) and the removal is the answer to it.
         driver.click("\u{2716}");
+        driver.frame(Vec::new());
+        driver.click("Remove");
         for _ in 0..3 {
             driver.frame(Vec::new());
         }
@@ -3389,7 +4003,7 @@ mod tests {
     #[test]
     fn names_are_trimmed_and_limited_to_symbios_audios_byte_bound() {
         assert_eq!(
-            instrument_id_byte_limit(),
+            EditorLimits::default().get(Cap::InstrumentIdBytes),
             128,
             "the bound Overlands' sanitiser pins"
         );
@@ -4868,5 +5482,402 @@ mod tests {
         let fresh = SequenceEditorState::default();
         assert_eq!(fresh.timeline_rect(), Rect::NOTHING);
         assert!(fresh.notes().is_empty());
+    }
+
+    // -----------------------------------------------------------------
+    // Limits and validation (#63, Overlands #1336 C2, C8)
+    // -----------------------------------------------------------------
+
+    /// A recipe whose `cap` is already used up, and limits small enough to
+    /// reach without building a 4 096-note track in a test.
+    fn tiny_limits() -> EditorLimits {
+        EditorLimits::from_envelope(Envelope {
+            max_nodes: 3,
+            max_connections_per_port: 2,
+            max_track_events: 3,
+            max_instruments: 2,
+            max_tracks: 2,
+            max_instrument_id_bytes: 4,
+        })
+    }
+
+    fn driver_with_limits(recipe: SequenceRecipe, limits: EditorLimits) -> Driver {
+        let mut state = SequenceEditorState::default();
+        state.set_limits(limits);
+        Driver::with_state(recipe, state)
+    }
+
+    /// Whether a button whose label starts with `prefix` is offered *and*
+    /// enabled, read from the AccessKit tree the way a screen reader does.
+    fn offered(driver: &Driver, prefix: &str) -> bool {
+        driver.nodes().any(|(_, n)| {
+            n.role() == accesskit::Role::Button
+                && n.label().is_some_and(|l| l.starts_with(prefix))
+                && !n.is_disabled()
+        })
+    }
+
+    /// **C8's acceptance, as one walk of the roster.** Every field of
+    /// [`EditorLimits`] both refuses something at its cap and says so.
+    ///
+    /// The match is exhaustive, so a seventh cap cannot be added without an
+    /// arm here that names the surface it guards — the shape
+    /// `the_distinct_style_gives_every_role_its_own_colour` has for style
+    /// roles and `Snap::ALL` has for the grid.
+    #[test]
+    fn every_cap_refuses_at_its_number_and_says_why() {
+        let limits = tiny_limits();
+        for cap in Cap::ALL {
+            let n = limits.get(cap);
+            let reason = limits.at(cap, n).full_reason();
+            match cap {
+                Cap::Instruments => {
+                    let full = recipe_with(&["a", "b"], 1);
+                    let mut driver = driver_with_limits(full, limits);
+                    driver.frame(Vec::new());
+                    assert!(
+                        !offered(&driver, "Add instrument"),
+                        "a {n}-instrument recipe still offers another"
+                    );
+                    let said = driver.hover_texts("Add instrument");
+                    assert!(
+                        said.iter().any(|t| t == &reason),
+                        "the disabled Add does not say why: {said:?}"
+                    );
+                    let mut driver = driver_with_limits(recipe_with(&["a"], 1), limits);
+                    driver.frame(Vec::new());
+                    assert!(offered(&driver, "Add instrument"), "one below the cap");
+                    driver.click("Add instrument");
+                    assert_eq!(driver.recipe.instruments.len(), 2);
+                }
+                Cap::Tracks => {
+                    let mut driver = driver_with_limits(recipe_with(&["a"], 2), limits);
+                    driver.frame(Vec::new());
+                    assert!(!offered(&driver, "Add track"), "a {n}-track recipe");
+                    let said = driver.hover_texts("Add track");
+                    assert!(
+                        said.iter().any(|t| t == &reason),
+                        "the disabled Add does not say why: {said:?}"
+                    );
+                    let mut driver = driver_with_limits(recipe_with(&["a"], 1), limits);
+                    driver.frame(Vec::new());
+                    assert!(offered(&driver, "Add track"));
+                    driver.click("Add track");
+                    assert_eq!(driver.recipe.tracks.len(), 2);
+                }
+                Cap::TrackEvents => {
+                    // Both doors: the menu's item, and the double-click.
+                    let mut recipe = recipe_with(&["a"], 1);
+                    recipe.tracks[0].events = (0..3).map(|i| note("a", i as f32)).collect();
+                    let mut driver = driver_with_limits(recipe, limits);
+                    driver.frame(Vec::new());
+                    let before = driver.recipe.tracks[0].events.len();
+                    driver.open_track_menu(0);
+                    assert!(
+                        !offered(&driver, "Add a"),
+                        "a full track still offers a note"
+                    );
+                    // In the menu itself: egui shows no tooltip at all
+                    // while a menu is open, so a reason left to
+                    // `on_disabled_hover_text` here would never be read.
+                    assert!(
+                        driver.texts().iter().any(|t| t == &reason),
+                        "the menu's refused item does not say why: {:?}",
+                        driver.texts()
+                    );
+                    driver.click("Add a");
+                    driver.frame(Vec::new());
+                    assert_eq!(
+                        driver.recipe.tracks[0].events.len(),
+                        before,
+                        "a full track took another note from its menu"
+                    );
+                    let mut recipe = recipe_with(&["a"], 1);
+                    recipe.tracks[0].events = vec![note("a", 0.0)];
+                    let mut driver = driver_with_limits(recipe, limits);
+                    driver.frame(Vec::new());
+                    driver.add_note_by_menu(0);
+                    assert_eq!(
+                        driver.recipe.tracks[0].events.len(),
+                        2,
+                        "one below the cap the menu still adds"
+                    );
+                }
+                Cap::InstrumentIdBytes => {
+                    let recipe = recipe_with(&["ab"], 1);
+                    let mut driver = driver_with_limits(recipe, limits);
+                    driver.focus("ab");
+                    driver.frame(vec![typed("cdefg")]);
+                    driver.frame(vec![key(egui::Key::Enter)]);
+                    assert_eq!(
+                        instrument_ids(&driver.recipe),
+                        ["ab"],
+                        "a name past {n} bytes was applied anyway"
+                    );
+                    assert!(
+                        driver.paints(&format!("the limit is {n}")),
+                        "the field does not say the limit: {:?}",
+                        driver.texts()
+                    );
+                }
+                // The two the canvas owns; they are driven in graph.rs,
+                // where the canvas's own harness is. Named here so the
+                // match stays exhaustive and the roster stays one list.
+                Cap::Nodes | Cap::ConnectionsPerPort => {
+                    assert!(!reason.is_empty());
+                }
+            }
+        }
+    }
+
+    /// The count is on screen, and it changes colour as it fills.
+    #[test]
+    fn the_readout_says_how_many_of_how_many_and_warns_near_the_cap() {
+        let limits = EditorLimits::from_envelope(Envelope {
+            max_tracks: 10,
+            ..Envelope::default()
+        });
+        for (tracks, want, tone) in [
+            (1_usize, "1 / 10", CapTone::Quiet),
+            (8, "8 / 10", CapTone::Warn),
+            (10, "10 / 10", CapTone::Full),
+        ] {
+            let mut driver = driver_with_limits(recipe_with(&["a"], tracks), limits);
+            driver.frame(Vec::new());
+            assert!(
+                driver.texts().iter().any(|t| t == want),
+                "no {want} readout with {tracks} tracks: {:?}",
+                driver.texts()
+            );
+            let style = distinct_style();
+            let painted = text_painted(&driver.out, want)
+                .unwrap_or_else(|| panic!("{want} was not painted"))
+                .1;
+            match tone {
+                CapTone::Warn => assert_eq!(painted, style.warn, "{want} is not in the warn tone"),
+                CapTone::Full => assert_eq!(painted, style.error, "{want} is not in the full tone"),
+                CapTone::Quiet => {
+                    assert_ne!(painted, style.warn);
+                    assert_ne!(painted, style.error);
+                }
+            }
+        }
+    }
+
+    /// **C2's acceptance.** A track with notes asks and does not go until
+    /// Remove; an empty one goes at once.
+    #[test]
+    fn a_track_with_notes_asks_before_it_goes_and_an_empty_one_does_not() {
+        let mut recipe = recipe_with(&["a"], 2);
+        recipe.tracks[0].events = vec![note("a", 0.0), note("a", 1.0)];
+        let mut driver = Driver::new(recipe);
+
+        driver.remove_track_by_cross(0);
+        assert_eq!(driver.recipe.tracks.len(), 2, "it went without asking");
+        assert!(driver.state.awaiting_confirmation());
+        assert!(
+            driver.paints("Remove track 1?") && driver.paints("2 notes"),
+            "the question does not say what is lost: {:?}",
+            driver.texts()
+        );
+        let res = driver.click("Remove");
+        assert_eq!(driver.recipe.tracks.len(), 1);
+        assert!(!driver.state.awaiting_confirmation());
+        assert!(res.changed && res.rebake, "a confirmed removal commits");
+
+        // The one left is empty, so it goes on the click.
+        driver.frame(Vec::new());
+        driver.remove_track_by_cross(0);
+        assert!(
+            driver.recipe.tracks.is_empty(),
+            "an empty track still asked"
+        );
+        assert!(!driver.state.awaiting_confirmation());
+    }
+
+    /// Both doors ask. Step 8 gave a track a second way out — "Remove this
+    /// track" in its own menu — so a confirmation wired to the gutter's
+    /// cross alone would have left the menu unguarded.
+    #[test]
+    fn both_ways_of_removing_a_track_ask_the_same_question() {
+        let mut recipe = recipe_with(&["a"], 2);
+        recipe.tracks[0].events = vec![note("a", 0.0)];
+        for by_menu in [false, true] {
+            let mut driver = Driver::new(recipe.clone());
+            if by_menu {
+                driver.remove_track_by_menu(0);
+            } else {
+                driver.remove_track_by_cross(0);
+            }
+            assert_eq!(
+                driver.recipe.tracks.len(),
+                2,
+                "removed without asking (by_menu = {by_menu})"
+            );
+            assert!(driver.state.awaiting_confirmation(), "by_menu = {by_menu}");
+            driver.click("Remove");
+            assert_eq!(driver.recipe.tracks.len(), 1, "by_menu = {by_menu}");
+        }
+    }
+
+    /// An instrument other notes name asks and says how many; an unused one
+    /// goes at once.
+    #[test]
+    fn an_instrument_notes_use_asks_and_says_how_many() {
+        let mut recipe = recipe_with(&["used", "spare"], 1);
+        recipe.tracks[0].events = vec![note("used", 0.0), note("used", 1.0), note("used", 2.0)];
+        let mut driver = Driver::new(recipe);
+        driver.frame(Vec::new());
+
+        // The spare is named by nothing, so its cross removes it outright.
+        driver.remove_instrument_by_cross(1);
+        assert_eq!(instrument_ids(&driver.recipe), ["used"]);
+        assert!(!driver.state.awaiting_confirmation());
+
+        driver.remove_instrument_by_cross(0);
+        assert_eq!(instrument_ids(&driver.recipe), ["used"], "it went anyway");
+        assert!(
+            driver.paints("Remove \u{201C}used\u{201D}?") && driver.paints("3 notes"),
+            "the question does not name it or count them: {:?}",
+            driver.texts()
+        );
+        driver.click("Remove");
+        assert!(driver.recipe.instruments.is_empty());
+    }
+
+    /// Keep and Escape both put the question away and leave everything
+    /// where it was, and Escape spends exactly one press and reports it.
+    #[test]
+    fn keep_and_escape_both_cancel_a_removal() {
+        let mut recipe = recipe_with(&["a"], 2);
+        recipe.tracks[0].events = vec![note("a", 0.0)];
+
+        let mut driver = Driver::new(recipe.clone());
+        driver.remove_track_by_cross(0);
+        driver.click("Keep");
+        assert_eq!(driver.recipe.tracks.len(), 2, "Keep removed it");
+        assert!(!driver.state.awaiting_confirmation());
+
+        let mut driver = Driver::new(recipe);
+        driver.remove_track_by_cross(0);
+        driver.point_at_timeline();
+        assert!(driver.state.awaiting_confirmation());
+        driver.frame(vec![key(egui::Key::Escape)]);
+        assert_eq!(driver.recipe.tracks.len(), 2, "Escape removed it");
+        assert!(!driver.state.awaiting_confirmation());
+        assert!(
+            driver.state.took_escape(),
+            "the press was spent without saying so, and the host's Esc \
+             ladder would close the pop-out under the question"
+        );
+        // And it was exactly one press: the next one is the selection's.
+        driver.frame(Vec::new());
+        assert!(!driver.state.took_escape());
+    }
+
+    /// A confirmed removal is one committed edit, so one undo brings it
+    /// back — the confirmation is a second look, not a replacement for the
+    /// history step 7a gave the recipe.
+    #[test]
+    fn one_undo_brings_back_a_confirmed_removal() {
+        let mut recipe = recipe_with(&["a"], 2);
+        recipe.tracks[0].events = vec![note("a", 0.0), note("a", 1.5)];
+        let mut driver = Driver::new(recipe);
+        driver.frame(Vec::new());
+
+        driver.remove_track_by_cross(0);
+        driver.click("Remove");
+        driver.frame(Vec::new());
+        assert_eq!(driver.recipe.tracks.len(), 1);
+
+        driver.point_at_timeline();
+        driver.frame(vec![chord(egui::Key::Z, egui::Modifiers::COMMAND)]);
+        assert_eq!(
+            driver.recipe.tracks.len(),
+            2,
+            "one undo did not bring it back"
+        );
+        assert_eq!(
+            note_ids(&driver.recipe)[0],
+            ["a", "a"],
+            "the notes came back with it"
+        );
+    }
+
+    /// The buttons are nowhere near the cross that summoned them.
+    ///
+    /// An affordance at the point the user clicks is hovered by that same
+    /// click, and a question whose Remove lands under a pointer that has
+    /// just pressed ✖ is a double-click away from removing something
+    /// nobody looked at. Measured against the *published* rects rather than
+    /// worked out again here.
+    #[test]
+    fn the_question_is_drawn_clear_of_every_cross_that_could_have_asked_it() {
+        let mut recipe = recipe_with(&["used", "spare"], 3);
+        recipe.tracks[0].events = vec![note("used", 0.0)];
+        recipe.tracks[1].events = vec![note("used", 2.0)];
+        for by_menu in [false, true] {
+            let mut driver = Driver::new(recipe.clone());
+            if by_menu {
+                driver.remove_track_by_menu(1);
+            } else {
+                driver.remove_track_by_cross(1);
+            }
+            driver.frame(Vec::new());
+            let bar = driver
+                .state
+                .confirmation_rect()
+                .expect("no question is up (by_menu = {by_menu})");
+            let asks = driver.state.removal_asks().to_vec();
+            assert!(!asks.is_empty(), "no removal control was published");
+            for cross in &asks {
+                assert!(
+                    !bar.intersects(*cross),
+                    "the question at {bar:?} covers a removal cross at {cross:?} \
+                     (by_menu = {by_menu})"
+                );
+            }
+            // And the buttons themselves, not just the frame around them.
+            for button in ["Keep", "Remove"] {
+                let node = driver.button(button).expect("button");
+                let b = driver
+                    .nodes()
+                    .find(|(id, _)| *id == node)
+                    .and_then(|(_, n)| n.bounds())
+                    .expect("bounds");
+                let rect = Rect::from_min_max(
+                    Pos2::new(b.x0 as f32, b.y0 as f32),
+                    Pos2::new(b.x1 as f32, b.y1 as f32),
+                );
+                for cross in &asks {
+                    assert!(
+                        !rect.intersects(*cross),
+                        "{button} at {rect:?} sits on a cross at {cross:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// While a question is up, nothing else offers a removal: the bar
+    /// pushed every row below it down, so a pointer left where it clicked
+    /// is resting on some *other* row's cross.
+    #[test]
+    fn no_other_removal_is_offered_while_a_question_is_up() {
+        let mut recipe = recipe_with(&["used", "spare"], 2);
+        recipe.tracks[0].events = vec![note("used", 0.0)];
+        let mut driver = Driver::new(recipe);
+        driver.frame(Vec::new());
+        assert!(offered(&driver, "\u{2716}"), "the crosses start live");
+
+        driver.remove_track_by_cross(0);
+        driver.frame(Vec::new());
+        assert!(
+            !offered(&driver, "\u{2716}"),
+            "an instrument can still be removed while a question is up"
+        );
+        driver.click("Keep");
+        driver.frame(Vec::new());
+        assert!(offered(&driver, "\u{2716}"), "they never came back");
     }
 }

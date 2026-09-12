@@ -30,7 +30,7 @@ use crate::noise::{BrownNoise, PinkNoise, WhiteNoise};
 use crate::oscillator::{AntiAlias, SawPolarity, SawtoothOsc, SineOsc, SquareOsc, TriangleOsc};
 use crate::reverb::Reverb;
 
-use super::{EditorResponse, bool_instant, drag_value_debounced, slider_debounced};
+use super::{EditorResponse, bool_instant, drag_value_debounced, ranged_slider};
 
 // ---------------------------------------------------------------------------
 // Editor-generating macro
@@ -100,22 +100,16 @@ macro_rules! impl_node_editor {
     (@w $ui:ident, $cfg:ident, $res:ident,
      slider ($label:expr, $unit:expr, $field:ident, $range:expr)) => {
         $ui.label($label);
-        $res.merge(slider_debounced(
-            $ui,
-            egui::Slider::new(&mut $cfg.$field, $range).suffix($unit),
-        ));
+        $res.merge(ranged_slider($ui, &mut $cfg.$field, $range, |s| s.suffix($unit)));
         $ui.end_row();
     };
     // f32 logarithmic slider — for frequencies / rates (matches `f32_log`).
     (@w $ui:ident, $cfg:ident, $res:ident,
      slider_log ($label:expr, $unit:expr, $field:ident, $range:expr)) => {
         $ui.label($label);
-        $res.merge(slider_debounced(
-            $ui,
-            egui::Slider::new(&mut $cfg.$field, $range)
-                .logarithmic(true)
-                .suffix($unit),
-        ));
+        $res.merge(ranged_slider($ui, &mut $cfg.$field, $range, |s| {
+            s.logarithmic(true).suffix($unit)
+        }));
         $ui.end_row();
     };
     // f32 drag value (wide-range amounts), clamped to `range`.
@@ -564,6 +558,195 @@ mod tests {
     use super::*;
 
     use crate::ui::test_paint::shapes;
+
+    /// One frame of `kind`'s body on a headless context: what it reported
+    /// and what it drew.
+    ///
+    /// The frame is *rendered* — B11's failure is a write that happens
+    /// while the widget is drawn, with nothing touching it — so a test that
+    /// only constructs the editor would see nothing.
+    fn run_body(kind: &mut NodeKind) -> (EditorResponse, egui::FullOutput) {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        let mut res = EditorResponse::NONE;
+        let out = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(600.0, 600.0),
+                )),
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    res = node_kind_body(ui, kind);
+                });
+            },
+        );
+        (res, out)
+    }
+
+    /// A node holding `value` in one field, the field's name, and how to
+    /// read it back — one row per range #1336 B11 names.
+    ///
+    /// One row: what it is called, the node holding it, how to read the
+    /// field back, and the value it should still be afterwards.
+    type OutOfTrack = (&'static str, NodeKind, fn(&NodeKind) -> f32, f32);
+
+    /// Each value is one the *record* is allowed to hold and the editor's
+    /// slider is not: the editor's ranges are the genetics bounds and the
+    /// sanitiser's are wider (amplitude to ±8 against a 0-1 track, cutoff to
+    /// 22 050 Hz against 20-20 000, the ADSR stages to 60 s against 10, Q to
+    /// 64 against 20, an LFO to 1 000 Hz against 0.01-30).
+    fn out_of_track_nodes() -> Vec<OutOfTrack> {
+        vec![
+            (
+                "amplitude",
+                NodeKind::Sine(SineOsc {
+                    amplitude: 2.5,
+                    ..SineOsc::default()
+                }),
+                (|k| match k {
+                    NodeKind::Sine(c) => c.amplitude,
+                    _ => unreachable!(),
+                }) as fn(&NodeKind) -> f32,
+                2.5,
+            ),
+            (
+                "cutoff",
+                NodeKind::BiquadLowpass(BiquadLowpass {
+                    cutoff_hz: 22_000.0,
+                    ..BiquadLowpass::default()
+                }),
+                |k| match k {
+                    NodeKind::BiquadLowpass(c) => c.cutoff_hz,
+                    _ => unreachable!(),
+                },
+                22_000.0,
+            ),
+            (
+                "Q",
+                NodeKind::BiquadLowpass(BiquadLowpass {
+                    q: 64.0,
+                    ..BiquadLowpass::default()
+                }),
+                |k| match k {
+                    NodeKind::BiquadLowpass(c) => c.q,
+                    _ => unreachable!(),
+                },
+                64.0,
+            ),
+            (
+                "an ADSR stage",
+                NodeKind::Adsr(AdsrEnvelope {
+                    attack_s: 60.0,
+                    ..AdsrEnvelope::default()
+                }),
+                |k| match k {
+                    NodeKind::Adsr(c) => c.attack_s,
+                    _ => unreachable!(),
+                },
+                60.0,
+            ),
+            (
+                "an LFO rate",
+                NodeKind::Lfo(Lfo {
+                    rate_hz: 1_000.0,
+                    ..Lfo::default()
+                }),
+                |k| match k {
+                    NodeKind::Lfo(c) => c.rate_hz,
+                    _ => unreachable!(),
+                },
+                1_000.0,
+            ),
+        ]
+    }
+
+    /// **B11's acceptance** (#63, Overlands #1336). A value the record is
+    /// allowed to hold and the slider's track is not survives a rendered
+    /// frame, bit for bit, and the frame reports nothing changed.
+    ///
+    /// egui's default is `SliderClamping::Always`, which writes the clamped
+    /// value back on the frame the slider is *drawn*: opening a patch with
+    /// an amplitude of 2.5 made it 1.0, with no `changed` flag to say so,
+    /// and the pop-out's next commit wrote the loss into the record. Flip
+    /// `ranged_slider`'s clamping back to `Always` and every row here fails.
+    #[test]
+    fn a_value_beyond_a_sliders_track_survives_being_drawn() {
+        for (what, mut kind, read, value) in out_of_track_nodes() {
+            let (res, _) = run_body(&mut kind);
+            assert_eq!(
+                read(&kind).to_bits(),
+                value.to_bits(),
+                "{what} was rewritten by drawing it: {} instead of {value}",
+                read(&kind)
+            );
+            assert_eq!(
+                res,
+                EditorResponse::NONE,
+                "{what} reported an edit nobody made"
+            );
+        }
+        // Ten more frames: a rewrite that needs the widget to have been
+        // drawn once would be invisible to a single-frame check.
+        for (what, mut kind, read, value) in out_of_track_nodes() {
+            for _ in 0..10 {
+                run_body(&mut kind);
+            }
+            assert_eq!(
+                read(&kind).to_bits(),
+                value.to_bits(),
+                "{what} drifted over ten frames"
+            );
+        }
+    }
+
+    /// The handle of a slider whose value is off its track is pinned at the
+    /// end, which is indistinguishable from a value that really is at the
+    /// end — so the row says so, and the hover says the value and the track.
+    #[test]
+    fn a_value_beyond_the_track_is_marked_with_its_value_and_its_range() {
+        let mut kind = NodeKind::Sine(SineOsc {
+            amplitude: 2.5,
+            ..SineOsc::default()
+        });
+        let (_, out) = run_body(&mut kind);
+        let painted: Vec<String> = shapes(&out)
+            .into_iter()
+            .filter_map(|s| match s {
+                egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            painted.iter().any(|t| t == "!"),
+            "nothing marks the amplitude as off its track: {painted:?}"
+        );
+        // The mark is ASCII on purpose: the hosted glyph list is a floor
+        // every host has to carry a font for (#52).
+        assert!(
+            painted.iter().all(|t| t.is_ascii() || !t.contains('!')),
+            "the mark is not the ASCII one: {painted:?}"
+        );
+
+        let mut inside = NodeKind::Sine(SineOsc {
+            amplitude: 0.5,
+            ..SineOsc::default()
+        });
+        let (_, out) = run_body(&mut inside);
+        let painted: Vec<String> = shapes(&out)
+            .into_iter()
+            .filter_map(|s| match s {
+                egui::Shape::Text(t) => Some(t.galley.text().to_owned()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !painted.iter().any(|t| t == "!"),
+            "a value inside its track is marked anyway: {painted:?}"
+        );
+    }
 
     /// Every string `body` paints for `kind`, on a headless context.
     fn painted_body(kind: &mut NodeKind) -> Vec<String> {
