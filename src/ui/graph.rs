@@ -39,18 +39,33 @@
 //!   when nothing does — and so does a port that is not one of its kind's
 //!   own (from JSON). While a wire is dragged it is drawn over the boxes,
 //!   the port it would connect to is highlighted in the host's selection
-//!   colour, and a tooltip names it ("➡ #2 Lowpass · cutoff_hz"); over no
-//!   port, nothing is lit and a release does nothing. Only the box on top
-//!   under the pointer can take the wire, so a row another box covers is
-//!   out of reach.
-//! - **Amounts / constants / deletes:** the "Inputs" section inside each node
-//!   box edits each connection's `amount` (or a [`Connection::Constant`]'s
-//!   value) and removes connections. Each wire's row names the node it
-//!   comes from ("from #1 LFO"), so nothing on the canvas asks the reader
-//!   to remember what a number stands for.
+//!   colour, and a tooltip names it ("➡ #2 Lowpass · cutoff_hz"). Only
+//!   the box on top under the pointer can take the wire, so a row another
+//!   box covers is out of reach. Let go over no port and the wire is not
+//!   thrown away: it opens the Add menu there and drives what is chosen.
+//! - **Touch a wire:** the wires are hit-tested against their curves, a few
+//!   points either side ([`WireGeom::distance_to`]). Hovering one lights it
+//!   and names both its ends, its port and its amount; a click picks it,
+//!   Delete removes it, and picking it opens a small panel at the middle of
+//!   its curve naming what it drives, with its amount and a cross — drawn in
+//!   screen space so it stays readable at any zoom. A wire is
+//!   taken off its port by its *end* — a grab point short of the dot,
+//!   since several wires can end on one — and dropped on another port to
+//!   re-route it, keeping the amount it carried, or on nothing to
+//!   disconnect it.
+//! - **Amounts / constants / deletes in the box:** the "Inputs" section
+//!   inside each node box edits each connection's `amount` (or a
+//!   [`Connection::Constant`]'s value) and removes connections; a constant
+//!   has no wire, so that section is the only place to edit one. Each
+//!   wire's row names the node it comes from ("from #1 LFO"), so nothing on
+//!   the canvas asks the reader to remember what a number stands for.
 //! - **Add / remove nodes, set output:** the one toolbar row above the
 //!   canvas — Add node, Delete, Tidy, Fit view, the Output picker and a
-//!   More menu holding the genetics controls and the JSON box.
+//!   More menu holding the genetics controls and the JSON box. Add node is
+//!   a menu grouped by role, built by walking the generated roster so a
+//!   kind added upstream appears in it on the version bump alone; the same
+//!   menu opens on a right-click on clear canvas and puts the node there.
+//!   Delete acts on whatever is picked, a node or a wire, and says which.
 //!
 //! Structural edits are collected as deferred `Action`s while the node loop
 //! holds `&mut patch.graph.nodes`, then applied once the loop's borrow ends —
@@ -59,6 +74,11 @@
 //! Validity ([`topo_sort`]) is shown live at the right of the toolbar and
 //! the output node wears an OUT badge in its title, so cycles /
 //! missing-output / unknown-node are visible the moment they're created.
+//! The same line counts what is *heard* — the nodes the output can be
+//! reached from along the wires — because "3 nodes" is true of a patch
+//! where two of them bake into nothing. A node nothing hears has its
+//! contents dimmed and wears a "not heard" badge, while its frame keeps
+//! full strength so it is still visibly a box to edit.
 //! The badge is a badge and not a border because the selection is a border
 //! — a thicker one — and a node can be both the output and selected. A broken graph is also located: the toolbar
 //! names the nodes at fault ("#0 Gain and #1 Gain feed each other in a
@@ -80,17 +100,19 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use bevy_egui::egui::{
     self, Align, Color32, Id, Layout, Pos2, Rect, Sense, Stroke, UiBuilder, Vec2,
+    emath::TSTransform,
 };
 
 use crate::node::NodeKind;
-use crate::oscillator::SineOsc;
 use crate::patch::{AudioPatch, Connection, GraphError, GraphNode, NodeGraph, NodeId, topo_sort};
 
 use super::EditorResponse;
 use super::evolve::{fresh_rng, mutate_node_kind, mutate_patch, randomize_seed};
 use super::history::EditHistory;
 use super::io::json_io;
-use super::node::{node_kind_body, node_kind_label, node_kind_picker};
+use super::node::{
+    default_kind_for, kinds_by_group, node_kind_body, node_kind_label, node_kind_picker,
+};
 use super::style::{EditorStyle, editor_style};
 
 /// The narrowest a node box is laid out at. A box whose content needs more
@@ -120,6 +142,17 @@ const GRID_MAX_LINES: usize = 240;
 /// How close (scene units) a wire drop must land to an input dot to connect
 /// when it is not on the port's row.
 const SNAP_DIST: f32 = 26.0;
+/// How close the pointer must come to a wire to hover it, in *screen*
+/// points: a wire is as easy to catch zoomed out as zoomed in.
+const WIRE_HIT_DIST: f32 = 6.0;
+/// How big a wire's end grab point is, in screen points: the square the
+/// pointer takes hold of to move a wire off its port. Big enough to hit
+/// without covering the wire's own curve.
+const WIRE_GRAB_RADIUS: f32 = 7.0;
+/// What a node the output never reaches wears in its title, and how much of
+/// its box's opacity is left.
+const NOT_HEARD: &str = "not heard";
+const NOT_HEARD_OPACITY: f32 = 0.45;
 
 /// Editor-side state for the patch canvas — node layout and view, kept out of
 /// the serialized [`AudioPatch`] so the wire format stays clean.
@@ -150,6 +183,8 @@ pub struct PatchEditorState {
     took_escape: bool,
     /// The [`egui::Scene`] view rectangle — pan and zoom live here.
     scene_rect: Rect,
+    /// The canvas layer's scene→screen transform as the last frame set it.
+    canvas_to_screen: TSTransform,
     /// Selected node (delete target + highlight).
     selected: Option<NodeId>,
     /// Mutation rate for the Mutate buttons.
@@ -163,6 +198,32 @@ pub struct PatchEditorState {
     /// Each node's box as the canvas last drew it, in drawing order: a box
     /// lies over the ones before it.
     boxes: Vec<(NodeId, Rect)>,
+    /// Every wire as the canvas last drew it, for hit-testing and for
+    /// whoever asks ([`Self::wires`]).
+    wires: Vec<WireGeom>,
+    /// The wire the user picked, while the canvas still draws it.
+    selected_wire: Option<WireRef>,
+    /// An open Add menu: where it was asked for, and the wire it would
+    /// complete.
+    add_menu: Option<AddMenu>,
+}
+
+/// An open Add menu on the canvas.
+#[derive(Clone, Debug)]
+struct AddMenu {
+    /// Where the node will be put, in canvas units — where the menu was
+    /// opened, so the node lands under the pointer that asked for it.
+    at: Pos2,
+    /// An output the new node's first input is wired from: the menu opened
+    /// by dropping a wire on empty canvas finishes the wire.
+    from: Option<NodeId>,
+    /// Whether the menu has been drawn at least once.
+    ///
+    /// The press that opens a menu is still this frame's press, and an
+    /// `Area` on its first frame does not yet know where it is, so a menu
+    /// that took any press outside itself as a dismissal would close on the
+    /// very click that asked for it.
+    shown: bool,
 }
 
 impl Default for PatchEditorState {
@@ -174,6 +235,7 @@ impl Default for PatchEditorState {
             relayout: false,
             show_json: false,
             scene_rect: Rect::from_min_size(Pos2::ZERO, Vec2::new(1000.0, 700.0)),
+            canvas_to_screen: TSTransform::IDENTITY,
             selected: None,
             mutate_rate: 0.3,
             json: super::JsonIoState::default(),
@@ -183,8 +245,110 @@ impl Default for PatchEditorState {
             ports: Vec::new(),
             outputs: HashMap::new(),
             boxes: Vec::new(),
+            wires: Vec::new(),
+            selected_wire: None,
+            add_menu: None,
         }
     }
+}
+
+/// One wire as the canvas last drew it, in canvas units (#61, Overlands
+/// #1334 B2).
+///
+/// A wire used to be paint and nothing else: to remove one you found its
+/// cross in the destination box's Inputs list. The canvas keeps them so it
+/// can hit-test them, and publishes them ([`PatchEditorState::wires`]) so a
+/// host can hang something on one and a scripted harness can put the
+/// pointer on one (crate #67).
+#[derive(Clone, Debug, PartialEq)]
+pub struct WireGeom {
+    /// The node the wire leaves, by its output.
+    pub from: NodeId,
+    /// The node it drives.
+    pub to: NodeId,
+    /// Which of `to`'s input ports it drives.
+    pub port: String,
+    /// Which of that port's connections it is — a port holds a list, summed
+    /// at bake time, so a port can have several wires into it.
+    pub index: usize,
+    /// The wire's curve, sampled; the `from` end first.
+    pub points: Vec<Pos2>,
+}
+
+impl WireGeom {
+    /// The middle of the curve, where the wire's remove cross sits and
+    /// where its amount editor opens.
+    pub fn midpoint(&self) -> Pos2 {
+        self.points
+            .get(self.points.len() / 2)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// How far `at` is from the curve, in canvas units.
+    ///
+    /// Against the curve and not its bounding box: the S-curve between two
+    /// boxes bulges well away from the straight line between the dots, and
+    /// a box test would take a click in the clear space beside it.
+    pub fn distance_to(&self, at: Pos2) -> f32 {
+        self.points
+            .windows(2)
+            .map(|seg| distance_to_segment(at, seg[0], seg[1]))
+            .fold(f32::INFINITY, f32::min)
+    }
+
+    /// Which connection this wire is, without its geometry.
+    fn wire_ref(&self) -> WireRef {
+        WireRef {
+            to: self.to,
+            port: self.port.clone(),
+            index: self.index,
+        }
+    }
+}
+
+/// Which connection a wire stands for: a port holds a list, so the index
+/// within the port is part of the name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WireRef {
+    to: NodeId,
+    port: String,
+    index: usize,
+}
+
+/// The wire passing nearest `at`, if one passes within `within` canvas
+/// units of it.
+fn wire_at(wires: &[WireGeom], at: Pos2, within: f32) -> Option<&WireGeom> {
+    wires
+        .iter()
+        .map(|w| (w, w.distance_to(at)))
+        .filter(|(_, d)| *d <= within)
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .map(|(w, _)| w)
+}
+
+/// Every node the output can be reached from along the wires — what the
+/// patch actually plays (#61, Overlands #1334 B13).
+///
+/// A walk upstream from the output with a visited set, so a loop among the
+/// nodes it passes through is counted once and does not spin: a broken
+/// graph is exactly when the reader most needs the canvas to keep drawing.
+/// The output node itself is heard even when nothing feeds it.
+fn heard_nodes(graph: &NodeGraph) -> HashSet<NodeId> {
+    let mut heard = HashSet::new();
+    let mut stack = vec![graph.output];
+    while let Some(id) = stack.pop() {
+        if !heard.insert(id) {
+            continue;
+        }
+        if let Some(node) = graph.nodes.iter().find(|n| n.id == id) {
+            stack.extend(upstream_of(node));
+        }
+    }
+    // A wire from a node that is not in the patch names an id nothing has;
+    // the walk reached it, and it is not a node that can be heard.
+    heard.retain(|id| graph.nodes.iter().any(|n| n.id == *id));
+    heard
 }
 
 /// One input port as the canvas drew it, in canvas units.
@@ -393,6 +557,33 @@ impl PatchEditorState {
         self.owns_keys
     }
 
+    /// Every wire the canvas drew on its last frame, in canvas units.
+    ///
+    /// [`Self::canvas_to_screen`] takes one to the screen. Empty before the
+    /// canvas has been drawn once, and re-measured every frame, so a wire
+    /// held across frames should be looked up again rather than kept.
+    pub fn wires(&self) -> &[WireGeom] {
+        &self.wires
+    }
+
+    /// Whether a wire is picked — what Delete removes, and what the amount
+    /// editor on the canvas is open on.
+    pub fn wire_is_selected(&self) -> bool {
+        self.selected_wire.is_some()
+    }
+
+    /// The canvas layer's scene→screen transform as of the last frame drawn.
+    ///
+    /// Everything the canvas remembers about its geometry — a node's
+    /// position, a port's dot — is in scene units, which pan and zoom move
+    /// under the reader. This is what takes them to screen points, so a
+    /// host can hang an overlay on a node, and a scripted harness can press
+    /// where a port is (crate #67). [`TSTransform::IDENTITY`] before the
+    /// canvas has been drawn once.
+    pub fn canvas_to_screen(&self) -> TSTransform {
+        self.canvas_to_screen
+    }
+
     /// Whether the canvas acted on an Escape this frame by clearing its
     /// selection.
     ///
@@ -426,6 +617,27 @@ impl PatchEditorState {
         self.auto.retain(|id| live.contains(id));
         if self.selected.is_some_and(|id| !live.contains(&id)) {
             self.selected = None;
+        }
+        // A wire is named by the node it drives and which of that port's
+        // connections it is, so a removal anywhere in the port's list can
+        // leave the selection pointing at a different wire, or at none.
+        self.forget_removed_wire(patch);
+    }
+
+    /// Drop a wire selection that the patch no longer holds.
+    fn forget_removed_wire(&mut self, patch: &AudioPatch) {
+        let Some(sel) = &self.selected_wire else {
+            return;
+        };
+        let still_there = patch
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.id == sel.to)
+            .and_then(|n| n.inputs.get(&sel.port))
+            .is_some_and(|conns| matches!(conns.get(sel.index), Some(Connection::Node { .. })));
+        if !still_there {
+            self.selected_wire = None;
         }
     }
 }
@@ -640,6 +852,74 @@ fn delete_node(patch: &mut AudioPatch, target: NodeId) {
     }
 }
 
+/// The Add menu's items: every kind the picker offers, under the heading of
+/// the role it fills. Returns the kind chosen, if one was.
+///
+/// Built by walking the generated roster and asking
+/// [`crate::ui::node::kind_group`] what each label is for, never from a
+/// hand-written list of kinds: a kind added upstream appears here on the
+/// version bump alone, under "Other" until this build is told its role
+/// (#50, and #61 / Overlands #1334 B6).
+fn add_menu_items(ui: &mut egui::Ui) -> Option<&'static str> {
+    let mut chosen = None;
+    for (group, kinds) in kinds_by_group() {
+        ui.label(egui::RichText::new(group.title()).weak().small());
+        for label in kinds {
+            if ui.button(label).clicked() {
+                chosen = Some(label);
+                ui.close();
+            }
+        }
+    }
+    chosen
+}
+
+/// Put a node of the kind named `label` at `at` (canvas units), select it,
+/// and wire `from`'s output into its first input if there is one to wire.
+///
+/// Returns the new node's id.
+fn add_node(
+    patch: &mut AudioPatch,
+    state: &mut PatchEditorState,
+    label: &str,
+    at: Pos2,
+    from: Option<NodeId>,
+) -> NodeId {
+    let new_id = NodeId(
+        patch
+            .graph
+            .nodes
+            .iter()
+            .map(|n| n.id.0)
+            .max()
+            .map_or(0, |m| m + 1),
+    );
+    let kind = default_kind_for(label);
+    let mut inputs: BTreeMap<String, Vec<Connection>> = Default::default();
+    // A wire dragged onto empty canvas asked for something to drive, so the
+    // node arrives already driven — by its first input, which is the one a
+    // signal goes into for every kind that has one.
+    //
+    // Unless the node it came from has gone in the meantime: the menu
+    // outlives the frame it was opened in, and a wire from an id nothing
+    // has is a graph that will not bake.
+    if let Some(from) = from
+        && patch.graph.nodes.iter().any(|n| n.id == from)
+        && let Some(port) = input_ports(&kind).first()
+    {
+        inputs.insert((*port).to_string(), vec![Connection::from_node(from)]);
+    }
+    patch.graph.nodes.push(GraphNode {
+        id: new_id,
+        kind,
+        inputs,
+    });
+    state.positions.insert(new_id, at);
+    state.selected = Some(new_id);
+    state.selected_wire = None;
+    new_id
+}
+
 /// Deferred structural edit, applied after the node-drawing loop releases its
 /// borrow on `patch.graph.nodes`.
 enum Action {
@@ -649,6 +929,21 @@ enum Action {
     CompleteWire {
         from: NodeId,
         at: Pos2,
+    },
+    /// Remove one wire, named by the connection it stands for.
+    RemoveWire(WireRef),
+    /// Take a wire off its port and put it on the one under `at`; nowhere
+    /// under `at` disconnects it.
+    RerouteWire {
+        wire: WireRef,
+        from: NodeId,
+        at: Pos2,
+    },
+    /// Put a node of this kind at `at`, wired from `from`'s output.
+    AddNode {
+        label: &'static str,
+        at: Pos2,
+        from: Option<NodeId>,
     },
     /// The node's context menu, applied after the loop like every other
     /// structural edit.
@@ -721,6 +1016,16 @@ pub fn audio_patch_canvas(
         canvas_contents(ui, patch, state, id, &style)
     });
     state.scene_rect = scene_rect;
+    // `Scene` sets the layer's transform before it draws, so this is the
+    // one the content just laid itself out under. Recorded rather than
+    // looked up by the reader: `Memory::to_global` is keyed by layer, and a
+    // host that draws two canvases (a patch and a sequence's instrument)
+    // has no way to tell which entry is whose (crate #67).
+    let layer = inner.response.layer_id;
+    state.canvas_to_screen = ui
+        .ctx()
+        .memory(|m| m.to_global.get(&layer).copied())
+        .unwrap_or(TSTransform::IDENTITY);
     res.merge(inner.inner);
     // This frame's widget edit, recorded before the keyboard is read so a
     // Ctrl+Z in the same frame steps back over it rather than swallowing it.
@@ -808,8 +1113,24 @@ fn canvas_keys(
         // A zero-size rect makes Scene auto-fit to the content next frame.
         state.scene_rect = Rect::ZERO;
     }
-    if keys.escape && state.selected.take().is_some() {
+    // One step per press, most recent first: the Add menu was opened by
+    // the last gesture, a picked wire by the last click before that.
+    if keys.escape
+        && (state.add_menu.take().is_some()
+            || state.selected_wire.take().is_some()
+            || state.selected.take().is_some())
+    {
         state.took_escape = true;
+    }
+    // Delete acts on whatever the last click picked, and picking a wire
+    // clears the node selection, so the two never compete.
+    if keys.delete
+        && let Some(wire) = state.selected_wire.clone()
+        && remove_wire(patch, &wire)
+    {
+        state.forget_removed_wire(patch);
+        res.changed = true;
+        res.rebake = true;
     }
     if let Some(sel) = state.selected {
         if keys.duplicate
@@ -942,10 +1263,26 @@ fn toolbar(
     let mut res = EditorResponse::NONE;
     // The check and the cross are Overlands' `affordances::CHECK` and
     // `CROSS`, its glyphs for valid and failed.
+    let heard = heard_nodes(&patch.graph).len();
     let (colour, line) = match topo_sort(&patch.graph) {
+        // What is there, and what of it the patch plays: "3 nodes" is true
+        // of a patch where two of them bake into nothing (#61, Overlands
+        // #1334 B13). "3 nodes, 3 heard" reads as an arithmetic puzzle in
+        // the one case where there is nothing to look for, so that case
+        // says so in words.
+        Ok(order) if heard >= order.len() => (
+            style.ok,
+            format!(
+                "\u{2714} valid graph \u{2014} {} nodes, all heard",
+                order.len()
+            ),
+        ),
         Ok(order) => (
             style.ok,
-            format!("\u{2714} valid graph \u{2014} {} nodes", order.len()),
+            format!(
+                "\u{2714} valid graph \u{2014} {} nodes, {heard} heard",
+                order.len()
+            ),
         ),
         // Named, and outlined on the canvas below (#57).
         Err(e) => (
@@ -966,51 +1303,66 @@ fn toolbar(
     // buttons had taken their share.
     let mut room_left = 0.0;
     ui.horizontal_wrapped(|ui| {
-        if ui
-            .button("Add node")
-            .on_hover_text("Put a new node in the middle of the view")
-            .clicked()
-        {
-            let new_id = NodeId(
-                patch
-                    .graph
-                    .nodes
-                    .iter()
-                    .map(|n| n.id.0)
-                    .max()
-                    .map_or(0, |m| m + 1),
-            );
-            patch.graph.nodes.push(GraphNode {
-                id: new_id,
-                kind: NodeKind::Sine(SineOsc::default()),
-                inputs: Default::default(),
-            });
-            // Drop it near the centre of the current view so it's visible,
-            // and leave it out of `auto`: the user put it there.
-            state.positions.insert(new_id, state.scene_rect.center());
-            state.selected = Some(new_id);
+        // The kind is chosen where the node is asked for, rather than a
+        // Sine dropped in the middle of the view followed by a trip to the
+        // title's kind combo (#61, Overlands #1334 B6).
+        let mut chosen = None;
+        ui.menu_button("Add node", |ui| {
+            chosen = add_menu_items(ui);
+        })
+        .response
+        .on_hover_text("Put a new node in the middle of the view");
+        if let Some(label) = chosen {
+            // Near the centre of the current view so it is visible, and out
+            // of `auto`: the user put it there.
+            add_node(patch, state, label, state.scene_rect.center(), None);
             res.changed = true;
             res.rebake = true;
         }
 
+        // Delete acts on whatever is picked — a node, or since #61 a wire —
+        // so it says which, and says why when it can do neither (#1289).
         let last_node = patch.graph.nodes.len() <= 1;
-        let can_delete = state.selected.is_some() && !last_node;
-        let why_not = if last_node {
+        let wire = state.selected_wire.clone();
+        let node = state.selected.filter(|_| !last_node);
+        let (can_delete, hover) = match (&wire, node) {
+            (Some(w), _) => (
+                true,
+                format!(
+                    "Remove the wire into {} \u{00B7} {}",
+                    node_name(&patch.graph, w.to),
+                    w.port
+                ),
+            ),
+            (None, Some(_)) => (
+                true,
+                "Remove the selected node and any wires into it".to_string(),
+            ),
+            (None, None) => (false, String::new()),
+        };
+        let why_not = if last_node && state.selected.is_some() {
             "A patch keeps at least one node"
         } else {
-            "Select a node first: click its number"
+            "Select a node or a wire first: click a node's number, or click a wire"
         };
         if ui
             .add_enabled(can_delete, egui::Button::new("Delete"))
-            .on_hover_text("Remove the selected node and any wires into it")
+            .on_hover_text(hover)
             .on_disabled_hover_text(why_not)
             .clicked()
-            && let Some(sel) = state.selected
         {
-            delete_node(patch, sel);
-            state.forget_missing(patch);
-            res.changed = true;
-            res.rebake = true;
+            if let Some(w) = wire {
+                if remove_wire(patch, &w) {
+                    state.forget_removed_wire(patch);
+                    res.changed = true;
+                    res.rebake = true;
+                }
+            } else if let Some(sel) = node {
+                delete_node(patch, sel);
+                state.forget_missing(patch);
+                res.changed = true;
+                res.rebake = true;
+            }
         }
 
         if ui
@@ -1172,6 +1524,10 @@ fn canvas_contents(
         Err(e) => nodes_at_fault(&patch.graph, &e).into_iter().collect(),
     };
     let error_stroke = Stroke::new(2.0, style.error);
+    // What the patch actually plays. A node the output cannot be reached
+    // from bakes into nothing, and said so nowhere (#61, Overlands #1334
+    // B13).
+    let heard = heard_nodes(&patch.graph);
 
     // Reserve a shape slot up front; we backfill it with the wires after node
     // rects are known, so wires render *behind* the node boxes.
@@ -1213,7 +1569,14 @@ fn canvas_contents(
         // which is the box's minimum width, so on every box that grew past
         // it the rule stopped short of the border.
         let mut rules: Vec<f32> = Vec::new();
+        let not_heard = !heard.contains(&nid);
         let fr = frame.show(&mut child, |ui| {
+            // A node nothing hears is still a node, and still editable, so
+            // it fades rather than disappears — and its frame does not,
+            // because it is still a box and still where it was.
+            if not_heard {
+                ui.set_opacity(NOT_HEARD_OPACITY);
+            }
             // Title bar: the number is the grip (drag to move, click to
             // select), the kind beside it is the picker, and the badge says
             // whether the patch plays this node.
@@ -1256,6 +1619,25 @@ fn canvas_contents(
                 res.merge(node_kind_picker(ui, &mut node.kind, Id::new(("nk", nid.0))));
                 if output_id == nid {
                     out_badge(ui, style);
+                }
+                if not_heard {
+                    // At full strength inside a dimmed box: the badge is
+                    // the one thing in it that says why the rest is faded.
+                    ui.scope(|ui| {
+                        ui.set_opacity(1.0);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(NOT_HEARD)
+                                    .small()
+                                    .color(style.node_title),
+                            )
+                            .sense(Sense::hover()),
+                        )
+                        .on_hover_text(
+                            "Nothing plays this node: the output cannot be reached from it. \
+                             Wire it towards the output, or make it the output.",
+                        );
+                    });
                 }
             });
             rule(ui, &mut rules);
@@ -1340,35 +1722,159 @@ fn canvas_contents(
         }
     }
 
-    // --- wires (behind nodes via the reserved slot) ---------------------
-    let mut wires: Vec<egui::Shape> = Vec::new();
-    for node in &patch.graph.nodes {
-        for (port, conns) in &node.inputs {
-            // Every port with connections has a row, so this finds its dot;
-            // the box's left centre is only a last resort.
-            let dst = state
-                .ports
-                .iter()
-                .find(|p| p.node == node.id && p.port == *port)
-                .map(|p| p.dot)
-                .or_else(|| {
-                    state
-                        .boxes
-                        .iter()
-                        .find(|(id, _)| *id == node.id)
-                        .map(|(_, r)| Pos2::new(r.left(), r.center().y))
-                });
-            let Some(dst) = dst else { continue };
-            for c in conns {
-                if let Connection::Node { id: src, .. } = c
-                    && let Some(src_pos) = state.outputs.get(src)
-                {
-                    wires.push(wire_shape(*src_pos, dst, style.wire));
-                }
-            }
+    // --- wires: where they run, and what the pointer is doing to one ----
+    state.wires = collect_wires(&patch.graph, &state.ports, &state.boxes, &state.outputs);
+    state.forget_removed_wire(patch);
+
+    // The canvas is a transformed layer, so the pointer arrives in screen
+    // points and everything remembered here is in canvas units.
+    let from_global = ui.ctx().layer_transform_from_global(ui.layer_id());
+    let zoom = ui
+        .ctx()
+        .layer_transform_to_global(ui.layer_id())
+        .map_or(1.0, |t| t.scaling)
+        .max(f32::EPSILON);
+    let pointer = ui
+        .ctx()
+        .pointer_latest_pos()
+        .map(|at| from_global.map_or(at, |t| t * at));
+    // Whether something is drawn over the canvas where the pointer is: a
+    // menu, a tooltip, the amount editor. `Ui::rect_contains_pointer`
+    // cannot answer this here — it asks `Context::layer_id_at`, which knows
+    // only `Area`s, and a `Scene`'s layer is not one, so it says no
+    // wherever the pointer is.
+    let covered = ui.ctx().pointer_latest_pos().is_some_and(|screen| {
+        ui.ctx()
+            .layer_id_at(screen)
+            .is_some_and(|over| over.order > ui.layer_id().order)
+    });
+    // A wire is behind every box, so a pointer over one is not on a wire
+    // however close the curve passes; and while a wire is being dragged or
+    // a menu is open the pointer is spoken for.
+    let free_pointer = pointer.filter(|at| {
+        ui.clip_rect().contains(*at)
+            && !covered
+            && !state.boxes.iter().any(|(_, r)| r.contains(*at))
+            && dragging.is_none()
+            && state.add_menu.is_none()
+    });
+
+    // --- take a wire off its port by its end, to re-route or disconnect --
+    let mut rerouting: Option<WireRef> = None;
+    for wire in &state.wires {
+        let grab = wire_grab(wire);
+        let resp = ui.interact(
+            Rect::from_center_size(grab, Vec2::splat(2.0 * WIRE_GRAB_RADIUS / zoom)),
+            id.with(("wire_end", wire.to.0, wire.port.as_str(), wire.index)),
+            Sense::drag(),
+        );
+        // Named inside the closure: it runs only when something is reading
+        // the tree, and this is per wire per frame.
+        resp.widget_info(|| {
+            egui::WidgetInfo::labeled(
+                egui::WidgetType::Other,
+                true,
+                format!("End of {}", wire_name(wire, &names)),
+            )
+        });
+        // `interact_pointer_pos` is already in this layer's own
+        // coordinates — canvas units — as the output port's drag below
+        // relies on too. `Context::pointer_latest_pos` is not, which is
+        // why the hover below goes through `from_global` and this does
+        // not.
+        if resp.dragged()
+            && let Some(at) = resp.interact_pointer_pos()
+        {
+            rerouting = Some(wire.wire_ref());
+            dragging = Some((wire.from, at, resp.clone()));
+        }
+        if resp.drag_stopped()
+            && let Some(at) = resp.interact_pointer_pos()
+        {
+            actions.push(Action::RerouteWire {
+                wire: wire.wire_ref(),
+                from: wire.from,
+                at,
+            });
         }
     }
-    painter.set(wire_idx, egui::Shape::Vec(wires));
+
+    let hovered: Option<WireRef> = free_pointer
+        .and_then(|at| wire_at(&state.wires, at, WIRE_HIT_DIST / zoom))
+        .map(WireGeom::wire_ref);
+    // The wire the cross and the amount editor are on: the picked one, or
+    // failing that the one under the pointer.
+    let marked: Option<WireRef> = state.selected_wire.clone().or_else(|| hovered.clone());
+
+    // The wire being taken off its port is drawn by the drag overlay
+    // below, from its source to the pointer, so it is not also drawn in
+    // place: a re-route should look like one wire moving, not two.
+    painter.set(
+        wire_idx,
+        egui::Shape::Vec(
+            state
+                .wires
+                .iter()
+                .filter(|w| rerouting.as_ref() != Some(&w.wire_ref()))
+                .map(|w| {
+                    let lit = marked.as_ref() == Some(&w.wire_ref());
+                    egui::Shape::line(
+                        w.points.clone(),
+                        Stroke::new(
+                            if lit { 3.0 } else { 2.0 },
+                            if lit { style.wire_active } else { style.wire },
+                        ),
+                    )
+                })
+                .collect(),
+        ),
+    );
+
+    if let Some(pick) = &hovered
+        && ui.input(|i| i.pointer.primary_clicked())
+    {
+        state.selected_wire = Some(pick.clone());
+        // One selection at a time: Delete has to act on the thing the last
+        // click was aimed at.
+        state.selected = None;
+    }
+
+    // The hovered wire says what it is, at the pointer — unless it is the
+    // picked one, whose amount editor already names it a few points away
+    // and which the tooltip would sit on top of.
+    //
+    // Never wrapped: an auto-sized area offers the width of its last pass,
+    // so a longer name than the last would wrap and the box would ratchet
+    // narrower as the pointer crossed wires (#1290).
+    if let Some(hover) = &hovered
+        && state.selected_wire.as_ref() != Some(hover)
+        && let Some(wire) = state.wires.iter().find(|w| &w.wire_ref() == hover)
+    {
+        let text = wire_tooltip(wire, &patch.graph, &names);
+        egui::Tooltip::always_open(
+            ui.ctx().clone(),
+            ui.layer_id(),
+            id.with("wire_tooltip"),
+            egui::PopupAnchor::Pointer,
+        )
+        .show(|ui| ui.add(egui::Label::new(text).extend()));
+    }
+
+    // --- the picked wire's own panel: what it is, its amount, its cross --
+    if let Some(pick) = state.selected_wire.clone()
+        && let Some(wire) = state.wires.iter().find(|w| w.wire_ref() == pick)
+    {
+        let mid = wire.midpoint();
+        let at = ui
+            .ctx()
+            .layer_transform_to_global(ui.layer_id())
+            .map_or(mid, |t| t * mid);
+        let (edit, remove) = wire_panel(ui, patch, id, &pick, &names, at);
+        res.merge(edit);
+        if remove {
+            actions.push(Action::RemoveWire(pick.clone()));
+        }
+    }
 
     // --- the wire being dragged, over the boxes, and where it would land --
     if let Some((from, at, out_resp)) = dragging
@@ -1390,41 +1896,132 @@ fn canvas_contents(
         // connection before letting go; over no port it follows the pointer.
         let end = target.map_or(at, |t| t.dot);
         painter.add(wire_shape(src, end, active));
-        if let Some(target) = target {
-            // A tooltip is drawn in screen space, so the name stays legible
-            // at any zoom of the canvas.
-            let kind = titles.get(&target.node).copied().unwrap_or_default();
-            let text = format!(
-                "\u{27A1} #{} {kind} \u{00B7} {}",
-                target.node.0, target.port
-            );
-            // Never wrapped: an auto-sized area offers the width of its last
-            // pass, so a name longer than the last one would wrap and the
-            // box would ratchet narrower as the pointer crosses rows.
-            egui::Tooltip::for_widget(&out_resp)
-                .at_pointer()
-                .show(|ui| ui.add(egui::Label::new(text).extend()));
+        // A tooltip is drawn in screen space, so the name stays legible
+        // at any zoom of the canvas.
+        let text = match target {
+            Some(target) => {
+                let kind = titles.get(&target.node).copied().unwrap_or_default();
+                format!(
+                    "\u{27A1} #{} {kind} \u{00B7} {}",
+                    target.node.0, target.port
+                )
+            }
+            // Over nothing, a release does not throw the wire away: it
+            // offers to make what the wire would drive (#61, Overlands
+            // #1334 B6).
+            None if rerouting.is_none() => "\u{27A1} let go for a new node here".to_string(),
+            None => "\u{27A1} let go to disconnect".to_string(),
+        };
+        // Never wrapped: an auto-sized area offers the width of its last
+        // pass, so a name longer than the last one would wrap and the
+        // box would ratchet narrower as the pointer crosses rows.
+        egui::Tooltip::for_widget(&out_resp)
+            .at_pointer()
+            .show(|ui| ui.add(egui::Label::new(text).extend()));
+    }
+
+    // --- the Add menu, where it was asked for ---------------------------
+    // A right-click on clear canvas offers what can be put there. Clear
+    // canvas: the pointer is over the ground, over no box, and no wire is
+    // being dragged — a right-click on a node opens that node's own menu.
+    if free_pointer.is_some()
+        && hovered.is_none()
+        && ui.input(|i| i.pointer.secondary_clicked())
+        && let Some(at) = free_pointer
+    {
+        state.add_menu = Some(AddMenu {
+            at,
+            from: None,
+            shown: false,
+        });
+    }
+    if let Some(menu) = state.add_menu.clone() {
+        match add_menu_area(ui, id, &menu) {
+            AddMenuOutcome::Chose(label) => {
+                actions.push(Action::AddNode {
+                    label,
+                    at: menu.at,
+                    from: menu.from,
+                });
+                state.add_menu = None;
+            }
+            AddMenuOutcome::Dismissed => state.add_menu = None,
+            AddMenuOutcome::Open => {
+                if let Some(open) = &mut state.add_menu {
+                    open.shown = true;
+                }
+            }
         }
     }
 
     // --- apply deferred structural edits -------------------------------
     for action in actions {
         match action {
-            Action::Select(nid) => state.selected = Some(nid),
+            Action::Select(nid) => {
+                state.selected = Some(nid);
+                // One selection at a time, both ways round: Delete acts on
+                // whatever the last click was aimed at.
+                state.selected_wire = None;
+            }
             Action::Move(nid, delta) => {
                 *state.positions.entry(nid).or_default() += delta;
             }
             Action::CompleteWire { from, at } => {
-                if let Some(target) = drop_target(&state.ports, &state.boxes, from, at)
-                    && let Some(n) = patch.graph.nodes.iter_mut().find(|n| n.id == target.node)
-                {
-                    n.inputs
-                        .entry(target.port.clone())
-                        .or_default()
-                        .push(Connection::from_node(from));
+                match drop_target(&state.ports, &state.boxes, from, at) {
+                    Some(target) => {
+                        if let Some(n) = patch.graph.nodes.iter_mut().find(|n| n.id == target.node)
+                        {
+                            n.inputs
+                                .entry(target.port.clone())
+                                .or_default()
+                                .push(Connection::from_node(from));
+                            res.changed = true;
+                            res.rebake = true;
+                        }
+                    }
+                    // Let go over nothing and the wire is not thrown away:
+                    // it asks what should be there (#61, Overlands #1334
+                    // B6).
+                    None => {
+                        state.add_menu = Some(AddMenu {
+                            at,
+                            from: Some(from),
+                            shown: false,
+                        })
+                    }
+                }
+            }
+            Action::RemoveWire(wire) => {
+                if remove_wire(patch, &wire) {
+                    state.forget_removed_wire(patch);
                     res.changed = true;
                     res.rebake = true;
                 }
+            }
+            Action::RerouteWire { wire, from, at } => {
+                let target = drop_target(&state.ports, &state.boxes, from, at)
+                    .map(|t| (t.node, t.port.clone()));
+                // Off its old port either way: dropped on a port it moves
+                // there, dropped on nothing it is gone.
+                let amount = remove_wire_amount(patch, &wire);
+                if amount.is_some() {
+                    state.forget_removed_wire(patch);
+                    res.changed = true;
+                    res.rebake = true;
+                }
+                if let (Some(amount), Some((node, port))) = (amount, target)
+                    && let Some(n) = patch.graph.nodes.iter_mut().find(|n| n.id == node)
+                {
+                    n.inputs
+                        .entry(port)
+                        .or_default()
+                        .push(Connection::Node { id: from, amount });
+                }
+            }
+            Action::AddNode { label, at, from } => {
+                add_node(patch, state, label, at, from);
+                res.changed = true;
+                res.rebake = true;
             }
             Action::MutateNode(nid) => {
                 if let Some(n) = patch.graph.nodes.iter_mut().find(|n| n.id == nid) {
@@ -1483,6 +2080,270 @@ fn canvas_contents(
     }
 
     res
+}
+
+/// Every wire the graph asks for, where the canvas drew its ends.
+///
+/// A port with connections always has a row, so its dot is where the wire
+/// ends; the box's left centre is only a last resort, for a frame in which
+/// a node has been added but not yet measured.
+fn collect_wires(
+    graph: &NodeGraph,
+    ports: &[PortGeom],
+    boxes: &[(NodeId, Rect)],
+    outputs: &HashMap<NodeId, Pos2>,
+) -> Vec<WireGeom> {
+    let mut wires = Vec::new();
+    for node in &graph.nodes {
+        for (port, conns) in &node.inputs {
+            let dst = ports
+                .iter()
+                .find(|p| p.node == node.id && p.port == *port)
+                .map(|p| p.dot)
+                .or_else(|| {
+                    boxes
+                        .iter()
+                        .find(|(id, _)| *id == node.id)
+                        .map(|(_, r)| Pos2::new(r.left(), r.center().y))
+                });
+            let Some(dst) = dst else { continue };
+            for (index, c) in conns.iter().enumerate() {
+                if let Connection::Node { id: src, .. } = c
+                    && let Some(src_pos) = outputs.get(src)
+                {
+                    wires.push(WireGeom {
+                        from: *src,
+                        to: node.id,
+                        port: port.clone(),
+                        index,
+                        points: wire_points(*src_pos, dst),
+                    });
+                }
+            }
+        }
+    }
+    wires
+}
+
+/// Where a wire is taken hold of to move its end: along the curve, short of
+/// the port it lands on.
+///
+/// Short of it, and not on it, because a port's dot is shared — a port holds
+/// a list of connections summed at bake time, so several wires can end on
+/// one dot, and each needs somewhere of its own to be grabbed.
+fn wire_grab(wire: &WireGeom) -> Pos2 {
+    let last = wire.points.len().saturating_sub(1);
+    wire.points
+        .get(last * 4 / 5)
+        .copied()
+        .unwrap_or_else(|| wire.midpoint())
+}
+
+/// `"the wire from #1 LFO to #2 Lowpass \u{00B7} cutoff_hz"`: a wire in
+/// words, for a hover text and for assistive tech.
+fn wire_name(wire: &WireGeom, names: &HashMap<NodeId, String>) -> String {
+    let named = |id: NodeId| {
+        names
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| format!("#{}", id.0))
+    };
+    format!(
+        "the wire from {} to {} \u{00B7} {}",
+        named(wire.from),
+        named(wire.to),
+        wire.port
+    )
+}
+
+/// What a hovered wire says: both ends, the port it drives and how much of
+/// the signal reaches it.
+fn wire_tooltip(wire: &WireGeom, graph: &NodeGraph, names: &HashMap<NodeId, String>) -> String {
+    let named = |id: NodeId| {
+        names
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| format!("#{}", id.0))
+    };
+    let amount = connection_of(graph, &wire.wire_ref()).and_then(|c| match c {
+        Connection::Node { amount, .. } => Some(*amount),
+        Connection::Constant { .. } => None,
+    });
+    match amount {
+        Some(amount) => format!(
+            "{} \u{27A1} {} \u{00B7} {} \u{00D7} {amount}",
+            named(wire.from),
+            named(wire.to),
+            wire.port
+        ),
+        None => format!(
+            "{} \u{27A1} {} \u{00B7} {}",
+            named(wire.from),
+            named(wire.to),
+            wire.port
+        ),
+    }
+}
+
+/// The connection a [`WireRef`] names, if the patch still holds it.
+fn connection_of<'a>(graph: &'a NodeGraph, wire: &WireRef) -> Option<&'a Connection> {
+    graph
+        .nodes
+        .iter()
+        .find(|n| n.id == wire.to)?
+        .inputs
+        .get(&wire.port)?
+        .get(wire.index)
+}
+
+/// Take the connection a [`WireRef`] names out of the patch. `true` when
+/// there was one.
+fn remove_wire(patch: &mut AudioPatch, wire: &WireRef) -> bool {
+    remove_wire_amount(patch, wire).is_some()
+}
+
+/// Take the connection out and hand back the amount it carried, so a
+/// re-route can put the same wire on another port rather than a fresh one.
+fn remove_wire_amount(patch: &mut AudioPatch, wire: &WireRef) -> Option<f32> {
+    let node = patch.graph.nodes.iter_mut().find(|n| n.id == wire.to)?;
+    let conns = node.inputs.get_mut(&wire.port)?;
+    let amount = match conns.get(wire.index)? {
+        Connection::Node { amount, .. } => *amount,
+        Connection::Constant { .. } => return None,
+    };
+    conns.remove(wire.index);
+    if conns.is_empty() {
+        node.inputs.remove(&wire.port);
+    }
+    Some(amount)
+}
+
+/// The picked wire's own panel, at the middle of its curve: what it drives,
+/// its amount, and the cross that removes it (#61, Overlands #1334 B2).
+///
+/// The amount is edited here rather than found again in the destination
+/// box's Inputs list, where the source was a number and the amount a bare
+/// "amt". All three together, and not a cross floating on the curve beside
+/// the panel: the middle of the curve is exactly where the pointer is when
+/// a wire has just been picked, so a separate cross there is hovered the
+/// moment the panel opens and its own hover text covers the panel. An
+/// amount and a cross side by side is also the pairing the Inputs list
+/// already uses.
+///
+/// An `Area` in screen space: the canvas is a transformed layer, and a
+/// panel of numbers that shrank with the zoom would stop being readable at
+/// exactly the zoom where a wire is hardest to pick out. Every widget in it
+/// is fixed-width for the same reason the tooltips are — an auto-sized area
+/// offers its last pass's width, so wrappable content ratchets narrow
+/// (#1290).
+/// Returns the edit made, and whether the cross was clicked.
+fn wire_panel(
+    ui: &mut egui::Ui,
+    patch: &mut AudioPatch,
+    id: Id,
+    wire: &WireRef,
+    names: &HashMap<NodeId, String>,
+    at: Pos2,
+) -> (EditorResponse, bool) {
+    let mut res = EditorResponse::NONE;
+    let mut remove = false;
+    let Some(node) = patch.graph.nodes.iter_mut().find(|n| n.id == wire.to) else {
+        return (res, remove);
+    };
+    let Some(Connection::Node { id: from, amount }) = node
+        .inputs
+        .get_mut(&wire.port)
+        .and_then(|conns| conns.get_mut(wire.index))
+    else {
+        return (res, remove);
+    };
+    let from = *from;
+    let named = |id: NodeId| {
+        names
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| format!("#{}", id.0))
+    };
+    let title = format!("{} \u{27A1} {}", named(from), wire.port);
+    egui::Area::new(id.with("wire_amount"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(at + Vec2::new(WIRE_GRAB_RADIUS + 4.0, WIRE_GRAB_RADIUS + 4.0))
+        .constrain(true)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::popup(ui.style()).show(ui, |ui| {
+                ui.vertical(|ui| {
+                    ui.add(egui::Label::new(egui::RichText::new(title).small()).extend());
+                    ui.horizontal(|ui| {
+                        let r = ui.add(egui::DragValue::new(amount).speed(0.05).prefix("amt "));
+                        res.changed |= r.changed();
+                        res.rebake |= r.drag_stopped() || (r.changed() && !r.dragged());
+                        remove |= ui
+                            .small_button("\u{2716}")
+                            .on_hover_text("Remove this wire")
+                            .clicked();
+                    });
+                });
+            });
+        });
+    (res, remove)
+}
+
+/// What happened to an open Add menu this frame.
+enum AddMenuOutcome {
+    /// Still open.
+    Open,
+    /// A kind was chosen.
+    Chose(&'static str),
+    /// Clicked away from, or Escaped.
+    Dismissed,
+}
+
+/// The Add menu, drawn where it was asked for.
+///
+/// In screen space, like the amount editor and for the same reason: a menu
+/// that shrank with the zoom would be unreadable at the zoom where a node
+/// is hardest to place. `at` is in canvas units, so it is taken to the
+/// screen here.
+fn add_menu_area(ui: &mut egui::Ui, id: Id, menu: &AddMenu) -> AddMenuOutcome {
+    let at = ui
+        .ctx()
+        .layer_transform_to_global(ui.layer_id())
+        .map_or(menu.at, |t| t * menu.at);
+    let mut chosen = None;
+    let area = egui::Area::new(id.with("add_menu"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(at)
+        .constrain(true)
+        .show(ui.ctx(), |ui| {
+            egui::Frame::menu(ui.style()).show(ui, |ui| {
+                ui.vertical(|ui| {
+                    if menu.from.is_some() {
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new("Drive a new\u{2026}").small().weak(),
+                            )
+                            .extend(),
+                        );
+                    }
+                    chosen = add_menu_items(ui);
+                });
+            });
+        });
+    if let Some(label) = chosen {
+        return AddMenuOutcome::Chose(label);
+    }
+    // Escape, or a press anywhere but in the menu, puts it away. The press
+    // and not the click, so a drag begun outside it closes it too — and not
+    // before the menu has been drawn once, or the press that opened it
+    // would be the press that closed it.
+    let dismissed = menu.shown
+        && (ui.input(|i| i.key_pressed(egui::Key::Escape))
+            || (ui.input(|i| i.pointer.any_pressed()) && !area.response.contains_pointer()));
+    if dismissed {
+        AddMenuOutcome::Dismissed
+    } else {
+        AddMenuOutcome::Open
+    }
 }
 
 /// Where one port's rows landed in a node box.
@@ -1645,17 +2506,33 @@ fn out_badge(ui: &mut egui::Ui, style: &EditorStyle) {
 
 /// A cubic-bezier wire from `a` to `b`, sampled to a polyline with horizontal
 /// control handles (the classic node-editor S-curve).
-fn wire_shape(a: Pos2, b: Pos2, color: Color32) -> egui::Shape {
+///
+/// An even number of segments, so the sample at the middle of the list is
+/// the curve at `t = 0.5` — which is where [`WireGeom::midpoint`] puts the
+/// wire's cross.
+fn wire_points(a: Pos2, b: Pos2) -> Vec<Pos2> {
     let handle = (b.x - a.x).abs().max(40.0) * 0.5;
     let c1 = Pos2::new(a.x + handle, a.y);
     let c2 = Pos2::new(b.x - handle, b.y);
     const SEGMENTS: usize = 18;
-    let mut pts = Vec::with_capacity(SEGMENTS + 1);
-    for i in 0..=SEGMENTS {
-        let t = i as f32 / SEGMENTS as f32;
-        pts.push(cubic_bezier(a, c1, c2, b, t));
+    (0..=SEGMENTS)
+        .map(|i| cubic_bezier(a, c1, c2, b, i as f32 / SEGMENTS as f32))
+        .collect()
+}
+
+fn wire_shape(a: Pos2, b: Pos2, color: Color32) -> egui::Shape {
+    egui::Shape::line(wire_points(a, b), Stroke::new(2.0, color))
+}
+
+/// The distance from `at` to the segment `a`–`b`.
+fn distance_to_segment(at: Pos2, a: Pos2, b: Pos2) -> f32 {
+    let seg = b - a;
+    let len_sq = seg.length_sq();
+    if len_sq <= f32::EPSILON {
+        return at.distance(a);
     }
-    egui::Shape::line(pts, Stroke::new(2.0, color))
+    let t = ((at - a).dot(seg) / len_sq).clamp(0.0, 1.0);
+    at.distance(a + seg * t)
 }
 
 fn cubic_bezier(p0: Pos2, p1: Pos2, p2: Pos2, p3: Pos2, t: f32) -> Pos2 {
@@ -1986,6 +2863,8 @@ mod tests {
     use egui::accesskit;
     use egui::emath::TSTransform;
 
+    use crate::oscillator::SineOsc;
+    use crate::ui::node::{KIND_LABELS, KindGroup};
     use crate::ui::style::tests::{AA, distinct_style};
     use crate::ui::style::{EditorStyle, set_editor_style, set_style};
     use crate::ui::test_paint::{
@@ -2363,6 +3242,17 @@ mod tests {
             self.frame(Vec::new());
         }
 
+        /// Add a node through the toolbar: the Add menu, then a kind.
+        ///
+        /// One click dropped a Sine before this step, which is what B6 was
+        /// about (#61, Overlands #1334). A Reverb, because no patch these
+        /// tests use has one and the kind picker of an existing node wears
+        /// its own kind's name in the same tree.
+        fn add_a_node(&mut self) {
+            self.click("Add node");
+            self.click("Reverb");
+        }
+
         /// Hold the pointer at `at` until egui's tooltip delay has passed,
         /// and return the text that appeared while it was there.
         ///
@@ -2556,8 +3446,11 @@ mod tests {
         assert!(res.changed && res.rebake);
     }
 
+    /// A wire let go over no port names no port, and wires nothing. Since
+    /// #61 it is not thrown away either: it offers to make what it would
+    /// drive, and the port it would have landed on is still not named.
     #[test]
-    fn a_wire_dropped_on_no_port_connects_nothing_and_names_nothing() {
+    fn a_wire_dropped_on_no_port_wires_nothing_and_names_no_port() {
         let mut canvas = Canvas::new(sine_into_gain(false));
         let gain_box = canvas
             .boxes()
@@ -2567,15 +3460,22 @@ mod tests {
         // Below the gain's box: no row, no dot.
         let to = Pos2::new(gain_box.center().x, gain_box.bottom() + 80.0);
         drag_from_the_sine_to(&mut canvas, to);
-        assert!(
-            !canvas
-                .painted_text()
-                .iter()
-                .any(|t| t.starts_with('\u{27A1}')),
-            "nothing is named over empty canvas"
+        let named: Vec<String> = canvas
+            .painted_text()
+            .into_iter()
+            .filter(|t| t.starts_with('\u{27A1}'))
+            .collect();
+        assert_eq!(
+            named,
+            vec!["\u{27A1} let go for a new node here".to_string()],
+            "over empty canvas the drag named a port"
         );
         release(&mut canvas, to);
-        assert!(canvas.patch.graph.nodes[1].inputs.is_empty());
+        assert!(
+            canvas.patch.graph.nodes[1].inputs.is_empty(),
+            "the drop wired something"
+        );
+        assert_eq!(canvas.patch.graph.nodes.len(), 2, "the drop added a node");
     }
 
     /// The canvas must not panic on a structurally invalid graph — the
@@ -2778,8 +3678,11 @@ mod tests {
         );
         let (_, title) = text_painted(&canvas.out, "#1").expect("a title");
         assert_eq!(title, s.node_title);
-        let (_, valid) =
-            text_painted(&canvas.out, "\u{2714} valid graph \u{2014} 3 nodes").expect("the line");
+        let (_, valid) = text_painted(
+            &canvas.out,
+            "\u{2714} valid graph \u{2014} 3 nodes, all heard",
+        )
+        .expect("the line");
         assert_eq!(valid, s.ok);
     }
 
@@ -3319,7 +4222,7 @@ mod tests {
         let mut canvas = Canvas::new(three_node_patch());
         assert!(!canvas.state.can_undo(), "nothing has been edited yet");
 
-        canvas.click("Add node");
+        canvas.add_a_node();
         assert_eq!(canvas.patch.graph.nodes.len(), 4);
         assert!(canvas.state.can_undo());
         assert!(!canvas.state.can_redo());
@@ -3364,7 +4267,7 @@ mod tests {
             (egui::Key::Y, egui::Modifiers::COMMAND),
         ] {
             let mut canvas = Canvas::new(three_node_patch());
-            canvas.click("Add node");
+            canvas.add_a_node();
             assert_eq!(canvas.patch.graph.nodes.len(), 4);
 
             keys_over_the_canvas(&mut canvas, press(egui::Key::Z, egui::Modifiers::COMMAND));
@@ -3453,7 +4356,7 @@ mod tests {
     #[test]
     fn the_canvas_takes_the_keys_only_while_it_owns_them() {
         let mut canvas = Canvas::new(three_node_patch());
-        canvas.click("Add node");
+        canvas.add_a_node();
         assert_eq!(canvas.patch.graph.nodes.len(), 4);
 
         // Pointer far outside the canvas.
@@ -3525,6 +4428,758 @@ mod tests {
                 .iter()
                 .any(|t| t.contains("fixed value") && t.contains("gain")),
             "hovering Add constant on the gain port says {shown:?}"
+        );
+    }
+
+    // ---- step 7b (#61, Overlands #1334): wires, the Add menu, heard -----
+
+    /// B13: "3 nodes" is true of a patch where two of them bake into
+    /// nothing. What is heard is what the output can be reached from.
+    #[test]
+    fn only_the_nodes_upstream_of_the_output_are_heard() {
+        // 0:sine -> 2:lowpass("in"), 1:lfo -> 2("cutoff_hz"); output 2.
+        let patch = three_node_patch();
+        let heard = heard_nodes(&patch.graph);
+        assert_eq!(heard.len(), 3, "every node reaches the output");
+
+        // Point the output at the LFO instead: the sine and the filter are
+        // still in the patch, and nothing plays them.
+        let mut orphaned = three_node_patch();
+        orphaned.graph.output = NodeId(1);
+        let heard = heard_nodes(&orphaned.graph);
+        assert_eq!(
+            heard,
+            HashSet::from([NodeId(1)]),
+            "only the output node and what feeds it is heard"
+        );
+    }
+
+    /// A loop upstream of the output is still heard, and the walk that finds
+    /// out must not spin on it: a broken graph is exactly when the reader
+    /// most needs the canvas to keep drawing.
+    #[test]
+    fn a_cycle_upstream_of_the_output_is_heard_without_spinning() {
+        let mut patch = three_node_patch();
+        // 2 already feeds nothing; wire it back into 0 to make 0 -> 2 -> 0.
+        patch.graph.nodes[0]
+            .inputs
+            .insert("freq_hz".into(), vec![Connection::from_node(NodeId(2))]);
+        let heard = heard_nodes(&patch.graph);
+        assert_eq!(heard.len(), 3);
+    }
+
+    /// A node the output never reaches is dimmed and says so, and the
+    /// validity chip counts what is heard rather than what is there.
+    #[test]
+    fn a_node_that_is_not_heard_is_badged_and_counted() {
+        let mut patch = three_node_patch();
+        patch.graph.output = NodeId(0);
+        let canvas = Canvas::new(patch);
+        let painted = canvas.painted_text();
+        assert_eq!(
+            painted.iter().filter(|t| *t == NOT_HEARD).count(),
+            2,
+            "the LFO and the filter are not heard; painted {painted:?}"
+        );
+        assert!(
+            text_painted(
+                &canvas.out,
+                "\u{2714} valid graph \u{2014} 3 nodes, 1 heard"
+            )
+            .is_some(),
+            "the chip says {:?}",
+            painted
+                .iter()
+                .find(|t| t.contains("valid graph"))
+                .map(String::as_str)
+        );
+    }
+
+    /// Every node heard means the chip says so in words rather than
+    /// repeating the count: "3 nodes, 3 heard" reads as an arithmetic
+    /// puzzle in the one case where there is nothing to look for.
+    #[test]
+    fn a_patch_whose_nodes_are_all_heard_says_so() {
+        let canvas = Canvas::new(three_node_patch());
+        assert!(
+            text_painted(
+                &canvas.out,
+                "\u{2714} valid graph \u{2014} 3 nodes, all heard"
+            )
+            .is_some(),
+            "the chip says {:?}",
+            canvas
+                .painted_text()
+                .iter()
+                .find(|t| t.contains("valid graph"))
+                .map(String::as_str)
+        );
+    }
+
+    /// B2: the hit test is against the wire's curve, not its bounding box.
+    /// The S-curve between two boxes bulges well away from the straight
+    /// line between the dots, and a box test would take a click in the gap
+    /// beside it.
+    #[test]
+    fn a_wire_is_hit_only_within_a_few_units_of_its_curve() {
+        let a = Pos2::new(0.0, 0.0);
+        let b = Pos2::new(200.0, 120.0);
+        let wire = WireGeom {
+            from: NodeId(0),
+            to: NodeId(1),
+            port: "in".into(),
+            index: 0,
+            points: wire_points(a, b),
+        };
+
+        // On the curve: both ends and the middle.
+        for at in [a, b, wire.midpoint()] {
+            assert!(
+                wire.distance_to(at) <= 0.5,
+                "{at:?} is {} from its own wire",
+                wire.distance_to(at)
+            );
+        }
+        // A few units off it is still a hit; the width of a node box is not.
+        let just_off = wire.midpoint() + Vec2::new(4.0, 0.0);
+        assert!(wire.distance_to(just_off) <= 6.0);
+        assert!(wire.distance_to(wire.midpoint() + Vec2::new(60.0, 0.0)) > 6.0);
+
+        // The chord's midpoint is on the curve, but the bounding box holds
+        // corners that are nowhere near it.
+        let corner = Pos2::new(a.x, b.y);
+        assert!(
+            wire.distance_to(corner) > 6.0,
+            "a corner of the wire's bounding box counted as a hit"
+        );
+
+        let wires = [wire.clone()];
+        assert_eq!(wire_at(&wires, just_off, 6.0), Some(&wires[0]));
+        assert_eq!(wire_at(&wires, corner, 6.0), None);
+    }
+
+    /// Of two wires crossing, a click takes the nearer.
+    #[test]
+    fn the_nearer_of_two_wires_is_the_one_hit() {
+        let down = WireGeom {
+            from: NodeId(0),
+            to: NodeId(2),
+            port: "in".into(),
+            index: 0,
+            points: wire_points(Pos2::new(0.0, 0.0), Pos2::new(200.0, 200.0)),
+        };
+        let up = WireGeom {
+            from: NodeId(1),
+            to: NodeId(2),
+            port: "cutoff_hz".into(),
+            index: 0,
+            points: wire_points(Pos2::new(0.0, 200.0), Pos2::new(200.0, 0.0)),
+        };
+        let wires = [down.clone(), up.clone()];
+        // Clear of the crossing, where the two curves are far apart: both
+        // run vertically through the middle, so a point beside the crossing
+        // is genuinely near both and neither is the answer.
+        let quarter = |w: &WireGeom| w.points[w.points.len() / 4];
+        assert_eq!(
+            wire_at(&wires, quarter(&down), 8.0).map(|w| w.from),
+            Some(NodeId(0))
+        );
+        assert_eq!(
+            wire_at(&wires, quarter(&up), 8.0).map(|w| w.from),
+            Some(NodeId(1))
+        );
+        assert!(
+            quarter(&down).distance(quarter(&up)) > 16.0,
+            "the probe points are not on opposite wires"
+        );
+    }
+
+    /// The canvas publishes the wires it drew, so a host can hang something
+    /// on one and this file's own tests can find one without guessing at a
+    /// dot's position (crate #67).
+    #[test]
+    fn the_canvas_publishes_the_wires_it_drew() {
+        let canvas = Canvas::new(three_node_patch());
+        let wires = canvas.state.wires();
+        assert_eq!(wires.len(), 2, "two wires into the filter");
+        let cutoff = wires
+            .iter()
+            .find(|w| w.port == "cutoff_hz")
+            .expect("the LFO's wire");
+        assert_eq!((cutoff.from, cutoff.to), (NodeId(1), NodeId(2)));
+        // Painted where it says it is: the published points are in scene
+        // units and the painted polyline in screen points.
+        let painted = canvas.wires();
+        let to_screen = canvas.to_screen();
+        assert!(
+            painted.iter().any(|points| {
+                points
+                    .first()
+                    .is_some_and(|p| p.distance(to_screen * cutoff.points[0]) < 0.5)
+            }),
+            "no painted wire starts where the published one does"
+        );
+    }
+
+    /// Hold the pointer over the middle of the wire that drives `port`.
+    fn over_the_wire(canvas: &mut Canvas, port: &str) -> Pos2 {
+        let wire = canvas
+            .state
+            .wires()
+            .iter()
+            .find(|w| w.port == port)
+            .unwrap_or_else(|| panic!("no wire into {port:?}"));
+        let at = canvas.to_screen() * wire.midpoint();
+        canvas.frame(vec![egui::Event::PointerMoved(at)]);
+        canvas.frame(Vec::new());
+        at
+    }
+
+    /// B2: a wire says what it is when the pointer is on it.
+    #[test]
+    fn a_hovered_wire_names_both_ends_its_port_and_its_amount() {
+        let mut canvas = Canvas::new(three_node_patch());
+        // The tooltip is up from the first frame the pointer is on the
+        // wire, so it is read from what the frame painted rather than
+        // through `hover_text_at`, which subtracts what was already there.
+        over_the_wire(&mut canvas, "cutoff_hz");
+        let shown = canvas.painted_text();
+        let text = shown
+            .iter()
+            .find(|t| t.contains("cutoff_hz") && t.contains('\u{27A1}'))
+            .unwrap_or_else(|| panic!("no wire tooltip; the frame showed {shown:?}"));
+        for part in ["#1 LFO", "#2 Lowpass", "cutoff_hz", "500"] {
+            assert!(
+                text.contains(part),
+                "the wire's tooltip {text:?} omits {part:?}"
+            );
+        }
+    }
+
+    /// The picked wire's amount is edited on the wire, and the hover
+    /// tooltip stands down while it is: the two are a few points apart and
+    /// say the same thing, and the tooltip covered the editor's title.
+    #[test]
+    fn picking_a_wire_opens_its_amount_and_puts_the_tooltip_away() {
+        let mut canvas = Canvas::new(three_node_patch());
+        let at = over_the_wire(&mut canvas, "cutoff_hz");
+        assert!(
+            canvas
+                .painted_text()
+                .iter()
+                .any(|t| t.contains("cutoff_hz") && t.contains('\u{27A1}')),
+            "the hovered wire had no tooltip to begin with"
+        );
+        click_at(&mut canvas, at);
+
+        let painted = canvas.painted_text();
+        assert!(canvas.state.wire_is_selected());
+        // A `DragValue` paints its prefix and its value as two galleys.
+        assert!(
+            painted.iter().any(|t| t.trim() == "amt") && painted.iter().any(|t| t == "500.00"),
+            "the picked wire's amount is not on the canvas; painted {painted:?}"
+        );
+        assert!(
+            painted.iter().any(|t| t == "#1 LFO \u{27A1} cutoff_hz"),
+            "the amount editor does not say which wire it is on; painted {painted:?}"
+        );
+        assert!(
+            !painted
+                .iter()
+                .any(|t| t.contains("#2 Lowpass") && t.contains('\u{27A1}')),
+            "the hover tooltip is still up over the amount editor; painted {painted:?}"
+        );
+    }
+
+    /// The picked wire's cross removes it, and it is the one *in* the
+    /// panel: a cross floating at the middle of the curve is under the
+    /// pointer the moment the wire is picked, so its hover text covered the
+    /// panel that had just opened.
+    #[test]
+    fn the_crosss_in_the_picked_wires_panel_removes_it() {
+        let mut canvas = Canvas::new(three_node_patch());
+        let at = over_the_wire(&mut canvas, "cutoff_hz");
+        click_at(&mut canvas, at);
+
+        // The panel's own cross: the one on the title's row, not one of the
+        // crosses in a node box's Inputs list.
+        let title = canvas
+            .painted_text_rects()
+            .into_iter()
+            .find(|(t, _)| t == "#1 LFO \u{27A1} cutoff_hz")
+            .map(|(_, r)| r)
+            .expect("the panel's title");
+        let cross = canvas
+            .chrome(accesskit::Role::Button)
+            .into_iter()
+            .filter(|(t, _)| t == "\u{2716}")
+            .map(|(_, r)| r)
+            .min_by(|a, b| {
+                a.center()
+                    .distance(title.center())
+                    .total_cmp(&b.center().distance(title.center()))
+            })
+            .expect("a cross in the panel");
+        assert!(
+            cross.center().distance(title.center()) < 60.0,
+            "the nearest cross to the panel's title is {:?} away",
+            cross.center().distance(title.center())
+        );
+
+        click_at(&mut canvas, cross.center());
+        let filter = canvas
+            .patch
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.id == NodeId(2))
+            .expect("the filter");
+        assert!(
+            !filter.inputs.contains_key("cutoff_hz"),
+            "the panel's cross did not remove the wire; inputs {:?}",
+            filter.inputs
+        );
+        assert!(!canvas.state.wire_is_selected());
+        assert!(canvas.state.can_undo(), "the removal is not on the history");
+    }
+
+    /// Click at `at` and let the frame settle.
+    fn click_at(canvas: &mut Canvas, at: Pos2) {
+        canvas.frame(vec![
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        canvas.frame(Vec::new());
+    }
+
+    /// B2 and B7: a wire is picked up by clicking it and removed with the
+    /// key that removes a node, and one undo puts it back — a wire removal
+    /// is a step on the history like any other committed edit.
+    #[test]
+    fn a_wire_is_selected_by_a_click_and_removed_by_delete() {
+        let mut canvas = Canvas::new(three_node_patch());
+        let at = over_the_wire(&mut canvas, "cutoff_hz");
+        click_at(&mut canvas, at);
+        assert!(
+            canvas.state.wire_is_selected(),
+            "a click on the wire did not select it"
+        );
+        assert_eq!(canvas.state.wires().len(), 2);
+
+        canvas.frame(press(egui::Key::Delete, egui::Modifiers::NONE));
+        canvas.frame(Vec::new());
+        let filter = canvas
+            .patch
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.id == NodeId(2))
+            .expect("the filter");
+        assert!(
+            !filter.inputs.contains_key("cutoff_hz"),
+            "Delete left the wire in place"
+        );
+        assert!(
+            !canvas.state.wire_is_selected(),
+            "the removed wire is still selected"
+        );
+
+        keys_over_the_canvas(&mut canvas, press(egui::Key::Z, egui::Modifiers::COMMAND));
+        let filter = canvas
+            .patch
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.id == NodeId(2))
+            .expect("the filter");
+        assert_eq!(
+            filter.inputs.get("cutoff_hz").map(Vec::len),
+            Some(1),
+            "one undo did not bring the wire back"
+        );
+    }
+
+    /// Deleting a node while a wire is selected must still delete the node:
+    /// the selections are separate, and the last one made is the one the
+    /// key acts on.
+    #[test]
+    fn selecting_a_wire_clears_the_node_selection() {
+        let mut canvas = Canvas::new(three_node_patch());
+        let grip = canvas.label("#1");
+        canvas.frame(vec![
+            egui::Event::PointerMoved(grip.center()),
+            egui::Event::PointerButton {
+                pos: grip.center(),
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: grip.center(),
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        canvas.frame(Vec::new());
+        assert_eq!(canvas.state.selected, Some(NodeId(1)));
+
+        let at = over_the_wire(&mut canvas, "cutoff_hz");
+        click_at(&mut canvas, at);
+        assert!(canvas.state.wire_is_selected());
+        assert_eq!(canvas.state.selected, None, "both were selected at once");
+    }
+
+    /// Both ways round: picking a node puts a picked wire down, as picking
+    /// a wire puts a picked node down. Delete acts on one thing.
+    #[test]
+    fn picking_a_node_clears_a_picked_wire() {
+        let mut canvas = Canvas::new(three_node_patch());
+        let at = over_the_wire(&mut canvas, "cutoff_hz");
+        click_at(&mut canvas, at);
+        assert!(canvas.state.wire_is_selected());
+
+        let grip = canvas.label("#1");
+        canvas.frame(vec![egui::Event::PointerMoved(grip.center())]);
+        click_at(&mut canvas, grip.center());
+        assert_eq!(canvas.state.selected, Some(NodeId(1)));
+        assert!(
+            !canvas.state.wire_is_selected(),
+            "both a node and a wire were picked at once"
+        );
+    }
+
+    /// The toolbar's Delete acts on whatever is picked, and says which. It
+    /// used to be greyed out whenever no *node* was picked, while the
+    /// Delete key removed the picked wire — the same word doing two things.
+    #[test]
+    fn the_toolbar_delete_removes_a_picked_wire_and_says_so() {
+        let mut canvas = Canvas::new(three_node_patch());
+        let at = over_the_wire(&mut canvas, "cutoff_hz");
+        click_at(&mut canvas, at);
+
+        let over = hover_text_over(&mut canvas, "Delete");
+        assert!(
+            over.iter()
+                .any(|t| t.contains("wire") && t.contains("cutoff_hz")),
+            "Delete says {over:?} with a wire picked"
+        );
+
+        canvas.click("Delete");
+        let filter = canvas
+            .patch
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.id == NodeId(2))
+            .expect("the filter");
+        assert!(
+            !filter.inputs.contains_key("cutoff_hz"),
+            "the wire is still there"
+        );
+        assert_eq!(
+            canvas.patch.graph.nodes.len(),
+            3,
+            "it removed a node as well"
+        );
+    }
+
+    /// B12's contract, extended: Escape spends one press per step, so a
+    /// selected wire is what it clears first.
+    #[test]
+    fn escape_clears_a_selected_wire_before_anything_else() {
+        let mut canvas = Canvas::new(three_node_patch());
+        let at = over_the_wire(&mut canvas, "cutoff_hz");
+        click_at(&mut canvas, at);
+        canvas.frame(press(egui::Key::Escape, egui::Modifiers::NONE));
+        assert!(!canvas.state.wire_is_selected());
+        assert!(canvas.state.took_escape(), "the press was not spent");
+    }
+
+    /// Take a wire off its port by its end and let it go at `to`.
+    fn reroute_the_cutoff_wire(canvas: &mut Canvas, to: Pos2) {
+        let grab = {
+            let wire = canvas
+                .state
+                .wires()
+                .iter()
+                .find(|w| w.port == "cutoff_hz")
+                .expect("the LFO's wire");
+            canvas.to_screen() * wire_grab(wire)
+        };
+        canvas.frame(vec![
+            egui::Event::PointerMoved(grab),
+            egui::Event::PointerButton {
+                pos: grab,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        for i in 1..=4 {
+            canvas.frame(vec![egui::Event::PointerMoved(
+                grab.lerp(to, i as f32 / 4.0),
+            )]);
+        }
+        canvas.frame(vec![egui::Event::PointerButton {
+            pos: to,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        canvas.frame(Vec::new());
+    }
+
+    /// B2: a wire's input end comes off its port and goes on another, and
+    /// the amount it carried goes with it — a re-route moves a wire, it
+    /// does not make a fresh one at 1.0.
+    #[test]
+    fn a_wire_dragged_off_its_port_onto_another_re_routes_and_keeps_its_amount() {
+        let mut canvas = Canvas::new(three_node_patch());
+        let q_row = canvas.label("q:");
+        reroute_the_cutoff_wire(
+            &mut canvas,
+            Pos2::new(q_row.right() + 40.0, q_row.center().y),
+        );
+
+        let filter = canvas
+            .patch
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.id == NodeId(2))
+            .expect("the filter");
+        assert!(
+            !filter.inputs.contains_key("cutoff_hz"),
+            "the wire is still on its old port; inputs {:?}",
+            filter.inputs
+        );
+        assert_eq!(
+            filter.inputs.get("q"),
+            Some(&vec![Connection::modulation(NodeId(1), 500.0)]),
+            "the wire did not land on q with the amount it carried; inputs {:?}",
+            filter.inputs
+        );
+    }
+
+    /// And let go over nothing it is simply off: a re-route that lands
+    /// nowhere is a disconnection, not an offer to make a node.
+    #[test]
+    fn a_wire_dragged_off_its_port_onto_nothing_is_disconnected() {
+        let mut canvas = Canvas::new(three_node_patch());
+        let clear = canvas
+            .state
+            .boxes
+            .iter()
+            .map(|(_, r)| *r)
+            .reduce(|a, b| a.union(b))
+            .expect("boxes")
+            .right_top()
+            + Vec2::new(60.0, 20.0);
+        let on_screen = canvas.to_screen() * clear;
+        reroute_the_cutoff_wire(&mut canvas, on_screen);
+
+        let filter = canvas
+            .patch
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.id == NodeId(2))
+            .expect("the filter");
+        assert!(!filter.inputs.contains_key("cutoff_hz"));
+        assert_eq!(
+            canvas.patch.graph.nodes.len(),
+            3,
+            "a re-route that landed nowhere offered to make a node"
+        );
+        assert!(
+            canvas.state.can_undo(),
+            "the disconnection is not on the history"
+        );
+    }
+
+    /// B6: the Add menu is grouped by role, and every group's heading and
+    /// every kind is in it.
+    #[test]
+    fn the_add_menu_offers_every_kind_under_a_heading() {
+        let mut canvas = Canvas::new(three_node_patch());
+        canvas.click("Add node");
+        let painted = canvas.painted_text();
+        for label in KIND_LABELS.iter().copied() {
+            assert!(
+                painted.iter().any(|t| t == label),
+                "the Add menu does not offer {label:?}; it showed {painted:?}"
+            );
+        }
+        for group in KindGroup::ALL {
+            let wanted = kinds_by_group().iter().any(|(g, _)| *g == group);
+            assert_eq!(
+                painted.iter().any(|t| t == group.title()),
+                wanted,
+                "{:?}'s heading is shown when it holds no kinds",
+                group
+            );
+        }
+        assert_eq!(
+            canvas.patch.graph.nodes.len(),
+            3,
+            "opening the menu added a node by itself"
+        );
+    }
+
+    /// B6: and adding one from it is one step, not a Sine followed by a
+    /// trip to the kind combo.
+    #[test]
+    fn choosing_a_kind_from_the_add_menu_adds_that_kind() {
+        let mut canvas = Canvas::new(three_node_patch());
+        canvas.click("Add node");
+        canvas.click("Reverb");
+        assert_eq!(canvas.patch.graph.nodes.len(), 4);
+        let added = canvas.patch.graph.nodes.last().expect("the new node");
+        assert_eq!(node_kind_label(&added.kind), "Reverb");
+        assert_eq!(canvas.state.selected, Some(added.id));
+    }
+
+    /// B6: the same menu opens where the canvas is right-clicked, and the
+    /// node lands there rather than in the middle of the view.
+    #[test]
+    fn the_add_menu_opens_where_the_canvas_was_right_clicked() {
+        let mut canvas = Canvas::new(three_node_patch());
+        // Empty canvas, well clear of every box — and high enough on the
+        // screen that the whole menu fits below it, since a menu that would
+        // run off the bottom is moved up to fit and is then not at the
+        // pointer for a good reason of its own.
+        let clear = canvas
+            .state
+            .boxes
+            .iter()
+            .map(|(_, r)| *r)
+            .reduce(|a, b| a.union(b))
+            .expect("boxes")
+            .right_top()
+            + Vec2::new(40.0, 10.0);
+        let at = canvas.to_screen() * clear;
+        canvas.frame(vec![
+            egui::Event::PointerMoved(at),
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        canvas.frame(Vec::new());
+
+        // The menu is at the pointer: its first heading is drawn beside the
+        // point that was clicked, not in the middle of the view.
+        let heading = canvas
+            .painted_text_rects()
+            .into_iter()
+            .find(|(t, _)| t == KindGroup::Sources.title())
+            .map(|(_, r)| r)
+            .expect("the menu's first heading");
+        assert!(
+            heading.left() >= at.x - 2.0 && heading.left() <= at.x + 40.0,
+            "the menu opened at {:?}, not at the pointer {at:?}",
+            heading.left_top()
+        );
+        assert!(
+            heading.top() >= at.y - 2.0 && heading.top() <= at.y + 40.0,
+            "the menu opened at {:?}, not at the pointer {at:?}",
+            heading.left_top()
+        );
+
+        canvas.click("Reverb");
+        assert_eq!(canvas.patch.graph.nodes.len(), 4);
+        let added = canvas.patch.graph.nodes.last().expect("the new node").id;
+        let put = canvas.state.positions[&added];
+        assert!(
+            put.distance(clear) < 2.0,
+            "the node landed at {put:?}, not where the menu was opened {clear:?}"
+        );
+    }
+
+    /// A right-click on a node opens that node's own menu, not the Add
+    /// menu: the canvas background is what offers to add.
+    #[test]
+    fn a_right_click_on_a_node_does_not_open_the_add_menu() {
+        let mut canvas = Canvas::new(three_node_patch());
+        let grip = canvas.label("#1");
+        canvas.frame(vec![
+            egui::Event::PointerMoved(grip.center()),
+            egui::Event::PointerButton {
+                pos: grip.center(),
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: grip.center(),
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        canvas.frame(Vec::new());
+        let buttons = canvas.buttons();
+        assert!(buttons.iter().any(|b| b == "Mutate this node"));
+        assert!(
+            !buttons.iter().any(|b| b == "Reverb"),
+            "the Add menu opened over the node's own; buttons {buttons:?}"
+        );
+    }
+
+    /// B6: a wire dragged onto empty canvas offers to make what it would
+    /// drive, and wires it up when one is chosen.
+    #[test]
+    fn a_wire_dropped_on_empty_canvas_opens_the_add_menu_and_wires_it() {
+        let mut canvas = Canvas::new(three_node_patch());
+        let clear = canvas
+            .state
+            .boxes
+            .iter()
+            .map(|(_, r)| *r)
+            .reduce(|a, b| a.union(b))
+            .expect("boxes")
+            .left_bottom()
+            + Vec2::new(30.0, 120.0);
+        let on_screen = canvas.to_screen() * clear;
+        drag_from_the_sine_to(&mut canvas, on_screen);
+        canvas.frame(vec![egui::Event::PointerButton {
+            pos: on_screen,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        canvas.frame(Vec::new());
+        assert!(
+            canvas.painted_text().iter().any(|t| t == "Lowpass"),
+            "dropping a wire on empty canvas offered nothing"
+        );
+
+        canvas.click("Lowpass");
+        assert_eq!(canvas.patch.graph.nodes.len(), 4);
+        let added = canvas.patch.graph.nodes.last().expect("the new node");
+        assert_eq!(
+            added.inputs.get("in").map(Vec::len),
+            Some(1),
+            "the new node's first input was not wired from the drag"
         );
     }
 }

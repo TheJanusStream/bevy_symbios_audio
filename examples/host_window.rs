@@ -83,16 +83,51 @@
 //! bounds are in canvas units; the canvas layer's transform takes them to
 //! the screen, and the pointer events go in through `EguiInput`:
 //!   cargo run --example host_window --features egui -- --drag --shot drag.png
+//!
+//! `--wire` parks the pointer on the wire that drives the Lowpass's cutoff,
+//! so a picture shows a hovered wire and its tooltip; `--pick` clicks it as
+//! well, so the picture shows the wire picked — its cross and the amount
+//! editor that opens on it:
+//!   cargo run --example host_window --features egui -- --wire --shot wire.png
+//!   cargo run --example host_window --features egui -- --pick --shot picked.png
+//!
+//! `--unheard` points the patch slot's output at its Sawtooth, so the LFO
+//! and the filter are in the patch and nothing plays them:
+//!   cargo run --example host_window --features egui -- --unheard --shot unheard.png
+//!
+//! `--menu add` opens the toolbar's Add node menu and `--menu node` the
+//! context menu on node #0's grip, each held open for the picture:
+//!   cargo run --example host_window --features egui -- --menu add --shot menu.png
+//!
+//! # Why a scripted gesture waits
+//!
+//! Every one of those presses where a widget *is*, and for the opening
+//! frames a widget is not where it will end up. Two things move it. Both
+//! windows size themselves, the canvas's [`egui::Scene`] auto-fits, and a
+//! node box that has never been drawn is placed at a guessed size and laid
+//! out again once it has been measured — that settles in the first handful
+//! of frames. And then the audition the picture wants starts playing, the
+//! strip above the canvas grows a waveform, and everything below it moves
+//! down by the height of one: about 54 points, or two rows of a node's
+//! Inputs list. A gesture fired on a fixed frame count grabs the right port
+//! and then watches the row it was aimed at slide away — the `--drag` wire
+//! landed on the Lowpass's `in` row rather than its `q` (crate #67).
+//!
+//! So a gesture waits for what `--shot` waits for (the monitor has reached
+//! the state `--status` asked for) and then for its own target points to
+//! hold still for [`STILL_FRAMES`] frames; and `--shot` in turn waits for
+//! the gesture to be in place, rather than for a frame count of its own.
 
 use std::collections::BTreeMap;
 
 use bevy::audio::{AudioSink, AudioSinkPlayback};
 use bevy::diagnostic::FrameCount;
+use bevy::ecs::system::SystemParam;
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{Screenshot, save_to_disk};
 use bevy_egui::{
-    EguiContext, EguiContexts, EguiInput, EguiOutput, EguiPlugin, EguiPreUpdateSet,
-    EguiPrimaryContextPass, PrimaryEguiContext, egui, egui::accesskit,
+    EguiContexts, EguiInput, EguiOutput, EguiPlugin, EguiPreUpdateSet, EguiPrimaryContextPass,
+    PrimaryEguiContext, egui, egui::accesskit,
 };
 
 use bevy_symbios_audio::{
@@ -133,7 +168,16 @@ const ORPHAN_NAME: &str = "harp";
 const ORPHAN_SCROLL_FRAMES: u32 = 30;
 /// Frames with both windows up before `--rename` starts typing: past the
 /// windows' sizing passes, and well before `--shot` takes its picture.
+/// Typing needs no coordinates — the field is focused by an AccessKit
+/// request — so a frame count is enough for it, and not for a gesture that
+/// presses somewhere ([`Settle`]).
 const TYPE_AFTER_FRAMES: u32 = 10;
+/// Frames running for which a gesture's target points must not have moved
+/// before it acts. See "Why a scripted gesture waits" above.
+const STILL_FRAMES: u32 = 6;
+/// How far a target point may move between frames and still count as
+/// still, in points: a rounding wobble is not the layout moving.
+const STILL_SLACK: f32 = 0.5;
 /// Frames `--drag` takes to carry the wire from the output to the row.
 const DRAG_FRAMES: u32 = 12;
 /// How far right of the `q` label `--drag` holds the pointer, in canvas
@@ -167,10 +211,12 @@ fn main() -> AppExit {
         .init_resource::<Shot>()
         .init_resource::<Typist>()
         .init_resource::<Dragger>()
+        .init_resource::<Hoverer>()
+        .init_resource::<Menuer>()
         .add_systems(Startup, setup_camera)
         .add_systems(
             PreUpdate,
-            (type_the_rename, drag_a_wire)
+            (type_the_rename, drag_a_wire, hover_a_wire, open_a_menu)
                 .after(EguiPreUpdateSet::ProcessInput)
                 .before(EguiPreUpdateSet::BeginPass),
         )
@@ -188,16 +234,44 @@ fn main() -> AppExit {
 }
 
 /// The command line: `--light`, `--orphan`, `--rename <name>`, `--drag`,
-/// `--broken`, `--status <state>` and `--shot <path>`.
+/// `--wire`, `--menu <which>`, `--broken`, `--status <state>` and
+/// `--shot <path>`.
 #[derive(Resource)]
 struct Args {
     light: bool,
     orphan: bool,
     rename: Option<String>,
     drag: bool,
+    wire: bool,
+    /// Pick the wire `--wire` parks on, as well as hovering it.
+    pick: bool,
+    unheard: bool,
+    menu: Option<Menu>,
     broken: bool,
     status: Option<Status>,
     shot: Option<String>,
+}
+
+/// Which menu `--menu` opens and holds open for the picture.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Menu {
+    /// The toolbar's Add node menu.
+    Add,
+    /// The context menu on node #0's grip.
+    Node,
+}
+
+impl Menu {
+    fn parse(name: &str) -> Self {
+        match name {
+            "add" => Self::Add,
+            "node" => Self::Node,
+            other => {
+                eprintln!("--menu {other}: expected add or node");
+                std::process::exit(2);
+            }
+        }
+    }
 }
 
 /// The chip state `--status` asks for.
@@ -248,12 +322,46 @@ impl Args {
             orphan: args.iter().any(|a| a == "--orphan"),
             rename: value("--rename", "lead"),
             drag: args.iter().any(|a| a == "--drag"),
+            wire: args.iter().any(|a| a == "--wire" || a == "--pick"),
+            pick: args.iter().any(|a| a == "--pick"),
+            unheard: args.iter().any(|a| a == "--unheard"),
+            menu: value("--menu", "add").as_deref().map(Menu::parse),
             broken: args.iter().any(|a| a == "--broken") || status == Some(Status::Error),
             status,
             shot,
         }
     }
+
+    /// Whether any flag drives the app through a gesture of its own. Those
+    /// find their widgets in the AccessKit tree, which is off unless one
+    /// does.
+    fn scripted(&self) -> bool {
+        self.rename.is_some() || self.drag || self.wire || self.menu.is_some()
+    }
+
+    /// Whether the gesture this run asked for is in place, so `--shot` can
+    /// take its picture. A gesture that never gets there is caught by
+    /// `--shot`'s own [`GIVE_UP`].
+    fn gesture_in_place(&self, gestures: &Gestures) -> bool {
+        (!self.drag || matches!(*gestures.dragger, Dragger::Holding(_)))
+            && (!self.wire || matches!(*gestures.hoverer, Hoverer::Parked(_)))
+            && (self.menu.is_none() || matches!(*gestures.menuer, Menuer::Open(_)))
+    }
 }
+
+/// Where each scripted gesture has got to, as one system parameter: three
+/// resources that are always read together.
+#[derive(SystemParam)]
+struct Gestures<'w> {
+    dragger: Res<'w, Dragger>,
+    hoverer: Res<'w, Hoverer>,
+    menuer: Res<'w, Menuer>,
+}
+
+/// The toolbar button that adds a node, by the label it wears: the harness
+/// finds it in the AccessKit tree, and the canvas's own tests look for the
+/// same string.
+const ADD_NODE: &str = "Add node";
 
 /// Both slots' working copies and view state, the theme, and what the
 /// windows measured this frame.
@@ -292,10 +400,17 @@ impl Editor {
             sequence_state.set_selected_event(Some((ORPHAN_TRACK, 0)));
         }
         Self {
-            patch: if args.broken {
-                looped_drone_patch()
-            } else {
-                filtered_drone_patch()
+            patch: match () {
+                _ if args.broken => looped_drone_patch(),
+                // Valid, and two of its three nodes bake into nothing: the
+                // output is the Sawtooth, so the filter the LFO drives is
+                // not on the way to it.
+                _ if args.unheard => {
+                    let mut patch = filtered_drone_patch();
+                    patch.graph.output = NodeId(0);
+                    patch
+                }
+                _ => filtered_drone_patch(),
             },
             patch_state: PatchEditorState::default(),
             patch_audition: AuditionState::default(),
@@ -390,8 +505,8 @@ fn render_ui(
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
     };
-    if args.rename.is_some() || args.drag {
-        // `type_the_rename` and `drag_a_wire` find their widgets in this tree.
+    if args.scripted() {
+        // Every scripted gesture finds its widgets in this tree.
         ctx.enable_accesskit();
     }
     let editor = editor.as_mut();
@@ -644,6 +759,194 @@ fn type_the_rename(
     }
 }
 
+/// Whether a scripted gesture may read the layout yet: the windows are up,
+/// and the monitor has reached the state this run's picture is of.
+///
+/// The second half is what a frame count cannot express — an audition
+/// starting is a layout change (the strip grows a waveform), and it happens
+/// whenever the bake happens to finish. See "Why a scripted gesture waits".
+fn layout_is_final(args: &Args, editor: &Editor, monitor: &AudioMonitor) -> bool {
+    editor.frames_shown >= TYPE_AFTER_FRAMES
+        && matches!(status_reached(args.status, monitor), Ok(true))
+}
+
+/// A gesture's target points, and how many frames running they have been
+/// where they are.
+///
+/// The opening frames of the app are not a settled layout: the windows size
+/// themselves, the canvas's `Scene` auto-fits, and a node box placed at a
+/// guessed size is laid out again once it has been measured. A press taken
+/// then lands on the right widget and is left holding stale geometry a
+/// moment later (crate #67), so a gesture recomputes its points every frame
+/// and waits for them to stop moving.
+#[derive(Default)]
+struct Settle {
+    was: Option<Vec<egui::Pos2>>,
+    still: u32,
+}
+
+impl Settle {
+    /// `now`, once it has been the same for [`STILL_FRAMES`] frames running.
+    fn settled(&mut self, now: Vec<egui::Pos2>) -> Option<Vec<egui::Pos2>> {
+        let moved = self.was.as_ref().is_none_or(|was| {
+            was.len() != now.len()
+                || was
+                    .iter()
+                    .zip(&now)
+                    .any(|(a, b)| a.distance(*b) > STILL_SLACK)
+        });
+        if moved {
+            self.still = 0;
+            self.was = Some(now);
+            return None;
+        }
+        self.still += 1;
+        (self.still >= STILL_FRAMES).then_some(now)
+    }
+}
+
+/// Every widget in the last pass's AccessKit tree that `wanted` accepts,
+/// as the rect the tree gives for it.
+///
+/// Bounds are in the coordinates of the layer the widget was drawn on: the
+/// screen for the toolbar and the window chrome, scene units for anything
+/// inside a canvas.
+fn accesskit_bounds(
+    output: &EguiOutput,
+    wanted: &dyn Fn(&accesskit::Node) -> bool,
+) -> Vec<egui::Rect> {
+    output
+        .platform_output
+        .accesskit_update
+        .iter()
+        .flat_map(|update| &update.nodes)
+        .filter(|(_, node)| wanted(node))
+        .filter_map(|(_, node)| node.bounds())
+        .map(|b| {
+            egui::Rect::from_min_max(
+                egui::pos2(b.x0 as f32, b.y0 as f32),
+                egui::pos2(b.x1 as f32, b.y1 as f32),
+            )
+        })
+        .collect()
+}
+
+/// The one widget the patch slot's canvas drew that `wanted` accepts, in
+/// screen points.
+///
+/// The AccessKit tree covers the whole app, and the sequence slot draws a
+/// canvas of its own, so a label like `"q:"` is not unique: `to_screen` is
+/// the patch canvas's own transform, and a widget of some other canvas's
+/// lands outside the patch window once it has been applied. `None` when
+/// nothing matches, and when more than one does — a gesture that cannot
+/// tell which widget it means must not guess.
+fn in_the_patch_canvas(
+    output: &EguiOutput,
+    window: egui::Rect,
+    to_screen: egui::emath::TSTransform,
+    what: &str,
+    wanted: &dyn Fn(&accesskit::Node) -> bool,
+) -> Option<egui::Rect> {
+    let found: Vec<egui::Rect> = accesskit_bounds(output, wanted)
+        .into_iter()
+        .map(|rect| to_screen * rect)
+        .filter(|rect| window.contains(rect.center()))
+        .collect();
+    match found.as_slice() {
+        [one] => Some(*one),
+        [] => None,
+        many => {
+            warn!(
+                "{what}: {} of them in the patch canvas, so none",
+                many.len()
+            );
+            None
+        }
+    }
+}
+
+/// The one widget the patch slot drew *outside* its canvas — its toolbar,
+/// its strip — that `wanted` accepts. Those are drawn on the window's own
+/// layer, which carries no transform, so the tree's bounds are already
+/// screen points.
+fn in_the_patch_window(
+    output: &EguiOutput,
+    window: egui::Rect,
+    what: &str,
+    wanted: &dyn Fn(&accesskit::Node) -> bool,
+) -> Option<egui::Rect> {
+    let found: Vec<egui::Rect> = accesskit_bounds(output, wanted)
+        .into_iter()
+        .filter(|rect| window.contains(rect.center()))
+        .collect();
+    match found.as_slice() {
+        [one] => Some(*one),
+        [] => None,
+        many => {
+            warn!(
+                "{what}: {} of them in the patch window, so none",
+                many.len()
+            );
+            None
+        }
+    }
+}
+
+/// Node #0's grip in the patch slot, in screen points.
+///
+/// `"#0"` is not a name that says which canvas it is in: the sequence slot
+/// draws an instrument's patch, whose nodes are numbered from zero too, and
+/// both windows are in the one AccessKit tree. The Sawtooth's output port
+/// *is* unique, and the grip is the leftmost thing on the same title row as
+/// it, so the port is what picks which `"#0"` is meant.
+fn node_zero_grip(
+    output: &EguiOutput,
+    window: egui::Rect,
+    to_screen: egui::emath::TSTransform,
+) -> Option<egui::Rect> {
+    let port = in_the_patch_canvas(output, window, to_screen, "the Sawtooth's output", &|n| {
+        n.label()
+            .is_some_and(|l| l.starts_with("Output of #0 Sawtooth"))
+    })?;
+    accesskit_bounds(output, &label_is("#0"))
+        .into_iter()
+        .map(|rect| to_screen * rect)
+        .filter(|rect| window.contains(rect.center()))
+        // On the port's row, and left of it: the grip is where the title
+        // starts and the output dot is where it ends.
+        .filter(|rect| {
+            (rect.center().y - port.center().y).abs() <= port.height()
+                && rect.center().x < port.center().x
+        })
+        .min_by(|a, b| a.center().x.total_cmp(&b.center().x))
+}
+
+/// A label the canvas painted, by the text it shows.
+fn label_is(text: &'static str) -> impl Fn(&accesskit::Node) -> bool {
+    move |n: &accesskit::Node| n.role() == accesskit::Role::Label && n.value() == Some(text)
+}
+
+/// Press the primary button at `at`, having moved there first.
+fn press_at(input: &mut EguiInput, at: egui::Pos2, button: egui::PointerButton) {
+    input.0.events.push(egui::Event::PointerMoved(at));
+    input.0.events.push(egui::Event::PointerButton {
+        pos: at,
+        button,
+        pressed: true,
+        modifiers: egui::Modifiers::NONE,
+    });
+}
+
+/// Let the button go at `at`.
+fn release_at(input: &mut EguiInput, at: egui::Pos2, button: egui::PointerButton) {
+    input.0.events.push(egui::Event::PointerButton {
+        pos: at,
+        button,
+        pressed: false,
+        modifiers: egui::Modifiers::NONE,
+    });
+}
+
 /// Where `--drag` is: looking for the port and the row, carrying the wire
 /// (from, to, frames done), or holding it for the picture.
 #[derive(Resource, Default)]
@@ -651,24 +954,29 @@ enum Dragger {
     #[default]
     Finding,
     Carrying(egui::Pos2, egui::Pos2, u32),
-    Holding,
+    /// Holding the wire at this point, which the pointer is put back to on
+    /// every frame after.
+    Holding(egui::Pos2),
 }
 
 /// `--drag`: press on the Sawtooth's output port in the patch slot, carry
 /// the wire to the Lowpass's `q` row over [`DRAG_FRAMES`] frames, and hold
 /// it there without releasing. Both widgets are found in the last pass's
-/// AccessKit tree, in canvas units, and taken to the screen by whichever
-/// layer transform puts the port inside the patch slot's window.
+/// AccessKit tree, in canvas units, and taken to the screen by the canvas's
+/// own transform — and the press waits until neither has moved for
+/// [`STILL_FRAMES`] frames.
 fn drag_a_wire(
     args: Res<Args>,
     editor: Res<Editor>,
+    monitor: Res<AudioMonitor>,
     mut dragger: ResMut<Dragger>,
-    mut contexts: Query<(&mut EguiContext, &mut EguiInput, &EguiOutput), With<PrimaryEguiContext>>,
+    mut settle: Local<Settle>,
+    mut contexts: Query<(&mut EguiInput, &EguiOutput), With<PrimaryEguiContext>>,
 ) {
     if !args.drag {
         return;
     }
-    let Ok((mut context, mut input, output)) = contexts.single_mut() else {
+    let Ok((mut input, output)) = contexts.single_mut() else {
         return;
     };
     match *dragger {
@@ -676,53 +984,42 @@ fn drag_a_wire(
             let Some(window) = editor.shown[0] else {
                 return;
             };
-            if editor.frames_shown < TYPE_AFTER_FRAMES {
+            if !layout_is_final(&args, &editor, &monitor) {
                 return;
             }
-            let bounds = |wanted: &dyn Fn(&accesskit::Node) -> bool| {
-                output
-                    .platform_output
-                    .accesskit_update
-                    .iter()
-                    .flat_map(|update| &update.nodes)
-                    .find(|(_, node)| wanted(node))
-                    .and_then(|(_, node)| node.bounds())
-                    .map(|b| {
-                        egui::Rect::from_min_max(
-                            egui::pos2(b.x0 as f32, b.y0 as f32),
-                            egui::pos2(b.x1 as f32, b.y1 as f32),
-                        )
-                    })
-            };
-            let Some(port) = bounds(&|n| {
-                n.label()
-                    .is_some_and(|l| l.starts_with("Output of #0 Sawtooth"))
-            }) else {
+            let to_screen = editor.patch_state.canvas_to_screen();
+            let port = in_the_patch_canvas(
+                output,
+                window,
+                to_screen,
+                "the Sawtooth's output port",
+                &|n| {
+                    n.label()
+                        .is_some_and(|l| l.starts_with("Output of #0 Sawtooth"))
+                },
+            );
+            let row_label = in_the_patch_canvas(
+                output,
+                window,
+                to_screen,
+                "the Lowpass's q row",
+                &label_is("q:"),
+            );
+            let (Some(port), Some(row_label)) = (port, row_label) else {
                 return;
             };
-            let Some(row_label) =
-                bounds(&|n| n.role() == accesskit::Role::Label && n.value() == Some("q:"))
-            else {
+            // Well to the right of the dot, so the picture shows a drop
+            // that the row took rather than one that snapped to the dot.
+            let over_the_row = egui::pos2(
+                row_label.right() + DRAG_PAST_LABEL * to_screen.scaling,
+                row_label.center().y,
+            );
+            let Some(points) = settle.settled(vec![port.center(), over_the_row]) else {
                 return;
             };
-            let transforms = context.get_mut().memory(|m| m.to_global.clone());
-            let Some(to_screen) = transforms
-                .values()
-                .find(|t| window.contains(**t * port.center()))
-            else {
-                return;
-            };
-            let from = *to_screen * port.center();
-            let to =
-                *to_screen * egui::pos2(row_label.right() + DRAG_PAST_LABEL, row_label.center().y);
+            let (from, to) = (points[0], points[1]);
             info!("--drag: pressing at {from:?} and carrying the wire to {to:?}");
-            input.0.events.push(egui::Event::PointerMoved(from));
-            input.0.events.push(egui::Event::PointerButton {
-                pos: from,
-                button: egui::PointerButton::Primary,
-                pressed: true,
-                modifiers: egui::Modifiers::NONE,
-            });
+            press_at(&mut input, from, egui::PointerButton::Primary);
             *dragger = Dragger::Carrying(from, to, 0);
         }
         Dragger::Carrying(from, to, done) => {
@@ -734,12 +1031,168 @@ fn drag_a_wire(
                 .push(egui::Event::PointerMoved(from.lerp(to, t)));
             *dragger = if done >= DRAG_FRAMES {
                 info!("--drag: holding a wire from the Sawtooth over the Lowpass's q row");
-                Dragger::Holding
+                Dragger::Holding(to)
             } else {
                 Dragger::Carrying(from, to, done)
             };
         }
-        Dragger::Holding => {}
+        // The pointer is put back where it was left: bevy_egui feeds the
+        // real one every frame, and a picture taken after it had wandered
+        // off would show no drag at all.
+        Dragger::Holding(at) => input.0.events.push(egui::Event::PointerMoved(at)),
+    }
+}
+
+/// Where `--wire` is: looking for the wire, or parked on it.
+#[derive(Resource, Default)]
+enum Hoverer {
+    #[default]
+    Finding,
+    /// `--pick`: parked on the wire, with the click still to come.
+    Picking(egui::Pos2),
+    Parked(egui::Pos2),
+}
+
+/// `--wire`: park the pointer on the wire that drives the Lowpass's
+/// `cutoff_hz`, so the picture shows a hovered wire and its tooltip.
+///
+/// The wire's own geometry comes from the canvas rather than from the
+/// AccessKit tree: a wire is painted, not laid out, so the tree has no
+/// bounds for one until it is hovered, which is what this is for.
+fn hover_a_wire(
+    args: Res<Args>,
+    editor: Res<Editor>,
+    monitor: Res<AudioMonitor>,
+    mut hoverer: ResMut<Hoverer>,
+    mut settle: Local<Settle>,
+    mut contexts: Query<&mut EguiInput, With<PrimaryEguiContext>>,
+) {
+    if !args.wire {
+        return;
+    }
+    let Ok(mut input) = contexts.single_mut() else {
+        return;
+    };
+    if let Hoverer::Parked(at) = *hoverer {
+        input.0.events.push(egui::Event::PointerMoved(at));
+        return;
+    }
+    if let Hoverer::Picking(at) = *hoverer {
+        // The click goes in on the frame after the park, so the canvas has
+        // already seen the pointer on the wire and knows which one it is.
+        press_at(&mut input, at, egui::PointerButton::Primary);
+        release_at(&mut input, at, egui::PointerButton::Primary);
+        info!("--pick: clicking the wire at {at:?}");
+        *hoverer = Hoverer::Parked(at);
+        return;
+    }
+    if editor.shown[0].is_none() || !layout_is_final(&args, &editor, &monitor) {
+        return;
+    }
+    let to_screen = editor.patch_state.canvas_to_screen();
+    let Some(wire) = editor
+        .patch_state
+        .wires()
+        .iter()
+        .find(|w| w.port == "cutoff_hz")
+    else {
+        return;
+    };
+    let on_the_wire = to_screen * wire.midpoint();
+    let Some(points) = settle.settled(vec![on_the_wire]) else {
+        return;
+    };
+    info!(
+        "--wire: parking on the wire from #{} to #{} · {} at {:?}",
+        wire.from.0, wire.to.0, wire.port, points[0]
+    );
+    input.0.events.push(egui::Event::PointerMoved(points[0]));
+    *hoverer = if args.pick {
+        Hoverer::Picking(points[0])
+    } else {
+        Hoverer::Parked(points[0])
+    };
+}
+
+/// Where `--menu` is: looking for what to click, or holding the menu open
+/// with the pointer parked inside it.
+#[derive(Resource, Default)]
+enum Menuer {
+    #[default]
+    Finding,
+    /// Clicked at this point on the last frame; the menu opens under it.
+    Clicked(egui::Pos2),
+    Open(egui::Pos2),
+}
+
+/// How far inside an opened menu `--menu` parks the pointer, in points:
+/// far enough to be over the menu rather than the widget that opened it,
+/// and not so far as to be over an item it might look chosen.
+const MENU_PARK: egui::Vec2 = egui::vec2(12.0, 14.0);
+
+/// `--menu`: open a menu and hold it open for the picture.
+///
+/// egui closes a menu on a click outside it, and bevy_egui feeds the real
+/// pointer every frame, so the pointer is parked just inside the menu and
+/// put back there on every frame after. That is what a fixed frame count
+/// could not do: the click landed and the menu was gone long before
+/// `--shot` fired (crate #67).
+fn open_a_menu(
+    args: Res<Args>,
+    editor: Res<Editor>,
+    monitor: Res<AudioMonitor>,
+    mut menuer: ResMut<Menuer>,
+    mut settle: Local<Settle>,
+    mut contexts: Query<(&mut EguiInput, &EguiOutput), With<PrimaryEguiContext>>,
+) {
+    let Some(which) = args.menu else {
+        return;
+    };
+    let Ok((mut input, output)) = contexts.single_mut() else {
+        return;
+    };
+    match *menuer {
+        Menuer::Finding => {
+            let Some(window) = editor.shown[0] else {
+                return;
+            };
+            if !layout_is_final(&args, &editor, &monitor) {
+                return;
+            }
+            let (at, button) = match which {
+                // The toolbar is drawn on the window's own layer, so its
+                // bounds need no transform.
+                Menu::Add => (
+                    in_the_patch_window(output, window, "the Add node button", &|n| {
+                        n.role() == accesskit::Role::Button && n.label() == Some(ADD_NODE)
+                    }),
+                    egui::PointerButton::Primary,
+                ),
+                Menu::Node => (
+                    node_zero_grip(output, window, editor.patch_state.canvas_to_screen()),
+                    egui::PointerButton::Secondary,
+                ),
+            };
+            let Some(at) = at else {
+                return;
+            };
+            let Some(points) = settle.settled(vec![at.center()]) else {
+                return;
+            };
+            info!("--menu {which:?}: clicking at {:?}", points[0]);
+            press_at(&mut input, points[0], button);
+            release_at(&mut input, points[0], button);
+            *menuer = Menuer::Clicked(points[0]);
+        }
+        // The menu opens on the frame after the click, so the pointer moves
+        // into it only once there is something to be inside.
+        Menuer::Clicked(at) => {
+            let park = at + MENU_PARK;
+            input.0.events.push(egui::Event::PointerMoved(park));
+            info!("--menu {which:?}: holding it open with the pointer at {park:?}");
+            *menuer = Menuer::Open(park);
+        }
+        Menuer::Open(park) => input.0.events.push(egui::Event::PointerMoved(park)),
     }
 }
 
@@ -801,6 +1254,7 @@ fn shoot(
     args: Res<Args>,
     editor: Res<Editor>,
     monitor: Res<AudioMonitor>,
+    gestures: Gestures,
     mut shot: ResMut<Shot>,
     mut exit: MessageWriter<AppExit>,
 ) {
@@ -811,6 +1265,17 @@ fn shoot(
         // Wait for the layout, not for a fixed number of frames from
         // startup: the count starts once both windows are actually up.
         if editor.frames_shown < SETTLE_FRAMES {
+            return;
+        }
+        // And wait for the gesture, not for a count at all: a gesture waits
+        // for a layout that has stopped moving, which may be later than
+        // this (crate #67).
+        if !args.gesture_in_place(&gestures) {
+            shot.waited += 1;
+            if shot.waited > GIVE_UP {
+                error!("--shot: the scripted gesture never got into place");
+                exit.write(AppExit::error());
+            }
             return;
         }
         match status_reached(args.status, &monitor) {

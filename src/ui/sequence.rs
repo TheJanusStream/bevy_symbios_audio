@@ -2160,6 +2160,7 @@ mod tests {
 
         // Add a node to the open instrument's patch, through its canvas.
         driver.click("Add node");
+        driver.click("Reverb");
         assert_ne!(driver.recipe, before, "the canvas edited the recipe");
 
         // The embedded canvas keeps no history of its own.
@@ -2199,6 +2200,7 @@ mod tests {
         assert_ne!(after_track, start);
 
         driver.click("Add node");
+        driver.click("Reverb");
         let after_node = driver.recipe.clone();
         assert_ne!(after_node, after_track);
 

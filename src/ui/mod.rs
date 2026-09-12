@@ -87,7 +87,7 @@ mod test_paint;
 
 pub use audition::{AUTO_QUIET_SECS, AuditionSource, AuditionState, audition_strip};
 pub use evolve::{mutate_node_kind, mutate_patch, randomize_seed};
-pub use graph::{PatchEditorState, audio_patch_canvas};
+pub use graph::{PatchEditorState, WireGeom, audio_patch_canvas};
 pub use io::{JsonIoState, json_io};
 pub use node::{
     adsr_envelope_editor, biquad_bandpass_editor, biquad_highpass_editor, biquad_lowpass_editor,

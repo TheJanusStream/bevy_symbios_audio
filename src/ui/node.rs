@@ -356,12 +356,12 @@ macro_rules! define_kind_picker {
     ) => {
         /// Node kinds in display order for the picker dropdown — upstream's
         /// roster order.
-        const KIND_LABELS: &[&str] = &[ $( $ul, )* $( $dl, )* ];
+        pub(crate) const KIND_LABELS: &[&str] = &[ $( $ul, )* $( $dl, )* ];
 
         /// Build a default node of the kind named by `label` (the inverse of
         /// [`node_kind_label`]).  Unknown labels fall back to
         /// [`NodeKind::Silence`].
-        fn default_kind_for(label: &str) -> NodeKind {
+        pub(crate) fn default_kind_for(label: &str) -> NodeKind {
             match label {
                 $( $ul => NodeKind::$uv, )*
                 $( $dl => NodeKind::$dv(<$dt>::default()), )*
@@ -409,6 +409,91 @@ macro_rules! define_kind_picker {
 }
 
 symbios_audio::for_each_node_kind!(define_kind_picker);
+
+/// What a node kind is *for*, as the canvas's Add menu gathers them
+/// (#61, Overlands #1334 B6).
+///
+/// A flat list of eighteen kinds asks the reader to know the vocabulary
+/// before they can look anything up in it. These are the headings that list
+/// is broken under.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) enum KindGroup {
+    Sources,
+    Envelopes,
+    Filters,
+    Modulators,
+    Mix,
+    Effects,
+    /// A kind this build has no role for. See [`kind_group`].
+    Other,
+}
+
+impl KindGroup {
+    /// The groups in menu order: what makes sound, what shapes it over
+    /// time, what colours it, what moves it, what combines it, what is done
+    /// to it afterwards — and whatever is left.
+    pub(crate) const ALL: [KindGroup; 7] = [
+        Self::Sources,
+        Self::Envelopes,
+        Self::Filters,
+        Self::Modulators,
+        Self::Mix,
+        Self::Effects,
+        Self::Other,
+    ];
+
+    /// The heading the menu writes over the group.
+    pub(crate) fn title(self) -> &'static str {
+        match self {
+            Self::Sources => "Sources",
+            Self::Envelopes => "Envelopes",
+            Self::Filters => "Filters",
+            Self::Modulators => "Modulators",
+            Self::Mix => "Mix",
+            Self::Effects => "Effects",
+            Self::Other => "Other",
+        }
+    }
+}
+
+/// The group `label` belongs under.
+///
+/// This is the *only* hand-written thing about the menu, and it is a hint,
+/// not a roster: the menu itself is built by walking [`KIND_LABELS`], which
+/// is generated from upstream's node vocabulary. A kind added to
+/// `symbios-audio` therefore appears in the menu on the version bump alone,
+/// under [`KindGroup::Other`] until this build is told what it is for — where
+/// a hand-written menu would simply not have it, and the tests that compared
+/// one hand list against another could not notice (#50).
+pub(crate) fn kind_group(label: &str) -> KindGroup {
+    match label {
+        "Sine" | "Square" | "Sawtooth" | "Triangle" | "White Noise" | "Pink Noise"
+        | "Brown Noise" | "Silence" => KindGroup::Sources,
+        "ADSR" => KindGroup::Envelopes,
+        "Lowpass" | "Highpass" | "Bandpass" => KindGroup::Filters,
+        "LFO" => KindGroup::Modulators,
+        "Mix" | "Gain" | "Gate" => KindGroup::Mix,
+        "Chorus" | "Reverb" => KindGroup::Effects,
+        _ => KindGroup::Other,
+    }
+}
+
+/// Every kind the picker offers, gathered under its group: the groups in
+/// [`KindGroup::ALL`] order, the kinds within one in the roster's order, and
+/// a group no kind falls in left out.
+pub(crate) fn kinds_by_group() -> Vec<(KindGroup, Vec<&'static str>)> {
+    KindGroup::ALL
+        .into_iter()
+        .filter_map(|group| {
+            let kinds: Vec<&'static str> = KIND_LABELS
+                .iter()
+                .copied()
+                .filter(|label| kind_group(label) == group)
+                .collect();
+            (!kinds.is_empty()).then_some((group, kinds))
+        })
+        .collect()
+}
 
 /// Human-readable label for a node kind — used by the kind picker and by
 /// canvas node-box headers.
@@ -590,5 +675,56 @@ mod tests {
         // And the label for it is still the one the fallback text uses, so a
         // node box that meets one is titled rather than blank.
         assert_eq!(node_kind_label(&NodeKind::Unknown), "Unknown");
+    }
+
+    // ---- step 7b (#61, Overlands #1334 B6): the Add menu's groups -------
+
+    /// Every kind the picker offers is offered by the Add menu too, in one
+    /// group and one only. The menu is built by walking `KIND_LABELS`, so a
+    /// kind added upstream arrives in it on the version bump — under
+    /// `Other` until this build learns what it is for.
+    #[test]
+    fn every_kind_label_lands_in_exactly_one_group() {
+        let grouped = kinds_by_group();
+        let mut seen: Vec<&str> = Vec::new();
+        for (_, labels) in &grouped {
+            seen.extend(labels.iter().copied());
+        }
+        for label in KIND_LABELS.iter().copied() {
+            assert_eq!(
+                seen.iter().filter(|l| **l == label).count(),
+                1,
+                "{label:?} is in {} groups, not one",
+                seen.iter().filter(|l| **l == label).count()
+            );
+        }
+        assert_eq!(
+            seen.len(),
+            KIND_LABELS.len(),
+            "the groups hold {} kinds and the roster {}",
+            seen.len(),
+            KIND_LABELS.len()
+        );
+    }
+
+    /// The #50 lesson, held: a label this build has no role for is still
+    /// offered, under `Other`. A hand-written menu would simply not have
+    /// it, and a test that compared two hand lists could not notice.
+    #[test]
+    fn a_kind_this_build_has_no_role_for_lands_in_other() {
+        assert_eq!(kind_group("Granular Cloud"), KindGroup::Other);
+        assert_eq!(kind_group(""), KindGroup::Other);
+    }
+
+    /// Every group the menu shows has a heading of its own, and no two
+    /// share one.
+    #[test]
+    fn each_group_has_its_own_heading() {
+        let titles: Vec<&str> = KindGroup::ALL.iter().map(|g| g.title()).collect();
+        let mut sorted = titles.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), titles.len(), "two groups share a heading");
+        assert!(titles.iter().all(|t| !t.is_empty()));
     }
 }
