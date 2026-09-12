@@ -223,7 +223,7 @@ pub(crate) fn set_style(ctx: &egui::Context) -> Option<EditorStyle> {
 }
 
 /// WCAG 2.1 relative luminance of an opaque sRGB colour.
-fn relative_luminance(c: Color32) -> f32 {
+pub(crate) fn relative_luminance(c: Color32) -> f32 {
     let linear = |v: u8| {
         let s = f32::from(v) / 255.0;
         if s <= 0.040_45 {

@@ -14,15 +14,39 @@
 //!   for a name that is non-empty after trimming, unique, and within
 //!   symbios-audio's [`Envelope`] byte limit; until then the field shows the
 //!   reason in the error colour, and Esc puts the name back.
-//! - **Timeline** — one lane per track; events are blocks whose x is
-//!   `time_beats`, width is `gate_beats`, with a translucent tail for
-//!   `release_beats`.  Drag a block to move it, drag its right edge to resize
-//!   the gate, double-click an empty lane to add an event.  An event whose
-//!   instrument id names no instrument bakes to silence; its block is drawn
-//!   hatched in the error colour and labelled `missing: <id>`.
-//! - **Inspector** — full numeric editing of the selected event, plus delete.
-//!   For an event with no instrument it says so and offers to reassign every
-//!   event of that id to an existing instrument.
+//! - **Timeline** — one lane per track, named in its gutter after the
+//!   instrument most of it plays. A note is a block whose x is `time_beats`
+//!   and width is `gate_beats`, with a translucent tail for `release_beats`,
+//!   painted in its *instrument's* colour — a hue per id at the saturation
+//!   and luminance of the style's `note_fill` — faded by its volume, and
+//!   labelled with as much of its instrument and pitch as the block has room
+//!   for (#62, Overlands #1335 C3). It opens zoomed so the whole sequence is
+//!   in view, with the loop markers labelled on the ruler ("loop start",
+//!   "blend", "end"), and there is a Fit to go back to that zoom (C4). An
+//!   event whose instrument id names no instrument bakes to silence; its
+//!   block is drawn hatched in the error colour and labelled `missing: <id>`.
+//! - **Editing notes** — click a block to pick it, shift-click or drag a box
+//!   over the lanes to pick several. A drag moves everything picked and a
+//!   drag on a block's right edge resizes that one's gate; Alt makes the
+//!   drag carry copies and leave the originals. Ctrl+D duplicates, the arrows
+//!   nudge by the grid (Shift for an eighth of it), Delete removes, and
+//!   Escape lets go. The grid itself is the toolbar's [`Snap`] picker, and
+//!   a new note comes from a double-click or a right-click on a lane and
+//!   takes *that lane's* instrument (C6).
+//! - **Inspector** — full numeric editing of the note the last pick landed
+//!   on, plus delete. For a note with no instrument it says so and offers to
+//!   reassign every note of that id to an existing instrument.
+//!
+//! Every label says what a field does rather than what the schema calls it,
+//! with the time at the recipe's BPM beside the beats (C5), and what is not
+//! wanted every minute — the genetics controls, the JSON box — is under the
+//! timeline's More menu rather than above everything it edits (C9).
+//!
+//! The timeline publishes the geometry it painted, [`NoteGeom`] and
+//! [`SequenceEditorState::timeline_rect`]: a host hanging an overlay on a
+//! note, a scripted harness pressing one, and the marquee itself all read
+//! the rects the paint used rather than working them out again from the zoom
+//! and the scroll offset (crate #67).
 //!
 //! Every colour the timeline paints — its ground, grid and ruler, the lanes,
 //! the loop markers, note blocks and their names, the error colour of a
@@ -50,28 +74,70 @@ use crate::sequence::{Event, Instrument, PitchMode, SequenceRecipe, Track};
 use super::evolve::fresh_rng;
 use super::history::EditHistory;
 use super::io::json_io;
-use super::style::{EditorStyle, editor_style};
+use super::style::{EditorStyle, editor_style, relative_luminance};
 use super::{
-    EditorResponse, JsonIoState, PatchEditorState, audio_patch_canvas, drag_debounced,
+    EditorResponse, JsonIoState, PatchEditorState, audio_patch_canvas, drag_value_debounced,
     slider_debounced,
 };
 
-const RULER_H: f32 = 22.0;
+/// The header above the lanes: the beat numbers on its first line, the loop
+/// markers' labels on its second. Two lines because a marker's label over
+/// the lanes sits on the notes it is about (#62, Overlands #1335 C4).
+const RULER_H: f32 = 34.0;
+/// Where in the ruler each of its two lines starts.
+const RULER_BEATS_Y: f32 = 1.0;
+const RULER_MARKS_Y: f32 = 17.0;
 const LANE_H: f32 = 34.0;
-/// Left margin inside the timeline reserved for the per-lane remove button.
-const GUTTER: f32 = 22.0;
-const DEFAULT_PPB: f32 = 48.0;
-/// Beat grid that drags snap to on release.
-const SNAP: f32 = 0.25;
+/// Left margin inside the timeline: the lane's remove cross and its name.
+/// Wide enough for an instrument name, which is what a lane is called.
+const GUTTER: f32 = 104.0;
+/// Points of timeline right of the last beat, so the end marker's label has
+/// somewhere to go.
+const TAIL_PAD: f32 = 16.0;
+/// The zoom range the slider offers and a fit is held to, in points a beat.
+const MIN_PPB: f32 = 4.0;
+const MAX_PPB: f32 = 160.0;
 /// Smallest gate a block can be resized to (beats).
 const MIN_GATE: f32 = 0.1;
+/// Beats in a bar, for the snap picker's coarsest division. The schema
+/// carries no time signature, so this is common time and nothing reads it
+/// but the picker.
+const BEATS_PER_BAR: f32 = 4.0;
+/// How opaque a note block is at volume 0. A silent note is faint, not
+/// invisible, and its name still has to read on it — see
+/// `tests::a_notes_name_reads_on_its_block_in_dark_and_light`.
+const QUIET_ALPHA: f32 = 0.55;
+/// Space either side of a marker's label, and inside a note block.
+const LABEL_PAD: f32 = 4.0;
 
 /// Whether an in-progress block drag is moving the event or resizing its gate.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum DragMode {
     #[default]
     Move,
+    /// Alt was held when the drag began: the notes being dragged are copies
+    /// the drag made, and the originals stay where they were.
+    Copy,
     Resize,
+}
+
+/// Where one note was drawn on the timeline's last frame, in screen points.
+///
+/// The timeline hands its geometry out rather than letting a reader work it
+/// out again from the zoom and the scroll offset: a host hanging an overlay
+/// on a note, a scripted harness pressing one, and the editor's own marquee
+/// all read the same rects the paint used (crate #67).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NoteGeom {
+    /// Which track it is on.
+    pub track: usize,
+    /// Its index within that track's events.
+    pub event: usize,
+    /// The block: `time_beats` to `time_beats + gate_beats`.
+    pub body: Rect,
+    /// The block and its release tail together — what a pointer over the
+    /// note can be said to be over.
+    pub extent: Rect,
 }
 
 /// Editor-side view state for the sequence editor — kept out of the
@@ -84,16 +150,55 @@ pub struct SequenceEditorState {
     /// instrument keeps its node positions when you switch away and back.
     /// A rename moves the entry to the new id.
     canvas_states: HashMap<String, PatchEditorState>,
-    /// Selected `(track, event)` for the inspector.
+    /// The `(track, event)` the inspector edits: the last note picked, and
+    /// always one of [`Self::selection`] while there is a selection at all.
     selected_event: Option<(usize, usize)>,
-    /// Timeline zoom, pixels per beat.
-    px_per_beat: f32,
+    /// Every picked note. A move, a duplicate and a nudge act on all of
+    /// them; the inspector edits [`Self::selected_event`].
+    selection: HashSet<(usize, usize)>,
+    /// A marquee being dragged out on a lane's background: where it started
+    /// and where the pointer is, in screen points.
+    marquee: Option<(Pos2, Pos2)>,
+    /// The track and beat the last right-click on a lane landed at.
+    ///
+    /// Remembered rather than read from the pointer while the menu is up:
+    /// the pointer has to move *into* the menu to choose anything, and by
+    /// then the lane is no longer under it. Asking the lane's response
+    /// where the pointer is left "Add a note here" greyed out the moment it
+    /// could be reached — which a picture caught and the test that drove
+    /// the menu by name did not.
+    menu_at: Option<(usize, f32)>,
+    /// Timeline zoom in points a beat, or `None` to fit the width it is
+    /// given — which is what it opens at, and what the Fit button goes back
+    /// to (#62, Overlands #1335 C4).
+    zoom: Option<f32>,
+    /// The grid drags, nudges and new notes land on.
+    snap: Snap,
     /// Move-vs-resize for the active block drag.
     drag_mode: DragMode,
-    /// Mutation rate for the "Mutate recipe" button.
+    /// The note whose *widget* the active drag belongs to.
+    ///
+    /// Not the same as [`Self::selected_event`] once an Alt-drag has
+    /// duplicated: egui ties a drag to the id of the widget the press
+    /// landed on, and the copies have ids of their own that nothing has
+    /// pressed. So the drag keeps reading the original's response and
+    /// carries the copies by its delta.
+    drag_anchor: Option<(usize, usize)>,
+    /// Mutation rate for the More menu's Mutate recipe.
     mutate_rate: f32,
+    /// Whether the JSON box is open, from the timeline's More menu.
+    show_json: bool,
     /// Buffer + last error for the JSON import/export section.
     json: JsonIoState,
+    /// The timeline's own rect as of the last frame drawn, in screen
+    /// points, and every note on it.
+    ///
+    /// Recorded rather than re-derived: the timeline is the only thing that
+    /// knows its zoom, its gutter and how far its `ScrollArea` is scrolled,
+    /// and a reader that works those out again is a second answer waiting
+    /// to disagree (crate #67).
+    timeline_rect: Rect,
+    notes: Vec<NoteGeom>,
     /// Names being typed into instrument rows, keyed by row. The recipe is
     /// renamed only when one is committed; see [`NameEdit`].
     name_edits: HashMap<usize, NameEdit>,
@@ -114,10 +219,18 @@ impl Default for SequenceEditorState {
             active_instrument: None,
             canvas_states: HashMap::new(),
             selected_event: None,
-            px_per_beat: DEFAULT_PPB,
+            selection: HashSet::new(),
+            marquee: None,
+            menu_at: None,
+            zoom: None,
+            snap: Snap::default(),
             drag_mode: DragMode::Move,
+            drag_anchor: None,
             mutate_rate: 0.3,
+            show_json: false,
             json: JsonIoState::default(),
+            timeline_rect: Rect::NOTHING,
+            notes: Vec::new(),
             name_edits: HashMap::new(),
             history: EditHistory::default(),
             owns_keys: false,
@@ -292,12 +405,22 @@ fn paint_missing_block(painter: &egui::Painter, body: Rect, selected: bool, erro
     );
 }
 
-/// A note's block: the style's note fill, outlined in `note_selected` when
-/// selected. The fill does not change with the selection, so the note's
-/// name reads the same either way, and the selection is a shape as well as
-/// a colour.
-fn paint_note_block(painter: &egui::Painter, body: Rect, selected: bool, style: &EditorStyle) {
-    painter.rect_filled(body, 3.0, style.note_fill);
+/// A note's block: its instrument's `tint`, faded by its volume, outlined
+/// in `note_selected` when selected.
+///
+/// The tint does not change with the selection, so a note's name reads the
+/// same either way and the selection is a shape as well as a colour. The
+/// volume is the block's opacity, floored at [`QUIET_ALPHA`] so a quiet
+/// note is faint rather than gone and its name still reads on it.
+fn paint_note_block(
+    painter: &egui::Painter,
+    body: Rect,
+    selected: bool,
+    tint: Color32,
+    volume: f32,
+    style: &EditorStyle,
+) {
+    painter.rect_filled(body, 3.0, tint.gamma_multiply(volume_alpha(volume)));
     let edge = if selected {
         Stroke::new(2.0, style.note_selected)
     } else {
@@ -330,13 +453,443 @@ impl SequenceEditorState {
     /// the selection with `None`. It does the same as clicking the event's
     /// block. A pair that names no event is cleared on the next draw.
     pub fn set_selected_event(&mut self, selected: Option<(usize, usize)>) {
-        self.selected_event = selected;
+        match selected {
+            Some(at) => self.select_only(at),
+            None => self.clear_selection(),
+        }
+    }
+
+    /// Every `(track, event)` picked, not only the one the inspector edits.
+    ///
+    /// A move, a duplicate and an arrow nudge act on all of these;
+    /// [`Self::selected_event`] is the last one picked, which is the one
+    /// the inspector shows.
+    pub fn selected_events(&self) -> impl Iterator<Item = (usize, usize)> + '_ {
+        self.selection.iter().copied()
+    }
+
+    /// The grid drags, nudges and new notes land on.
+    pub fn snap(&self) -> Snap {
+        self.snap
+    }
+
+    /// Put the timeline on `snap`'s grid, as its picker does.
+    pub fn set_snap(&mut self, snap: Snap) {
+        self.snap = snap;
+    }
+
+    /// The timeline's rect as of the last frame drawn, in screen points —
+    /// its ruler, its gutter and its lanes, as wide as the zoom made it.
+    ///
+    /// [`Rect::NOTHING`] before the editor has been drawn once. Re-measured
+    /// every frame, so a rect held across frames should be asked for again.
+    pub fn timeline_rect(&self) -> Rect {
+        self.timeline_rect
+    }
+
+    /// Every note the timeline drew on its last frame, in screen points.
+    /// See [`NoteGeom`].
+    pub fn notes(&self) -> &[NoteGeom] {
+        &self.notes
+    }
+
+    /// Pick `at` and nothing else, as a plain click on a note does.
+    fn select_only(&mut self, at: (usize, usize)) {
+        self.selection.clear();
+        self.selection.insert(at);
+        self.selected_event = Some(at);
+    }
+
+    /// Add `at` to the selection, or take it out if it was already in, as a
+    /// shift-click does.
+    fn select_also(&mut self, at: (usize, usize)) {
+        if self.selection.remove(&at) {
+            if self.selected_event == Some(at) {
+                self.selected_event = self.selection.iter().copied().next();
+            }
+        } else {
+            self.selection.insert(at);
+            self.selected_event = Some(at);
+        }
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection.clear();
+        self.selected_event = None;
+    }
+
+    /// Drop selected notes that `recipe` no longer has, and keep
+    /// [`Self::selected_event`] inside what is left.
+    ///
+    /// A removal moves the indices after it down, so a selection kept
+    /// across one would otherwise come to mean different notes.
+    fn forget_missing_notes(&mut self, recipe: &SequenceRecipe) {
+        self.selection.retain(|(track, event)| {
+            recipe
+                .tracks
+                .get(*track)
+                .is_some_and(|t| *event < t.events.len())
+        });
+        if self
+            .selected_event
+            .is_none_or(|at| !self.selection.contains(&at))
+        {
+            self.selected_event = self.selection.iter().copied().next();
+        }
     }
 }
 
-/// Snap a beat value to the [`SNAP`] grid, clamped to `>= 0`.
-fn snap_beat(beats: f32) -> f32 {
-    ((beats / SNAP).round() * SNAP).max(0.0)
+/// The grid a drag, a nudge and a new note land on.
+///
+/// One enum with one [`Snap::ALL`] is the whole roster: the picker walks it,
+/// the arrow keys take their step from it, and the tests cover it by walking
+/// the same array, so a division cannot be offered by the picker and unknown
+/// to the maths (the #50 lesson, applied to the one thing here that is not
+/// generated upstream).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Snap {
+    /// No grid: a note lands where it was dropped.
+    Off,
+    /// An eighth of a beat.
+    Eighth,
+    /// The quarter beat every drag snapped to before there was a choice.
+    #[default]
+    Quarter,
+    /// One whole beat.
+    Beat,
+    /// One bar: four beats. The schema carries no time signature, so
+    /// this is common time.
+    Bar,
+}
+
+impl Snap {
+    /// Every division, coarsest last: what the picker offers and what the
+    /// tests walk.
+    pub const ALL: [Self; 5] = [
+        Self::Off,
+        Self::Eighth,
+        Self::Quarter,
+        Self::Beat,
+        Self::Bar,
+    ];
+
+    /// The grid in beats, or `None` when snapping is off.
+    pub fn beats(self) -> Option<f32> {
+        match self {
+            Self::Off => None,
+            Self::Eighth => Some(0.125),
+            Self::Quarter => Some(0.25),
+            Self::Beat => Some(1.0),
+            Self::Bar => Some(BEATS_PER_BAR),
+        }
+    }
+
+    /// How the picker names it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Eighth => "1/8",
+            Self::Quarter => "1/4",
+            Self::Beat => "beat",
+            Self::Bar => "bar",
+        }
+    }
+
+    /// How far one arrow press moves a note: the grid, or a quarter beat
+    /// with the grid off, so an arrow always moves something.
+    pub fn step(self) -> f32 {
+        self.beats().unwrap_or(0.25)
+    }
+}
+
+/// Snap a beat value to `snap`'s grid, clamped to `>= 0`.
+///
+/// Only the low end is clamped: a note before beat 0 cannot be baked, but
+/// one past the end is fine — the timeline grows to hold it, and the
+/// duration is the owner's to raise.
+fn snap_beat(beats: f32, snap: Snap) -> f32 {
+    match snap.beats() {
+        Some(grid) => ((beats / grid).round() * grid).max(0.0),
+        None => beats.max(0.0),
+    }
+}
+
+/// The zoom that puts `total_beats` inside `width` points of panel, held to
+/// the range the slider offers.
+///
+/// The editor opened at 48 points a beat whatever it was given, so the
+/// seeded 34-beat recipe was 1 632 points of content in a 900-point slot
+/// and its loop end, its crossfade and the second half of every lane were
+/// off screen behind a scrollbar that only appears under the pointer (#62,
+/// Overlands #1335 C4).
+fn fit_px_per_beat(width: f32, total_beats: f32) -> f32 {
+    let lanes = width - GUTTER - TAIL_PAD;
+    (lanes / total_beats.max(1.0)).clamp(MIN_PPB, MAX_PPB)
+}
+
+/// How many hues the timeline hands out.
+///
+/// Twelve is thirty degrees apart, which is about as close as two colours of
+/// one luminance can be and still be told apart on a note block, and more
+/// instruments than a recipe usually has. Past twelve they start to share.
+const HUE_BUCKETS: usize = 12;
+
+/// FNV-1a over `id`'s bytes: the same number every frame, every run and
+/// whatever order the instruments are in.
+fn instrument_hash(id: &str) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in id.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+/// The hue `id` asks for, as a bucket index.
+fn wanted_bucket(id: &str) -> usize {
+    instrument_hash(id) as usize % HUE_BUCKETS
+}
+
+/// How far apart two buckets are, going round the wheel whichever way is
+/// shorter.
+fn bucket_distance(a: usize, b: usize) -> usize {
+    let d = a.abs_diff(b);
+    d.min(HUE_BUCKETS - d)
+}
+
+/// Every instrument's tint, keyed by id.
+///
+/// An id's own hash picks the hue it asks for, so an instrument keeps its
+/// colour as tracks are re-ordered and as other instruments come and go. A
+/// hash is not a spread, though, and that is not a detail: in the recipe
+/// the `host_window` example seeds, `gust` and `pluck` hash to within four
+/// degrees of each other, and their notes came out one colour — which is
+/// the finding this is here to fix. So an id whose hue is already taken is
+/// given the free one furthest from every hue in use, and which of two ids
+/// keeps a contested hue is settled by sorting them: never by the order the
+/// tracks, or the instruments, happen to be in.
+fn instrument_tints<'a>(
+    ids: impl IntoIterator<Item = &'a str>,
+    style: &EditorStyle,
+) -> HashMap<String, Color32> {
+    let mut sorted: Vec<&str> = ids.into_iter().collect();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let mut taken: Vec<usize> = Vec::with_capacity(sorted.len());
+    let mut out = HashMap::with_capacity(sorted.len());
+    for id in sorted {
+        let wanted = wanted_bucket(id);
+        let bucket = if taken.contains(&wanted) {
+            // The free hue with the most room around it. None free means
+            // more instruments than hues, and it takes the one it asked
+            // for and shares.
+            (0..HUE_BUCKETS)
+                .filter(|b| !taken.contains(b))
+                .max_by_key(|b| taken.iter().map(|t| bucket_distance(*b, *t)).min())
+                .unwrap_or(wanted)
+        } else {
+            wanted
+        };
+        taken.push(bucket);
+        out.insert(id.to_owned(), tint_of_bucket(bucket, style));
+    }
+    out
+}
+
+/// The colour of hue bucket `bucket` under `style`.
+fn tint_of_bucket(bucket: usize, style: &EditorStyle) -> Color32 {
+    let base = egui::ecolor::Hsva::from(style.note_fill);
+    tint_at_luminance(
+        bucket as f32 / HUE_BUCKETS as f32,
+        base.s,
+        relative_luminance(style.note_fill),
+    )
+}
+
+/// The colour of hue `hue` and saturation `sat` whose relative luminance is
+/// `target`.
+///
+/// Bisected along a path that runs black -> the hue at full value -> white,
+/// on which luminance only rises, so there is exactly one point to find.
+///
+/// Holding the luminance is the point. Contrast is a function of luminance
+/// alone, so every tint built this way has the same contrast against the
+/// note's text as the style's own `note_fill` does — one style test covers
+/// every instrument's colour rather than each hue needing its own.
+fn tint_at_luminance(hue: f32, sat: f32, target: f32) -> Color32 {
+    let at = |t: f32| {
+        let hsva = if t <= 0.5 {
+            egui::ecolor::Hsva::new(hue, sat, 2.0 * t, 1.0)
+        } else {
+            egui::ecolor::Hsva::new(hue, sat * (2.0 - 2.0 * t), 1.0, 1.0)
+        };
+        Color32::from(hsva)
+    };
+    let (mut lo, mut hi) = (0.0_f32, 1.0_f32);
+    for _ in 0..20 {
+        let mid = 0.5 * (lo + hi);
+        if relative_luminance(at(mid)) < target {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    at(0.5 * (lo + hi))
+}
+
+/// The colour the notes of instrument `id` are painted when nothing else
+/// wants its hue.
+///
+/// Every note was the style's one `note_fill`, so five instruments on five
+/// lanes were one blue and a note moved to the wrong lane looked at home
+/// (#62, Overlands #1335 C3). Each id now gets a hue, at the saturation and
+/// luminance of the style's `note_fill`: the colour follows the host's
+/// theme, and what reads on one instrument's notes reads on every
+/// instrument's. Which hue each id in a recipe actually gets is
+/// [`instrument_tints`], which pushes crowded ones apart; this is what an
+/// id asks for, and what a note naming no instrument at all would get.
+fn instrument_tint(id: &str, style: &EditorStyle) -> Color32 {
+    tint_of_bucket(wanted_bucket(id), style)
+}
+
+/// How opaque a note of `volume` is drawn: loud notes solid, quiet ones
+/// faint, never below [`QUIET_ALPHA`].
+fn volume_alpha(volume: f32) -> f32 {
+    QUIET_ALPHA + (1.0 - QUIET_ALPHA) * volume.clamp(0.0, 1.0)
+}
+
+/// The instrument most of `track`'s notes name, and how many name it.
+///
+/// Ties break on the instrument whose first note starts earliest and then on
+/// the lower id, so a lane's name depends on what is on it and not on the
+/// order the events happen to be stored in.
+fn dominant_instrument(track: &Track) -> Option<(&str, usize)> {
+    let mut tally: std::collections::BTreeMap<&str, (usize, f32)> =
+        std::collections::BTreeMap::new();
+    for event in &track.events {
+        let entry = tally
+            .entry(event.instrument_id.as_str())
+            .or_insert((0, f32::INFINITY));
+        entry.0 += 1;
+        entry.1 = entry.1.min(event.time_beats);
+    }
+    tally
+        .into_iter()
+        .reduce(|best, next| {
+            let (_, (best_n, best_t)) = best;
+            let (_, (next_n, next_t)) = next;
+            let better = next_n > best_n || (next_n == best_n && next_t < best_t);
+            if better { next } else { best }
+        })
+        .map(|(id, (count, _))| (id, count))
+}
+
+/// A note's pitch as it is written on its block, or `None` at the patch's
+/// native pitch, which is the default and would say nothing on every note.
+fn pitch_label(pitch: f32) -> Option<String> {
+    if (pitch - 1.0).abs() < 5e-3 {
+        return None;
+    }
+    let mut digits = format!("{pitch:.2}");
+    while digits.ends_with('0') {
+        digits.pop();
+    }
+    if digits.ends_with('.') {
+        digits.pop();
+    }
+    Some(format!("\u{00D7}{digits}"))
+}
+
+/// What a note's block can say, widest first: its instrument and its pitch,
+/// then the pitch alone, then nothing.
+///
+/// The block draws the first of these that fits inside it. A label was
+/// drawn at the block's left edge whatever the block's width, so a
+/// quarter-beat note at the fitted zoom wrote its instrument's name across
+/// the four notes after it.
+fn note_labels(event: &Event, missing: bool) -> Vec<String> {
+    if missing {
+        return vec![missing_label(&event.instrument_id)];
+    }
+    let name = event.instrument_id.as_str();
+    match pitch_label(event.pitch_multiplier) {
+        Some(pitch) => vec![format!("{name} {pitch}"), pitch],
+        None => vec![name.to_owned()],
+    }
+}
+
+/// Everything a note is, as one line, for its hover: what the block would
+/// say if it were wide enough, and what it never has room for.
+fn note_tooltip(event: &Event, bpm: f32) -> String {
+    let pitch = pitch_label(event.pitch_multiplier).unwrap_or_else(|| "native pitch".to_owned());
+    format!(
+        "{} \u{00B7} {pitch} \u{00B7} from beat {} for {} ({}), tail {}, volume {:.0}%",
+        if event.instrument_id.is_empty() {
+            "(no instrument)"
+        } else {
+            event.instrument_id.as_str()
+        },
+        trim_beats(event.time_beats),
+        trim_beats(event.gate_beats),
+        beats_as_time(event.gate_beats, bpm),
+        trim_beats(event.release_beats),
+        100.0 * event.volume.clamp(0.0, 1.0),
+    )
+}
+
+/// A beat count without the trailing zeros a `{:.2}` leaves on it.
+fn trim_beats(beats: f32) -> String {
+    let mut digits = format!("{beats:.2}");
+    while digits.ends_with('0') {
+        digits.pop();
+    }
+    if digits.ends_with('.') {
+        digits.pop();
+    }
+    if digits.is_empty() {
+        "0".to_owned()
+    } else {
+        digits
+    }
+}
+
+/// `beats` at `bpm`, in seconds or minutes and seconds.
+///
+/// Beats are what the schema stores and what the timeline rules, but nobody
+/// hears beats: "34 beats" at 60 BPM is half a minute of audio and at 300
+/// BPM is under seven seconds, and the field that set it said only
+/// "duration (beats)" (#62, Overlands #1335 C5).
+fn beats_as_time(beats: f32, bpm: f32) -> String {
+    let secs = if bpm > 0.0 { beats * 60.0 / bpm } else { 0.0 };
+    if secs >= 60.0 {
+        let whole = secs.floor() as u32;
+        format!("{}:{:02}", whole / 60, whole % 60)
+    } else if secs >= 10.0 {
+        format!("{secs:.0} s")
+    } else {
+        format!("{secs:.1} s")
+    }
+}
+
+/// Where a marker's label goes: at `x` inside `bounds`, to the right of the
+/// marker when there is room and to its left when there is not, and never
+/// outside `bounds`.
+///
+/// A marker can sit at the very last beat — the end marker always does — so
+/// a label simply placed to its right is a label off the end of the
+/// timeline, which the acceptance of #1335 asks about by name.
+fn marker_label_rect(x: f32, size: Vec2, top: f32, bounds: Rect) -> Rect {
+    let room_right = bounds.right() - LABEL_PAD - (x + LABEL_PAD);
+    let left = if room_right >= size.x {
+        x + LABEL_PAD
+    } else {
+        x - LABEL_PAD - size.x
+    };
+    let left = left.clamp(
+        bounds.left() + LABEL_PAD,
+        (bounds.right() - LABEL_PAD - size.x).max(bounds.left() + LABEL_PAD),
+    );
+    Rect::from_min_size(Pos2::new(left, top), size)
 }
 
 /// A fresh `instN` id not already used by an instrument in `recipe`.
@@ -418,20 +971,6 @@ pub fn sequence_recipe_editor(
         .default_open(true)
         .show(ui, |ui| res.merge(transport(ui, recipe)));
 
-    ui.horizontal(|ui| {
-        if ui
-            .button("Mutate recipe")
-            .on_hover_text("Nudge BPM and event volumes via symbios-genetics")
-            .clicked()
-        {
-            recipe.mutate(&mut fresh_rng(), state.mutate_rate);
-            res.changed = true;
-            res.rebake = true;
-        }
-        ui.add(egui::Slider::new(&mut state.mutate_rate, 0.0..=1.0).text("rate"));
-    });
-    res.merge(json_io(ui, recipe, &mut state.json, id.with("recipe_json")));
-
     ui.separator();
     res.merge(instruments_panel(ui, recipe, state, id, &style));
 
@@ -477,22 +1016,60 @@ fn recipe_keys(
     }
     // Most specific first: `consume_key` ignores extra Shift, so Ctrl+Z
     // would swallow Ctrl+Shift+Z the other way round.
-    let (redo, undo, escape) = ui.input_mut(|i| {
+    let (redo, undo, escape, duplicate, nudge, fine) = ui.input_mut(|i| {
         (
             i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z)
                 | i.consume_key(Modifiers::COMMAND, Key::Y),
             i.consume_key(Modifiers::COMMAND, Key::Z),
             i.consume_key(Modifiers::NONE, Key::Escape),
+            i.consume_key(Modifiers::COMMAND, Key::D),
+            [(Key::ArrowLeft, -1.0), (Key::ArrowRight, 1.0)]
+                .into_iter()
+                .filter(|(key, _)| {
+                    i.consume_key(Modifiers::SHIFT, *key) || i.consume_key(Modifiers::NONE, *key)
+                })
+                .map(|(_, dir)| dir)
+                .sum::<f32>(),
+            i.modifiers.shift,
         )
     });
     if redo {
         res.rebake = state.history.redo(recipe);
-    } else if undo {
-        res.rebake = state.history.undo(recipe);
+        res.changed = res.rebake;
+        return res;
     }
-    res.changed = res.rebake;
-    if escape && state.selected_event.take().is_some() {
+    if undo {
+        res.rebake = state.history.undo(recipe);
+        res.changed = res.rebake;
+        return res;
+    }
+    // One step per press, most recent gesture first: a marquee being
+    // dragged out, then the notes it or a click picked (#61's ladder, now
+    // two rungs deep on the timeline too).
+    if escape && (state.marquee.take().is_some() || !state.selection.is_empty()) {
+        state.clear_selection();
         state.took_escape = true;
+    }
+    if duplicate && duplicate_selection(recipe, state) {
+        res.changed = true;
+        res.rebake = true;
+    }
+    if nudge != 0.0 && !state.selection.is_empty() {
+        // Shift is the fine step, an eighth of the grid, for a note that
+        // has to sit just off it.
+        let step = if fine {
+            0.125 * state.snap.step()
+        } else {
+            state.snap.step()
+        };
+        let picked: Vec<(usize, usize)> = state.selection.iter().copied().collect();
+        for (ti, ei) in picked {
+            if let Some(event) = recipe.tracks.get_mut(ti).and_then(|t| t.events.get_mut(ei)) {
+                event.time_beats = (event.time_beats + nudge * step).max(0.0);
+            }
+        }
+        res.changed = true;
+        res.rebake = true;
     }
     res
 }
@@ -582,41 +1159,78 @@ fn transport(ui: &mut egui::Ui, recipe: &mut SequenceRecipe) -> EditorResponse {
             });
     });
 
-    res.merge(drag_debounced(
+    let bpm = recipe.bpm;
+    res.merge(beat_field(
         ui,
-        "duration (beats)",
+        "Length",
+        "How long the whole sequence is. Notes past it are still baked; \
+         the loop and the crossfade are measured from it",
         &mut recipe.duration_beats,
         0.25,
         0.25..=512.0,
+        bpm,
     ));
 
     let dur = recipe.duration_beats.max(0.0);
     let mut looping = recipe.loop_start_beats.is_some();
-    if ui.checkbox(&mut looping, "seamless loop").changed() {
+    let loop_toggle = ui.checkbox(&mut looping, "Loop").on_hover_text(
+        "Bake the sequence to loop without a seam: it plays to the end and \
+         returns to the loop point",
+    );
+    if loop_toggle.changed() {
         recipe.loop_start_beats = looping.then_some(0.0);
         res.changed = true;
         res.rebake = true;
     }
     if let Some(loop_start) = recipe.loop_start_beats.as_mut() {
-        res.merge(drag_debounced(
+        res.merge(beat_field(
             ui,
-            "loop start (beats)",
+            "Loop from",
+            "Where the loop returns to. Everything before it is a run-up, \
+             played once",
             loop_start,
             0.25,
             0.0..=dur,
+            bpm,
         ));
     }
     if recipe.loop_start_beats.is_some() {
-        res.merge(drag_debounced(
+        res.merge(beat_field(
             ui,
-            "crossfade (beats)",
+            "Blend into loop",
+            "How much of the end is faded into the loop point, so the seam \
+             cannot be heard",
             &mut recipe.loop_crossfade_beats,
             0.25,
             0.0..=dur.max(0.25),
+            bpm,
         ));
     }
 
     res
+}
+
+/// A beats field that says what it is for and how long it is.
+///
+/// The label is words rather than the schema's name for the field, the
+/// hover says what the value does, and the time at the recipe's BPM is
+/// written beside the beats — nobody hears beats (#62, Overlands #1335 C5).
+fn beat_field(
+    ui: &mut egui::Ui,
+    label: &str,
+    hover: &str,
+    value: &mut f32,
+    speed: f32,
+    range: std::ops::RangeInclusive<f32>,
+    bpm: f32,
+) -> EditorResponse {
+    ui.horizontal(|ui| {
+        ui.label(label).on_hover_text(hover);
+        let res = drag_value_debounced(ui, value, speed, range, " beats");
+        ui.label(egui::RichText::new(beats_as_time(*value, bpm)).weak());
+        res
+    })
+    .inner
 }
 
 // ---------------------------------------------------------------------------
@@ -856,6 +1470,20 @@ fn name_field(
 // Timeline
 // ---------------------------------------------------------------------------
 
+/// A deferred edit to the recipe's tracks, applied after the lane loop has
+/// let go of its borrow — the shape the canvas uses for the same reason.
+enum Action {
+    /// A note of the lane's dominant instrument at this beat.
+    AddNote {
+        track: usize,
+        beat: f32,
+    },
+    RemoveTrack(usize),
+    /// Copy every selected note in place, and drag the copies instead of
+    /// the originals (an Alt-drag).
+    DuplicateSelection,
+}
+
 fn timeline(
     ui: &mut egui::Ui,
     recipe: &mut SequenceRecipe,
@@ -864,114 +1492,105 @@ fn timeline(
     style: &EditorStyle,
 ) -> EditorResponse {
     let mut res = EditorResponse::NONE;
+    state.forget_missing_notes(recipe);
 
-    ui.horizontal(|ui| {
-        if ui.button("Add track").clicked() {
-            recipe.tracks.push(Track::default());
-            res.changed = true;
-            res.rebake = true;
-        }
-        res.merge(slider_debounced(
-            ui,
-            egui::Slider::new(&mut state.px_per_beat, 12.0..=160.0).text("px/beat"),
-        ));
-        ui.label(format!("{} track(s)", recipe.tracks.len()));
-    });
-
-    let ppb = state.px_per_beat.max(4.0);
+    let bpm = recipe.bpm;
     let dur = recipe.duration_beats.max(1.0);
     let loop_start = recipe.loop_start_beats;
     let crossfade = recipe.loop_crossfade_beats;
-    let default_inst = recipe
-        .instruments
-        .first()
-        .map(|i| i.id.clone())
-        .unwrap_or_default();
     // Notes whose id is not in here name no instrument and bake to nothing.
     let known: HashSet<String> = recipe.instruments.iter().map(|i| i.id.clone()).collect();
+    let tints = instrument_tints(recipe.instruments.iter().map(|i| i.id.as_str()), style);
     let error = style.error;
 
     let mut total = dur;
-    for t in &recipe.tracks {
-        for e in &t.events {
-            total = total.max(e.time_beats + e.gate_beats + e.release_beats);
+    for track in &recipe.tracks {
+        for event in &track.events {
+            total = total.max(event.time_beats + event.gate_beats + event.release_beats);
         }
     }
     total = (total + 4.0).ceil();
     let lanes = recipe.tracks.len();
 
-    let mut add_event: Option<(usize, f32)> = None;
-    let mut remove_track: Option<usize> = None;
+    // The zoom the timeline is drawn at: the user's, or the one that fits
+    // what it has to show inside the room it has. `available_width` is the
+    // width of the row the `ScrollArea` will be given, which is the
+    // question a fit is the answer to.
+    let room = ui.available_width();
+    let fitted = fit_px_per_beat(room, total);
+    let ppb = state.zoom.unwrap_or(fitted).clamp(MIN_PPB, MAX_PPB);
 
+    let mut actions: Vec<Action> = Vec::new();
+    // Set inside the lane loop, applied the moment it lets go of the tracks
+    // and before the drag delta is read: an Alt-drag duplicates and then
+    // carries the copies, so a duplicate deferred to the end of the frame
+    // would let the first frame's movement land on the originals.
+    let mut copy_now = false;
+
+    res.merge(timeline_toolbar(
+        ui,
+        recipe,
+        state,
+        id,
+        ppb,
+        fitted,
+        total,
+        &mut actions,
+    ));
+    if state.show_json {
+        res.merge(json_io(ui, recipe, &mut state.json, id.with("recipe_json")));
+    }
+
+    // The lane names, taken before the loop borrows the tracks mutably: a
+    // note says its instrument's name, and the lane says the name of the
+    // instrument most of it plays (#62, Overlands #1335 C3).
+    let lane_names: Vec<Option<(String, usize)>> = recipe
+        .tracks
+        .iter()
+        .map(|track| dominant_instrument(track).map(|(id, n)| (id.to_owned(), n)))
+        .collect();
+
+    // Always visible: a scrollbar that appears under the pointer cannot say
+    // that there is more timeline than the panel is showing, which is
+    // exactly what it is for (#62, Overlands #1335 C4).
     egui::ScrollArea::horizontal()
         .id_salt(id.with("timeline_scroll"))
+        .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::AlwaysVisible)
         .show(ui, |ui| {
-            let width = GUTTER + total * ppb + 16.0;
+            let width = GUTTER + total * ppb + TAIL_PAD;
             let height = RULER_H + (lanes.max(1) as f32) * LANE_H;
             let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+            state.timeline_rect = rect;
+            state.notes.clear();
             let painter = ui.painter_at(rect);
             let bx = |beat: f32| rect.left() + GUTTER + beat * ppb;
+            let beat_at = |x: f32| (x - bx(0.0)) / ppb;
 
             painter.rect_filled(rect, 0.0, style.timeline_ground);
 
-            // Beat ruler + grid lines.
-            let step = if ppb < 20.0 {
-                4
-            } else if ppb < 40.0 {
-                2
-            } else {
-                1
-            };
-            let mut beat = 0i32;
-            while (beat as f32) <= total {
-                let x = bx(beat as f32);
-                painter.line_segment(
-                    [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
-                    Stroke::new(1.0, style.timeline_grid),
-                );
-                if beat % step == 0 {
-                    painter.text(
-                        Pos2::new(x + 2.0, rect.top() + 1.0),
-                        Align2::LEFT_TOP,
-                        beat.to_string(),
-                        egui::FontId::proportional(10.0),
-                        style.ground_text,
-                    );
-                }
-                beat += 1;
-            }
-
-            // Loop markers + crossfade shade.
-            let lanes_top = rect.top() + RULER_H;
-            if let Some(ls) = loop_start {
-                let x = bx(ls);
-                painter.line_segment(
-                    [Pos2::new(x, lanes_top), Pos2::new(x, rect.bottom())],
-                    Stroke::new(2.0, style.loop_start),
-                );
-            }
-            let x_end = bx(dur);
-            painter.line_segment(
-                [Pos2::new(x_end, lanes_top), Pos2::new(x_end, rect.bottom())],
-                Stroke::new(2.0, style.loop_end),
+            paint_ruler(&painter, rect, total, ppb, bx(0.0), style);
+            // The band goes under the lanes it shades; its markers' lines
+            // go over them, after the notes.
+            paint_crossfade_band(
+                &painter,
+                rect,
+                dur,
+                loop_start,
+                crossfade,
+                ppb,
+                bx(0.0),
+                style,
             );
-            if crossfade > 0.0 {
-                let x0 = bx((dur - crossfade).max(0.0));
-                painter.rect_filled(
-                    Rect::from_min_max(Pos2::new(x0, lanes_top), Pos2::new(x_end, rect.bottom())),
-                    0.0,
-                    style.crossfade_band,
-                );
-            }
 
-            // Lanes + events.
+            let lanes_top = rect.top() + RULER_H;
             for (ti, track) in recipe.tracks.iter_mut().enumerate() {
                 let lane_top = lanes_top + ti as f32 * LANE_H;
+                let lane = Rect::from_min_max(
+                    Pos2::new(rect.left(), lane_top),
+                    Pos2::new(rect.right(), lane_top + LANE_H),
+                );
                 painter.rect_filled(
-                    Rect::from_min_max(
-                        Pos2::new(rect.left(), lane_top),
-                        Pos2::new(rect.right(), lane_top + LANE_H),
-                    ),
+                    lane,
                     0.0,
                     if ti % 2 == 0 {
                         style.lane
@@ -980,147 +1599,833 @@ fn timeline(
                     },
                 );
 
-                // Per-lane remove button.
-                let x_rect = Rect::from_min_size(
-                    Pos2::new(rect.left() + 3.0, lane_top + (LANE_H - 14.0) * 0.5),
-                    Vec2::splat(14.0),
-                );
-                let x_resp = ui.interact(x_rect, id.with(("rm_track", ti)), Sense::click());
-                painter.text(
-                    x_rect.center(),
-                    Align2::CENTER_CENTER,
-                    "\u{2716}",
-                    egui::FontId::proportional(13.0),
-                    if x_resp.hovered() {
-                        error
-                    } else {
-                        style.ground_text
-                    },
-                );
-                if x_resp.clicked() {
-                    remove_track = Some(ti);
-                }
+                let name = lane_names[ti].as_ref();
+                res.merge(lane_gutter(
+                    ui,
+                    &painter,
+                    lane,
+                    ti,
+                    name,
+                    id,
+                    style,
+                    &mut actions,
+                ));
 
-                // Empty-lane double-click adds an event at that beat.
+                // The lane's background: a plain drag pulls a marquee out
+                // of it, a double-click adds a note, and a right-click
+                // opens the lane's menu at the beat it was pressed at.
+                //
+                // Nothing that acts on a press is drawn where the press
+                // lands: an affordance at the pointer takes the click meant
+                // for what is under it, which is how 7b's remove cross ate
+                // the click that was picking its wire (crate #67).
                 let bg = Rect::from_min_max(
                     Pos2::new(rect.left() + GUTTER, lane_top),
                     Pos2::new(rect.right(), lane_top + LANE_H),
                 );
-                let bg_resp = ui.interact(bg, id.with(("lane_bg", ti)), Sense::click());
+                let bg_resp = ui.interact(bg, id.with(("lane_bg", ti)), Sense::click_and_drag());
+                // `interact_pointer_pos`, not `press_origin`: a click is
+                // reported on the release, and egui clears the press
+                // origin on exactly that event.
+                if bg_resp.secondary_clicked()
+                    && let Some(p) = bg_resp.interact_pointer_pos()
+                {
+                    state.menu_at = Some((ti, beat_at(p.x)));
+                }
+                let menu_beat = state
+                    .menu_at
+                    .filter(|(track, _)| *track == ti)
+                    .map(|(_, beat)| beat);
+                res.merge(lane_menu(&bg_resp, ti, name, menu_beat, &mut actions));
                 if bg_resp.double_clicked()
                     && let Some(p) = bg_resp.interact_pointer_pos()
                 {
-                    add_event = Some((ti, snap_beat((p.x - bx(0.0)) / ppb)));
+                    actions.push(Action::AddNote {
+                        track: ti,
+                        beat: snap_beat(beat_at(p.x), state.snap),
+                    });
+                }
+                // The marquee's two corners.
+                //
+                // `Response::interact_pointer_pos` is where the pointer is
+                // *now*, not where the press landed, so a box anchored on
+                // it is a box with no anchor: both corners follow the
+                // pointer and it never covers anything. The anchor is
+                // `press_origin`, which is a position on the context —
+                // fine here because the timeline is a `ScrollArea`, whose
+                // interact rects are already screen points, where on the
+                // patch canvas's `Scene` the two are in different
+                // coordinates and mixing them double-transforms (crate
+                // #67, and 7b's first coordinate fact).
+                if bg_resp.drag_started()
+                    && let Some(origin) = ui.ctx().input(|i| i.pointer.press_origin())
+                {
+                    state.marquee = Some((origin, origin));
+                }
+                if bg_resp.dragged()
+                    && let Some((from, _)) = state.marquee
+                    && let Some(p) = bg_resp.interact_pointer_pos()
+                {
+                    state.marquee = Some((from, p));
+                }
+                if bg_resp.drag_stopped() {
+                    state.marquee = None;
                 }
 
-                for (ei, ev) in track.events.iter_mut().enumerate() {
-                    let ex = bx(ev.time_beats);
-                    let gate_w = (ev.gate_beats * ppb).max(6.0);
-                    let etop = lane_top + 4.0;
-                    let eh = LANE_H - 8.0;
-                    let body = Rect::from_min_size(Pos2::new(ex, etop), Vec2::new(gate_w, eh));
-                    let selected = state.selected_event == Some((ti, ei));
-                    let missing = !known.contains(&ev.instrument_id);
+                for (ei, event) in track.events.iter_mut().enumerate() {
+                    let geom = note_geometry(event, lane_top, ppb, bx(0.0));
+                    state.notes.push(NoteGeom {
+                        track: ti,
+                        event: ei,
+                        body: geom.0,
+                        extent: geom.1,
+                    });
+                    let (body, extent) = geom;
+                    let selected = state.selection.contains(&(ti, ei));
+                    let missing = !known.contains(&event.instrument_id);
+                    let tint = tints
+                        .get(&event.instrument_id)
+                        .copied()
+                        .unwrap_or_else(|| instrument_tint(&event.instrument_id, style));
 
-                    let tail_w = ev.release_beats * ppb;
-                    if tail_w > 0.5 {
+                    if extent.right() > body.right() {
                         painter.rect_filled(
-                            Rect::from_min_size(
-                                Pos2::new(body.right(), etop),
-                                Vec2::new(tail_w, eh),
-                            ),
+                            Rect::from_min_max(Pos2::new(body.right(), body.top()), extent.max),
                             2.0,
                             if missing {
                                 error.gamma_multiply(0.15)
                             } else {
-                                style.release_tail
+                                tint.gamma_multiply(0.35 * volume_alpha(event.volume))
                             },
                         );
                     }
                     if missing {
                         paint_missing_block(&painter, body, selected, error);
                     } else {
-                        paint_note_block(&painter, body, selected, style);
+                        paint_note_block(&painter, body, selected, tint, event.volume, style);
                     }
-                    painter.text(
-                        Pos2::new(body.left() + 4.0, body.center().y),
-                        Align2::LEFT_CENTER,
-                        if missing {
-                            missing_label(&ev.instrument_id)
-                        } else {
-                            ev.instrument_id.clone()
-                        },
-                        egui::FontId::proportional(11.0),
-                        if missing { error } else { style.note_text },
-                    );
+                    paint_note_label(&painter, body, event, missing, error, style);
 
                     let resp = ui.interact(body, id.with(("ev", ti, ei)), Sense::click_and_drag());
                     let resp = if missing {
                         resp.on_hover_text(format!(
                             "{}, so this note is silent. Select it to reassign it.",
-                            no_instrument_text(&ev.instrument_id)
+                            no_instrument_text(&event.instrument_id)
                         ))
                     } else {
-                        resp
+                        resp.on_hover_text(note_tooltip(event, bpm))
                     };
                     if resp.clicked() {
-                        state.selected_event = Some((ti, ei));
+                        if resp.ctx.input(|i| i.modifiers.shift) {
+                            state.select_also((ti, ei));
+                        } else {
+                            state.select_only((ti, ei));
+                        }
                     }
                     if resp.drag_started() {
+                        // Where the press landed, not where the pointer has
+                        // got to: `interact_pointer_pos` is the *current*
+                        // position, and a drag only starts once it has
+                        // moved, so on the frame this runs the pointer is
+                        // already several points along. On a 24-point block
+                        // that was enough to read every move as a resize of
+                        // the right edge.
                         let near_right = resp
-                            .interact_pointer_pos()
+                            .ctx
+                            .input(|i| i.pointer.press_origin())
                             .is_some_and(|p| p.x >= body.right() - 8.0);
-                        state.drag_mode = if near_right {
-                            DragMode::Resize
-                        } else {
-                            DragMode::Move
+                        let alt = resp.ctx.input(|i| i.modifiers.alt);
+                        state.drag_mode = match (near_right, alt) {
+                            (true, _) => DragMode::Resize,
+                            (false, true) => DragMode::Copy,
+                            (false, false) => DragMode::Move,
                         };
-                        state.selected_event = Some((ti, ei));
-                    }
-                    if resp.dragged() {
-                        let dx = resp.drag_delta().x / ppb;
-                        match state.drag_mode {
-                            DragMode::Move => ev.time_beats = (ev.time_beats + dx).max(0.0),
-                            DragMode::Resize => ev.gate_beats = (ev.gate_beats + dx).max(MIN_GATE),
+                        if !state.selection.contains(&(ti, ei)) {
+                            state.select_only((ti, ei));
+                        } else {
+                            state.selected_event = Some((ti, ei));
                         }
-                        res.changed = true;
-                    }
-                    if resp.drag_stopped() {
-                        match state.drag_mode {
-                            DragMode::Move => ev.time_beats = snap_beat(ev.time_beats),
-                            DragMode::Resize => {
-                                ev.gate_beats = snap_beat(ev.gate_beats).max(MIN_GATE)
-                            }
-                        }
-                        res.rebake = true;
+                        state.drag_anchor = Some((ti, ei));
+                        copy_now |= state.drag_mode == DragMode::Copy;
                     }
                 }
             }
+
+            if copy_now && duplicate_selection(recipe, state) {
+                res.changed = true;
+                res.rebake = true;
+            }
+            // Every selected note moves with the one under the pointer, so
+            // the drag is read once, outside the lane loop, and applied to
+            // all of them.
+            res.merge(drag_selection(ui, recipe, state, id, ppb));
+            // The marquee picks from the rects the paint just recorded, not
+            // from a second reckoning of where the notes are.
+            if let Some((from, to)) = state.marquee {
+                let band = Rect::from_two_pos(from, to);
+                let caught: HashSet<(usize, usize)> = state
+                    .notes
+                    .iter()
+                    .filter(|note| band.intersects(note.extent))
+                    .map(|note| (note.track, note.event))
+                    .collect();
+                if caught != state.selection {
+                    state.selection = caught;
+                    if state
+                        .selected_event
+                        .is_none_or(|at| !state.selection.contains(&at))
+                    {
+                        state.selected_event = state.selection.iter().copied().next();
+                    }
+                }
+            }
+            // Over the notes, not under them: a note as long as the
+            // sequence — the seeded recipe has two — covered the loop and
+            // end lines completely, so the markers C4 is about were
+            // invisible at exactly the zoom that had just brought them on
+            // screen.
+            paint_markers(
+                &painter,
+                rect,
+                dur,
+                loop_start,
+                crossfade,
+                ppb,
+                bx(0.0),
+                style,
+            );
+            paint_marquee(&painter, state.marquee, style);
         });
 
-    if let Some(ti) = remove_track {
-        if ti < recipe.tracks.len() {
-            recipe.tracks.remove(ti);
-        }
-        state.selected_event = None;
-        res.changed = true;
-        res.rebake = true;
-    }
-    if let Some((ti, beat)) = add_event
-        && ti < recipe.tracks.len()
-    {
-        recipe.tracks[ti].events.push(Event {
-            time_beats: beat,
-            instrument_id: default_inst,
-            volume: 0.8,
-            ..Event::default()
-        });
-        state.selected_event = Some((ti, recipe.tracks[ti].events.len() - 1));
-        res.changed = true;
-        res.rebake = true;
+    // A marquee that ended over a note, or outside the timeline, never sees
+    // its lane's `drag_stopped`; the pointer coming up ends it either way.
+    if state.marquee.is_some() && !ui.ctx().input(|i| i.pointer.any_down()) {
+        state.marquee = None;
     }
 
+    res.merge(apply_actions(recipe, state, actions, &lane_names));
     res
+}
+
+/// The row above the lanes: a track, the zoom and a Fit, the snap grid, how
+/// many lanes there are, and the More menu that holds what is not wanted
+/// every minute.
+///
+/// One row, the way #59 gave the canvas one: the genetics controls and the
+/// JSON fold used to sit above the instruments and the timeline both, which
+/// is two rows of chrome before the thing being edited (#62, Overlands
+/// #1335 C9).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one toolbar row's worth of state"
+)]
+fn timeline_toolbar(
+    ui: &mut egui::Ui,
+    recipe: &mut SequenceRecipe,
+    state: &mut SequenceEditorState,
+    id: Id,
+    ppb: f32,
+    fitted: f32,
+    total: f32,
+    actions: &mut Vec<Action>,
+) -> EditorResponse {
+    let mut res = EditorResponse::NONE;
+    ui.horizontal_wrapped(|ui| {
+        if ui
+            .button("Add track")
+            .on_hover_text("A new empty track at the bottom of the timeline")
+            .clicked()
+        {
+            recipe.tracks.push(Track::default());
+            res.changed = true;
+            res.rebake = true;
+        }
+
+        ui.label("Zoom")
+            .on_hover_text("How wide one beat is drawn, in points");
+        // Narrower than egui's default, and the track count is off the row
+        // altogether: at the sequence editor's panel width the row wrapped
+        // and left More on a line of its own, which is two rows of chrome
+        // again.
+        ui.spacing_mut().slider_width = 64.0;
+        let mut zoom = ppb;
+        if ui
+            .add(egui::Slider::new(&mut zoom, MIN_PPB..=MAX_PPB).show_value(false))
+            .changed()
+        {
+            state.zoom = Some(zoom);
+            res.changed = true;
+        }
+        if ui
+            .add_enabled(state.zoom.is_some(), egui::Button::new("Fit"))
+            .on_hover_text(format!(
+                "Zoom so all {} beats are in view, and keep them there as the panel is resized",
+                trim_beats(total)
+            ))
+            .on_disabled_hover_text(format!(
+                "Already fitted: all {} beats are in view at {:.0} points a beat",
+                trim_beats(total),
+                fitted
+            ))
+            .clicked()
+        {
+            state.zoom = None;
+            res.changed = true;
+        }
+
+        ui.label("Snap")
+            .on_hover_text("The grid a dragged note, an arrow nudge and a new note land on");
+        egui::ComboBox::from_id_salt(id.with("snap"))
+            .selected_text(state.snap.label())
+            .width(56.0)
+            .show_ui(ui, |ui| {
+                for snap in Snap::ALL {
+                    if ui
+                        .selectable_label(state.snap == snap, snap.label())
+                        .clicked()
+                    {
+                        state.snap = snap;
+                    }
+                }
+            })
+            .response
+            .on_hover_text("off, an eighth, a quarter, one beat, or one bar of four");
+
+        ui.separator();
+        res.merge(timeline_more_menu(ui, recipe, state, actions));
+    });
+    res
+}
+
+/// The timeline's More menu: the genetics controls and the JSON box, which
+/// cost the editor two rows above everything it edits.
+fn timeline_more_menu(
+    ui: &mut egui::Ui,
+    recipe: &mut SequenceRecipe,
+    state: &mut SequenceEditorState,
+    actions: &mut Vec<Action>,
+) -> EditorResponse {
+    let mut res = EditorResponse::NONE;
+    ui.menu_button("More", |ui| {
+        if ui
+            .button("Mutate recipe")
+            .on_hover_text("Nudge BPM and note volumes via symbios-genetics")
+            .clicked()
+        {
+            recipe.mutate(&mut fresh_rng(), state.mutate_rate);
+            res.changed = true;
+            res.rebake = true;
+        }
+        ui.add(egui::Slider::new(&mut state.mutate_rate, 0.0..=1.0).text("rate"));
+        ui.separator();
+        let picked = state.selection.len();
+        if ui
+            .add_enabled(picked > 0, egui::Button::new("Duplicate selected notes"))
+            .on_hover_text(format!(
+                "Copy the {picked} picked note(s) in place — Alt-drag one does the same"
+            ))
+            .on_disabled_hover_text("Click a note first; shift-click or drag a box picks more")
+            .clicked()
+        {
+            actions.push(Action::DuplicateSelection);
+            ui.close();
+        }
+        ui.separator();
+        if ui
+            .selectable_label(state.show_json, "Import / Export JSON")
+            .on_hover_text("Show the JSON box under this row")
+            .clicked()
+        {
+            state.show_json = !state.show_json;
+        }
+    });
+    res
+}
+
+/// The beat numbers along the top of the timeline, and a line down the
+/// whole height at every beat.
+fn paint_ruler(
+    painter: &egui::Painter,
+    rect: Rect,
+    total: f32,
+    ppb: f32,
+    origin: f32,
+    style: &EditorStyle,
+) {
+    // Number every beat, every other one, or every fourth, so the numbers
+    // never run into each other as the zoom comes down.
+    let step = if ppb < 20.0 {
+        4
+    } else if ppb < 40.0 {
+        2
+    } else {
+        1
+    };
+    let mut beat = 0i32;
+    while (beat as f32) <= total {
+        let x = origin + beat as f32 * ppb;
+        painter.line_segment(
+            [Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())],
+            Stroke::new(1.0, style.timeline_grid),
+        );
+        if beat % step == 0 {
+            painter.text(
+                Pos2::new(x + 2.0, rect.top() + RULER_BEATS_Y),
+                Align2::LEFT_TOP,
+                beat.to_string(),
+                egui::FontId::proportional(10.0),
+                style.ground_text,
+            );
+        }
+        beat += 1;
+    }
+}
+
+/// The loop markers: a line down the lanes at each, the crossfade shaded,
+/// and each one labelled on the ruler's second line.
+///
+/// The lines were there and said nothing — the accent line at beat 2 was
+/// the loop point and the strong one at the end was the end, and nothing on
+/// screen said either (#62, Overlands #1335 C4). Every label is placed with
+/// [`marker_label_rect`], which keeps it inside the timeline: the end
+/// marker sits at the last beat, where a label simply written to its right
+/// would be off the edge.
+/// The shade over the crossfade at the end of the sequence.
+///
+/// Under the lanes, unlike the marker lines: a wash over the note blocks
+/// makes them look faded, which is what a quiet note looks like.
+#[expect(clippy::too_many_arguments, reason = "the markers and their geometry")]
+fn paint_crossfade_band(
+    painter: &egui::Painter,
+    rect: Rect,
+    dur: f32,
+    loop_start: Option<f32>,
+    crossfade: f32,
+    ppb: f32,
+    origin: f32,
+    style: &EditorStyle,
+) {
+    if crossfade <= 0.0 || loop_start.is_none() {
+        return;
+    }
+    let lanes_top = rect.top() + RULER_H;
+    painter.rect_filled(
+        Rect::from_min_max(
+            Pos2::new(origin + (dur - crossfade).max(0.0) * ppb, lanes_top),
+            Pos2::new(origin + dur * ppb, rect.bottom()),
+        ),
+        0.0,
+        style.crossfade_band,
+    );
+}
+
+#[expect(clippy::too_many_arguments, reason = "the markers and their geometry")]
+fn paint_markers(
+    painter: &egui::Painter,
+    rect: Rect,
+    dur: f32,
+    loop_start: Option<f32>,
+    crossfade: f32,
+    ppb: f32,
+    origin: f32,
+    style: &EditorStyle,
+) {
+    let lanes_top = rect.top() + RULER_H;
+    let mut labels: Vec<(f32, &str, Color32)> = Vec::new();
+
+    let x_end = origin + dur * ppb;
+    if crossfade > 0.0 && loop_start.is_some() {
+        labels.push((
+            origin + (dur - crossfade).max(0.0) * ppb,
+            "blend",
+            style.loop_start,
+        ));
+    }
+    if let Some(ls) = loop_start {
+        let x = origin + ls * ppb;
+        painter.line_segment(
+            [Pos2::new(x, lanes_top), Pos2::new(x, rect.bottom())],
+            Stroke::new(2.0, style.loop_start),
+        );
+        labels.push((x, "loop start", style.loop_start));
+    }
+    painter.line_segment(
+        [Pos2::new(x_end, lanes_top), Pos2::new(x_end, rect.bottom())],
+        Stroke::new(2.0, style.loop_end),
+    );
+    labels.push((x_end, "end", style.loop_end));
+
+    // Left to right, each one clear of the one before it. Two markers can
+    // be a couple of beats apart — the blend and the end of the seeded
+    // recipe are — and their labels are wider than that, so placing each
+    // one only against the timeline's edges drew them on top of each other
+    // and neither could be read.
+    labels.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let font = egui::FontId::proportional(10.0);
+    let mut after: Option<f32> = None;
+    for (x, text, colour) in labels {
+        let galley = painter.layout_no_wrap(text.to_owned(), font.clone(), colour);
+        let mut at = marker_label_rect(x, galley.size(), rect.top() + RULER_MARKS_Y, rect);
+        if let Some(clear) = after.filter(|clear| at.left() < *clear) {
+            // Just clear of the last one, and still inside the timeline: a
+            // marker at the very last beat has nowhere further right to go,
+            // and being inside is the promise the acceptance holds us to.
+            let last_chance = (rect.right() - LABEL_PAD - galley.size().x).max(rect.left());
+            at = Rect::from_min_size(Pos2::new(clear.min(last_chance), at.top()), galley.size());
+        }
+        after = Some(at.right() + LABEL_PAD);
+        painter.galley(at.min, galley, colour);
+    }
+}
+
+/// The rubber band of a marquee in progress.
+fn paint_marquee(painter: &egui::Painter, marquee: Option<(Pos2, Pos2)>, style: &EditorStyle) {
+    let Some((from, to)) = marquee else { return };
+    let band = Rect::from_two_pos(from, to);
+    painter.rect_filled(band, 0.0, style.note_selected.gamma_multiply(0.15));
+    painter.rect_stroke(
+        band,
+        0.0,
+        Stroke::new(1.0, style.note_selected),
+        StrokeKind::Inside,
+    );
+}
+
+/// A lane's gutter: the remove cross, and the lane's name.
+///
+/// The name is the discoverable end of everything the lane can do: its
+/// hover says how to add a note, which used to be said only by the empty
+/// inspector, where nobody who had selected a note could see it (#62,
+/// Overlands #1335 C6).
+#[expect(clippy::too_many_arguments, reason = "one gutter's worth of state")]
+fn lane_gutter(
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    lane: Rect,
+    track: usize,
+    name: Option<&(String, usize)>,
+    id: Id,
+    style: &EditorStyle,
+    actions: &mut Vec<Action>,
+) -> EditorResponse {
+    let cross = Rect::from_min_size(
+        Pos2::new(lane.left() + 3.0, lane.center().y - 7.0),
+        Vec2::splat(14.0),
+    );
+    let cross_resp = ui
+        .interact(cross, id.with(("rm_track", track)), Sense::click())
+        .on_hover_text(format!("Remove track {} and its notes", track + 1));
+    painter.text(
+        cross.center(),
+        Align2::CENTER_CENTER,
+        "\u{2716}",
+        egui::FontId::proportional(13.0),
+        if cross_resp.hovered() {
+            style.error
+        } else {
+            style.ground_text
+        },
+    );
+    if cross_resp.clicked() {
+        actions.push(Action::RemoveTrack(track));
+    }
+
+    let text = Rect::from_min_max(
+        Pos2::new(cross.right() + 4.0, lane.top()),
+        Pos2::new(lane.left() + GUTTER - 4.0, lane.bottom()),
+    );
+    let (label, colour) = match name {
+        Some((name, _)) => (name.clone(), style.ground_text),
+        None => ("empty".to_owned(), style.ground_text.gamma_multiply(0.6)),
+    };
+    let galley = painter.layout(
+        label,
+        egui::FontId::proportional(12.0),
+        colour,
+        text.width().max(1.0),
+    );
+    painter.galley(
+        Pos2::new(text.left(), text.center().y - 0.5 * galley.size().y),
+        galley,
+        colour,
+    );
+    let hover = match name {
+        Some((name, n)) => format!(
+            "Track {}: {n} note(s), most of them {name}. Double-click the track to add \
+             one, or right-click it for the track's menu",
+            track + 1
+        ),
+        None => format!(
+            "Track {}: no notes yet. Double-click the track to add one, or right-click \
+             it for the track's menu",
+            track + 1
+        ),
+    };
+    ui.interact(text, id.with(("lane_name", track)), Sense::hover())
+        .on_hover_text(hover);
+    EditorResponse::NONE
+}
+
+/// A lane's context menu, opened by a right-click on it: a note at the beat
+/// pressed, and the lane's removal.
+///
+/// A menu at the pointer is the canvas's Add-node gesture (#61), and it is
+/// how a lane gets an add control without putting a target where a click
+/// already means something else.
+fn lane_menu(
+    bg: &egui::Response,
+    track: usize,
+    name: Option<&(String, usize)>,
+    beat: Option<f32>,
+    actions: &mut Vec<Action>,
+) -> EditorResponse {
+    let whose = match name {
+        Some((name, _)) => format!("Add a {name} note here"),
+        None => "Add a note here".to_owned(),
+    };
+    bg.context_menu(|ui| {
+        ui.label(
+            egui::RichText::new(format!("Track {}", track + 1))
+                .weak()
+                .small(),
+        );
+        if ui
+            .add_enabled(beat.is_some(), egui::Button::new(whose))
+            .on_hover_text("At the beat you right-clicked, on this track's grid")
+            .on_disabled_hover_text("Right-click the track to say where the note goes")
+            .clicked()
+            && let Some(beat) = beat
+        {
+            actions.push(Action::AddNote { track, beat });
+            ui.close();
+        }
+        ui.separator();
+        if ui.button("Remove this track").clicked() {
+            actions.push(Action::RemoveTrack(track));
+            ui.close();
+        }
+    });
+    EditorResponse::NONE
+}
+
+/// One note's block and its full extent (the block plus its release tail).
+fn note_geometry(event: &Event, lane_top: f32, ppb: f32, origin: f32) -> (Rect, Rect) {
+    let left = origin + event.time_beats * ppb;
+    let top = lane_top + 4.0;
+    let height = LANE_H - 8.0;
+    let body = Rect::from_min_size(
+        Pos2::new(left, top),
+        Vec2::new((event.gate_beats * ppb).max(6.0), height),
+    );
+    let tail = (event.release_beats * ppb).max(0.0);
+    let extent = Rect::from_min_size(body.min, Vec2::new(body.width() + tail, height));
+    (body, extent)
+}
+
+/// What one note's block says: the widest of [`note_labels`] that fits
+/// inside it, or nothing.
+fn paint_note_label(
+    painter: &egui::Painter,
+    body: Rect,
+    event: &Event,
+    missing: bool,
+    error: Color32,
+    style: &EditorStyle,
+) {
+    let colour = if missing { error } else { style.note_text };
+    let font = egui::FontId::proportional(11.0);
+    let draw = |galley: std::sync::Arc<egui::Galley>| {
+        painter.galley(
+            Pos2::new(
+                body.left() + LABEL_PAD,
+                body.center().y - 0.5 * galley.size().y,
+            ),
+            galley,
+            colour,
+        );
+    };
+    // A broken note says so whatever its width: the label is the only
+    // thing that names the instrument nothing answers to, so it runs past
+    // the block the way every label used to. Making it fit inside is
+    // Overlands #1342, which is not this step's.
+    if missing {
+        draw(painter.layout_no_wrap(missing_label(&event.instrument_id), font, colour));
+        return;
+    }
+    // The text starts [`LABEL_PAD`] inside the left edge and needs only
+    // clearance at the right, so a 4-beat note's pitch fits at the zoom
+    // that fits the whole sequence.
+    let room = body.width() - LABEL_PAD - 1.0;
+    for label in note_labels(event, false) {
+        if label.is_empty() {
+            continue;
+        }
+        let galley = painter.layout_no_wrap(label, font.clone(), colour);
+        if galley.size().x <= room {
+            draw(galley);
+            return;
+        }
+    }
+}
+
+/// Move or resize every selected note by this frame's drag.
+///
+/// Read once for the whole timeline rather than inside the lane loop: a
+/// multi-note move is one gesture, and asking each note for its own drag
+/// would move only the one under the pointer.
+fn drag_selection(
+    ui: &egui::Ui,
+    recipe: &mut SequenceRecipe,
+    state: &mut SequenceEditorState,
+    id: Id,
+    ppb: f32,
+) -> EditorResponse {
+    let mut res = EditorResponse::NONE;
+    // The widget the press landed on, which after an Alt-drag is not one of
+    // the notes being moved.
+    let Some(anchor) = state.drag_anchor else {
+        return res;
+    };
+    let resp = ui.ctx().read_response(id.with(("ev", anchor.0, anchor.1)));
+    let Some(resp) = resp else { return res };
+
+    let picked: Vec<(usize, usize)> = state.selection.iter().copied().collect();
+    if resp.dragged() {
+        let dx = resp.drag_delta().x / ppb;
+        for (ti, ei) in &picked {
+            let Some(event) = recipe
+                .tracks
+                .get_mut(*ti)
+                .and_then(|t| t.events.get_mut(*ei))
+            else {
+                continue;
+            };
+            match state.drag_mode {
+                DragMode::Move | DragMode::Copy => {
+                    event.time_beats = (event.time_beats + dx).max(0.0);
+                }
+                // A resize is one note's: dragging one edge of five
+                // different gates is not a gesture anyone means.
+                DragMode::Resize if (*ti, *ei) == anchor => {
+                    event.gate_beats = (event.gate_beats + dx).max(MIN_GATE);
+                }
+                DragMode::Resize => {}
+            }
+        }
+        res.changed = true;
+    }
+    if resp.drag_stopped() {
+        for (ti, ei) in &picked {
+            let Some(event) = recipe
+                .tracks
+                .get_mut(*ti)
+                .and_then(|t| t.events.get_mut(*ei))
+            else {
+                continue;
+            };
+            match state.drag_mode {
+                DragMode::Move | DragMode::Copy => {
+                    event.time_beats = snap_beat(event.time_beats, state.snap);
+                }
+                DragMode::Resize if (*ti, *ei) == anchor => {
+                    event.gate_beats = snap_beat(event.gate_beats, state.snap).max(MIN_GATE);
+                }
+                DragMode::Resize => {}
+            }
+        }
+        state.drag_anchor = None;
+        res.rebake = true;
+    }
+    res
+}
+
+/// Apply the edits the draw loop collected, now that it has let go of the
+/// tracks.
+fn apply_actions(
+    recipe: &mut SequenceRecipe,
+    state: &mut SequenceEditorState,
+    actions: Vec<Action>,
+    lane_names: &[Option<(String, usize)>],
+) -> EditorResponse {
+    let mut res = EditorResponse::NONE;
+    for action in actions {
+        match action {
+            Action::AddNote { track, beat } => {
+                if track >= recipe.tracks.len() {
+                    continue;
+                }
+                // The lane's own instrument, not the recipe's first: a note
+                // added to the bass lane used to arrive as a `bed` (#62,
+                // Overlands #1335 C6).
+                let instrument_id = lane_names
+                    .get(track)
+                    .and_then(|n| n.as_ref().map(|(name, _)| name.clone()))
+                    .or_else(|| recipe.instruments.first().map(|i| i.id.clone()))
+                    .unwrap_or_default();
+                recipe.tracks[track].events.push(Event {
+                    time_beats: snap_beat(beat, state.snap),
+                    instrument_id,
+                    volume: 0.8,
+                    ..Event::default()
+                });
+                state.select_only((track, recipe.tracks[track].events.len() - 1));
+                res.changed = true;
+                res.rebake = true;
+            }
+            Action::RemoveTrack(track) => {
+                if track < recipe.tracks.len() {
+                    recipe.tracks.remove(track);
+                }
+                state.clear_selection();
+                res.changed = true;
+                res.rebake = true;
+            }
+            Action::DuplicateSelection => {
+                if duplicate_selection(recipe, state) {
+                    res.changed = true;
+                    res.rebake = true;
+                }
+            }
+        }
+    }
+    res
+}
+
+/// Copy every selected note, and leave the copies selected.
+///
+/// The copies land on top of the originals rather than beside them: an
+/// Alt-drag is about to carry them somewhere, and an offset the drag then
+/// adds to would put them where neither the pointer nor the grid says. The
+/// menu's Duplicate leaves them there to be dragged or nudged off.
+fn duplicate_selection(recipe: &mut SequenceRecipe, state: &mut SequenceEditorState) -> bool {
+    let mut picked: Vec<(usize, usize)> = state.selection.iter().copied().collect();
+    picked.sort_unstable();
+    if picked.is_empty() {
+        return false;
+    }
+    let anchor = state.selected_event;
+    let mut copies: HashSet<(usize, usize)> = HashSet::new();
+    let mut new_anchor = None;
+    for (ti, ei) in picked {
+        let Some(track) = recipe.tracks.get_mut(ti) else {
+            continue;
+        };
+        let Some(event) = track.events.get(ei).cloned() else {
+            continue;
+        };
+        track.events.push(event);
+        let at = (ti, track.events.len() - 1);
+        if anchor == Some((ti, ei)) {
+            new_anchor = Some(at);
+        }
+        copies.insert(at);
+    }
+    if copies.is_empty() {
+        return false;
+    }
+    state.selected_event = new_anchor.or_else(|| copies.iter().copied().next());
+    state.selection = copies;
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1136,17 +2441,22 @@ fn event_inspector(
     let mut res = EditorResponse::NONE;
 
     let Some((ti, ei)) = state.selected_event else {
-        ui.label("No event selected — click an event, or double-click a lane to add one.");
+        ui.label(
+            "No note picked. Click a note to edit it, shift-click or drag a box to pick \
+             more, or double-click a lane to add one.",
+        );
         return res;
     };
     if ti >= recipe.tracks.len() || ei >= recipe.tracks[ti].events.len() {
-        state.selected_event = None;
-        ui.label("No event selected.");
+        state.clear_selection();
+        ui.label("No note picked.");
         return res;
     }
 
     let inst_ids: Vec<String> = recipe.instruments.iter().map(|i| i.id.clone()).collect();
     let dur = recipe.duration_beats.max(1.0);
+    let bpm = recipe.bpm;
+    let picked = state.selection.len();
     let error = style.error;
     let mut delete = false;
     // Set by the reassign offer: every note of the first id takes the second.
@@ -1163,7 +2473,21 @@ fn event_inspector(
 
     {
         let ev = &mut recipe.tracks[ti].events[ei];
-        ui.label(format!("Track {ti}, event #{ei}"));
+        // Counted from one, the way the lanes are named in their gutters
+        // and the way anyone reading it counts (#62, Overlands #1335 C5).
+        ui.label(
+            egui::RichText::new(format!("Track {} \u{00B7} note {}", ti + 1, ei + 1)).strong(),
+        );
+        if picked > 1 {
+            ui.label(
+                egui::RichText::new(format!(
+                    "{picked} notes picked \u{2014} a drag, an arrow or Ctrl+D moves or copies \
+                     all of them; the fields below edit this one"
+                ))
+                .weak()
+                .small(),
+            );
+        }
         let missing = !inst_ids.contains(&ev.instrument_id);
         if missing {
             ui.colored_label(error, no_instrument_text(&ev.instrument_id));
@@ -1216,55 +2540,96 @@ fn event_inspector(
             }
         });
 
-        res.merge(drag_debounced(
+        res.merge(beat_field(
             ui,
-            "time (beats)",
+            "Start",
+            "Where the note begins, in beats from the start of the sequence",
             &mut ev.time_beats,
             0.05,
             0.0..=dur * 4.0,
+            bpm,
         ));
-        res.merge(drag_debounced(
+        res.merge(beat_field(
             ui,
-            "gate (beats)",
+            "Hold",
+            "How long the note is held down. The instrument's envelope \
+             sustains for this long and then starts to release",
             &mut ev.gate_beats,
             0.05,
             MIN_GATE..=dur * 4.0,
+            bpm,
         ));
-        res.merge(drag_debounced(
+        res.merge(beat_field(
             ui,
-            "release (beats)",
+            "Tail",
+            "Extra time baked after the note is let go, for the release to \
+             ring out. 0 cuts it dead",
             &mut ev.release_beats,
             0.05,
             0.0..=32.0,
+            bpm,
         ));
-        res.merge(slider_debounced(
-            ui,
-            egui::Slider::new(&mut ev.pitch_multiplier, 0.25..=4.0)
-                .logarithmic(true)
-                .text("pitch \u{00D7}"),
-        ));
-        // Pitch mode: tape varispeed (pitch ↔ time coupled) vs. synthesis-
-        // time retune (note keeps its slot regardless of pitch).
         ui.horizontal(|ui| {
-            ui.label("pitch mode");
-            for (variant, label) in [
-                (PitchMode::Varispeed, "Varispeed"),
-                (PitchMode::TimePreserving, "Time-preserving"),
+            ui.label("Pitch").on_hover_text(
+                "How far the note is shifted from the instrument's own \
+                 pitch: 2 is an octave up, 0.5 an octave down",
+            );
+            res.merge(slider_debounced(
+                ui,
+                egui::Slider::new(&mut ev.pitch_multiplier, 0.25..=4.0)
+                    .logarithmic(true)
+                    .show_value(true),
+            ));
+        });
+        // Pitch mode: tape varispeed (pitch and time coupled) vs.
+        // synthesis-time retune (the note keeps its slot whatever its
+        // pitch). Said as what happens, not as the technique's name.
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Pitch mode");
+            for (variant, label, hover) in [
+                (
+                    PitchMode::Varispeed,
+                    "pitch and length linked",
+                    "Resampled like tape: pitching it up makes it shorter, \
+                     and down makes it longer",
+                ),
+                (
+                    PitchMode::TimePreserving,
+                    "pitch and length independent",
+                    "Retuned as it is synthesised: the note keeps its Hold \
+                     whatever its pitch",
+                ),
             ] {
                 let selected = ev.pitch_mode == variant;
-                if ui.selectable_label(selected, label).clicked() && !selected {
+                if ui
+                    .selectable_label(selected, label)
+                    .on_hover_text(hover)
+                    .clicked()
+                    && !selected
+                {
                     ev.pitch_mode = variant;
                     res.changed = true;
                     res.rebake = true;
                 }
             }
         });
-        res.merge(slider_debounced(
-            ui,
-            egui::Slider::new(&mut ev.volume, 0.0..=1.0).text("volume"),
-        ));
+        ui.horizontal(|ui| {
+            ui.label("Volume")
+                .on_hover_text("How loud the note is in the mix, and how solid its block is drawn");
+            res.merge(slider_debounced(
+                ui,
+                egui::Slider::new(&mut ev.volume, 0.0..=1.0).show_value(true),
+            ));
+        });
 
-        if ui.button("Delete note").clicked() {
+        if ui
+            .button(if picked > 1 {
+                format!("Delete {picked} notes")
+            } else {
+                "Delete note".to_owned()
+            })
+            .clicked()
+        {
             delete = true;
         }
     }
@@ -1275,8 +2640,18 @@ fn event_inspector(
         res.rebake = true;
     }
     if delete {
-        recipe.tracks[ti].events.remove(ei);
-        state.selected_event = None;
+        // Every picked note, highest index first so the removals do not
+        // move each other's indices out from under them.
+        let mut picked: Vec<(usize, usize)> = state.selection.iter().copied().collect();
+        picked.sort_unstable_by(|a, b| b.cmp(a));
+        for (track, event) in picked {
+            if let Some(track) = recipe.tracks.get_mut(track)
+                && event < track.events.len()
+            {
+                track.events.remove(event);
+            }
+        }
+        state.clear_selection();
         res.changed = true;
         res.rebake = true;
     }
@@ -1302,12 +2677,52 @@ mod tests {
         }
     }
 
+    /// Every division the picker offers, at the value it rounds to, past
+    /// the end of the sequence, and below zero.
+    ///
+    /// Walked from [`Snap::ALL`], so a division added to the picker cannot
+    /// go untested: it is the same array the combo is built from.
     #[test]
-    fn snap_beat_rounds_to_quarter_grid_and_clamps() {
-        assert_eq!(snap_beat(0.12), 0.0);
-        assert_eq!(snap_beat(0.13), 0.25);
-        assert_eq!(snap_beat(1.6), 1.5);
-        assert_eq!(snap_beat(-3.0), 0.0);
+    fn snapping_rounds_to_every_division_and_never_below_zero() {
+        let cases = [
+            (Snap::Off, 1.61, 1.61),
+            (Snap::Eighth, 1.61, 1.625),
+            (Snap::Quarter, 1.61, 1.5),
+            (Snap::Beat, 1.61, 2.0),
+            (Snap::Bar, 1.61, 0.0),
+            // Halfway rounds up on every grid, the way `f32::round` does.
+            (Snap::Eighth, 0.0625, 0.125),
+            (Snap::Quarter, 0.125, 0.25),
+            (Snap::Beat, 0.5, 1.0),
+            (Snap::Bar, 2.0, 4.0),
+            // Past the end is left alone: the timeline grows to hold it.
+            (Snap::Off, 400.4, 400.4),
+            (Snap::Bar, 400.4, 400.0),
+            (Snap::Beat, 400.4, 400.0),
+            // Below zero is not: a note before beat 0 cannot be baked.
+            (Snap::Off, -3.0, 0.0),
+            (Snap::Eighth, -3.0, 0.0),
+            (Snap::Quarter, -3.0, 0.0),
+            (Snap::Beat, -3.0, 0.0),
+            (Snap::Bar, -3.0, 0.0),
+            (Snap::Quarter, -0.01, 0.0),
+        ];
+        for (snap, beats, want) in cases {
+            let got = snap_beat(beats, snap);
+            assert!(
+                (got - want).abs() < 1e-4,
+                "{snap:?} put {beats} at {got}, not {want}"
+            );
+        }
+        // The quarter grid every drag snapped to before there was a choice
+        // is still the default, so nothing moved for anyone who never opens
+        // the picker.
+        assert_eq!(Snap::default(), Snap::Quarter);
+        for snap in Snap::ALL {
+            assert!(snap_beat(-1.0, snap) >= 0.0, "{snap:?} allowed a negative");
+            assert!(snap.step() > 0.0, "{snap:?} has no nudge step");
+            assert!(!snap.label().is_empty(), "{snap:?} has no label");
+        }
     }
 
     #[test]
@@ -1423,6 +2838,17 @@ mod tests {
         }
     }
 
+    /// `key` with `modifiers` held: what the editor's own shortcuts read.
+    fn chord(key: egui::Key, modifiers: egui::Modifiers) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers,
+        }
+    }
+
     fn typed(text: &str) -> egui::Event {
         egui::Event::Text(text.into())
     }
@@ -1455,6 +2881,9 @@ mod tests {
         recipe: SequenceRecipe,
         state: SequenceEditorState,
         out: egui::FullOutput,
+        /// The side panel's own rect, as the editor was given it: what the
+        /// timeline's fit-to-width has to fit inside.
+        panel: Rect,
     }
 
     impl Driver {
@@ -1488,6 +2917,7 @@ mod tests {
                 recipe,
                 state,
                 out: egui::FullOutput::default(),
+                panel: Rect::NOTHING,
             };
             // A new area's first pass is an invisible sizing pass; act from
             // the third frame on.
@@ -1498,21 +2928,39 @@ mod tests {
 
         /// One frame with `events` as its input; the editor's response.
         fn frame(&mut self, events: Vec<egui::Event>) -> EditorResponse {
+            self.frame_held(egui::Modifiers::NONE, events)
+        }
+
+        /// One frame with `modifiers` held down as the platform reports
+        /// them.
+        ///
+        /// `InputState::modifiers` comes from the raw input and not from an
+        /// event's own copy of them, so a Shift-arrow needs both: the event
+        /// carries the chord that is matched, and the raw modifiers are
+        /// what the fine step is read from.
+        fn frame_held(
+            &mut self,
+            modifiers: egui::Modifiers,
+            events: Vec<egui::Event>,
+        ) -> EditorResponse {
             let Self {
                 ctx,
                 recipe,
                 state,
                 out,
+                panel,
             } = self;
             let mut res = EditorResponse::NONE;
             let input = egui::RawInput {
                 events,
+                modifiers,
                 ..Default::default()
             };
             *out = ctx.run_ui(input, |root| {
                 egui::Panel::left("seq")
                     .default_size(480.0)
                     .show(root, |ui| {
+                        *panel = ui.max_rect();
                         res.merge(sequence_recipe_editor(ui, recipe, state, Id::new("seq")));
                     });
                 egui::CentralPanel::default().show(root, |ui| {
@@ -1604,6 +3052,20 @@ mod tests {
                 .button(prefix)
                 .unwrap_or_else(|| panic!("no button labelled {prefix:?}\u{2026}"));
             self.act(button, accesskit::Action::Click)
+        }
+
+        /// Put the pointer on the timeline and leave it there.
+        ///
+        /// The editor takes the keyboard only while it has the pointer and
+        /// nothing holds text focus (#60), so a test of an arrow or a
+        /// Ctrl+D has to point at it first — with no pointer anywhere, the
+        /// keys belong to the host.
+        fn point_at_timeline(&mut self) {
+            // The *visible* part of it: zoomed in, the timeline is several
+            // times the panel's width and its centre is off the panel
+            // altogether, where the pointer is over nothing.
+            let at = self.state.timeline_rect().intersect(self.panel).center();
+            self.frame(vec![egui::Event::PointerMoved(at)]);
         }
 
         /// The text of everything the last frame painted.
@@ -1997,7 +3459,10 @@ mod tests {
         recipe.tracks[1].events = vec![note("kick", 1.0)];
         recipe.loop_start_beats = Some(2.0);
         recipe.loop_crossfade_beats = 1.0;
-        let mut state = SequenceEditorState::default();
+        // At the fitted zoom a half-beat note is a few points wide and
+        // holds no label, so these read the timeline zoomed in, which is
+        // where a note's name is something to check the contrast of.
+        let mut state = view(48.0, Snap::default());
         state.set_selected_event(Some((0, 0)));
         (recipe, state)
     }
@@ -2077,19 +3542,26 @@ mod tests {
             ("loop_start", s.loop_start),
             ("loop_end", s.loop_end),
             ("crossfade_band", s.crossfade_band),
-            ("note_fill", s.note_fill),
             ("note_selected", s.note_selected),
-            ("release_tail", s.release_tail),
         ] {
             assert!(painted.contains(&colour), "{role} is not painted");
         }
+        // `note_fill` is no longer painted as itself: since #62 it is what
+        // each instrument's tint is derived *from* — its saturation and its
+        // luminance, with a hue per id — so what the blocks paint is the
+        // tint, and the label still goes on it in `note_text`.
+        let tints = instrument_tints(["wind", "kick"], &s);
         for name in ["wind", "kick"] {
             assert_eq!(
                 note_labels(&driver.out, name),
-                [(s.note_text, s.note_fill)],
-                "{name}: the label in note_text on a note_fill block"
+                [(s.note_text, tints[name])],
+                "{name}: the label in note_text on its own instrument's tint"
             );
         }
+        assert!(
+            !painted.contains(&s.note_fill),
+            "note_fill is painted as itself, so some block skipped the tint"
+        );
     }
 
     /// A note with no instrument and a refused name are in the style's
@@ -2121,25 +3593,36 @@ mod tests {
     #[test]
     fn the_sequence_buttons_say_what_they_do_in_words() {
         let (recipe, state) = two_lane_recipe();
-        let driver = Driver::with_state(recipe, state);
-        let labels = button_labels(&driver.out);
+        let mut driver = Driver::with_state(recipe, state);
+        let front = button_labels(&driver.out);
         for word in [
             "Add instrument",
             "Add track",
-            "Mutate recipe",
+            "Fit",
+            "More",
             "Delete note",
             "\u{270F} Edit",
         ] {
             assert!(
-                labels.iter().any(|l| l == word),
-                "no {word:?} button; buttons: {labels:?}"
+                front.iter().any(|l| l == word),
+                "no {word:?} button; buttons: {front:?}"
             );
         }
-        assert_eq!(
-            glyph_labels(&labels, &['\u{2716}', '\u{270F}']),
-            Vec::<String>::new(),
-            "buttons labelled with a glyph where the vocabulary says a word"
+        // Mutate recipe moved under More with the JSON box (#62, Overlands
+        // #1335 C9), so its wording is checked where it now lives.
+        driver.click("More");
+        let under = button_labels(&driver.out);
+        assert!(
+            under.iter().any(|l| l == "Mutate recipe"),
+            "no Mutate recipe under More: {under:?}"
         );
+        for labels in [&front, &under] {
+            assert_eq!(
+                glyph_labels(labels, &['\u{2716}', '\u{270F}']),
+                Vec::<String>::new(),
+                "buttons labelled with a glyph where the vocabulary says a word"
+            );
+        }
     }
 
     // ---- step 7a (#60, Overlands #1333): one history per recipe ---------
@@ -2209,5 +3692,1181 @@ mod tests {
         assert!(driver.state.undo(&mut driver.recipe));
         assert_eq!(driver.recipe, start, "then the track edit");
         assert!(!driver.state.can_undo());
+    }
+
+    // -----------------------------------------------------------------------
+    // A readable timeline (#62, Overlands #1335 C3, C4, C5, C9)
+    // -----------------------------------------------------------------------
+    //
+    // These read what the timeline actually painted, the way the rename
+    // tests do: the ground it drew, the rects on it, and the text over
+    // them. Nothing asks the drawing code what it meant to draw.
+
+    /// The recipe `host_window` seeds its sequence slot with, cut to what
+    /// the timeline cares about: five lanes, thirty-four beats, a loop that
+    /// starts at two and blends for two, and notes off the native pitch.
+    fn wide_recipe() -> SequenceRecipe {
+        let note = |id: &str, time_beats: f32, pitch_multiplier: f32, gate_beats: f32| Event {
+            time_beats,
+            instrument_id: id.into(),
+            pitch_multiplier,
+            volume: 0.5,
+            gate_beats,
+            release_beats: 0.5,
+            ..Event::default()
+        };
+        let mut recipe = recipe_with(&["bed", "pluck", "melody"], 3);
+        recipe.bpm = 60.0;
+        recipe.duration_beats = 34.0;
+        recipe.loop_start_beats = Some(2.0);
+        recipe.loop_crossfade_beats = 2.0;
+        recipe.tracks[0].events = vec![note("bed", 0.0, 1.0, 34.0)];
+        recipe.tracks[1].events = (0..6)
+            .map(|i| note("pluck", 2.0 + 4.0 * i as f32, 1.5, 1.0))
+            .collect();
+        recipe.tracks[2].events = vec![
+            note("melody", 2.0, 1.0, 4.0),
+            note("melody", 8.0, 1.25, 4.0),
+            note("pluck", 16.0, 0.75, 4.0),
+        ];
+        recipe
+    }
+
+    /// Every rect the last frame painted, with its fill.
+    fn rects(out: &egui::FullOutput) -> Vec<(Rect, Color32)> {
+        shapes(out)
+            .into_iter()
+            .filter_map(|s| match s {
+                egui::Shape::Rect(r) => Some((r.rect, r.fill)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The timeline's own ground: the one rect painted in the style's
+    /// `timeline_ground`, which under [`distinct_style`] nothing else uses.
+    fn timeline_ground(driver: &Driver) -> Rect {
+        let ground = distinct_style().timeline_ground;
+        rects(&driver.out)
+            .into_iter()
+            .find(|(_, fill)| *fill == ground)
+            .map(|(rect, _)| rect)
+            .expect("the timeline painted its ground")
+    }
+
+    /// The bounding rect of the text reading exactly `text`.
+    fn text_rect(driver: &Driver, text: &str) -> Option<Rect> {
+        shapes(&driver.out).into_iter().find_map(|s| match s {
+            egui::Shape::Text(t) if t.galley.text() == text => Some(t.visual_bounding_rect()),
+            _ => None,
+        })
+    }
+
+    /// C4: the timeline opens fitted to the width it was given, so the loop
+    /// end and the crossfade are on screen without a scroll.
+    ///
+    /// At 48 points a beat — what every sequence editor opened with — the
+    /// seeded recipe's thirty-four beats are 1 632 points of content in a
+    /// 480-point panel, and everything past beat ten is off screen with no
+    /// scrollbar at rest to say so.
+    #[test]
+    fn the_timeline_opens_fitted_to_the_width_it_is_given() {
+        let mut driver = Driver::new(wide_recipe());
+        driver.frame(Vec::new());
+        let ground = timeline_ground(&driver);
+        assert!(
+            ground.width() <= driver.panel.width(),
+            "the timeline drew {} points of content inside a {}-point panel",
+            ground.width(),
+            driver.panel.width()
+        );
+    }
+
+    /// C4: every marker is labelled, and every label is inside the
+    /// timeline. A label pushed off the end by a marker at the last beat is
+    /// a label nobody reads.
+    #[test]
+    fn every_marker_label_lies_inside_the_timeline() {
+        let mut driver = Driver::new(wide_recipe());
+        driver.frame(Vec::new());
+        let ground = timeline_ground(&driver);
+        for label in ["loop start", "blend", "end"] {
+            let rect = text_rect(&driver, label)
+                .unwrap_or_else(|| panic!("no marker is labelled {label:?}: {:?}", driver.texts()));
+            assert!(
+                ground.contains_rect(rect),
+                "the {label:?} label is at {rect:?}, outside the timeline {ground:?}"
+            );
+        }
+    }
+
+    /// C4: the marker lines are drawn over the notes, not under them.
+    ///
+    /// The seeded recipe has two notes as long as the whole sequence, and
+    /// they covered the loop and end lines completely — so the markers C4
+    /// is about were invisible at exactly the zoom that had just brought
+    /// them on screen. The band stays underneath: a wash over a block
+    /// makes it look faded, which is what a quiet note looks like.
+    #[test]
+    fn the_marker_lines_are_drawn_over_the_notes_and_the_band_under_them() {
+        let mut recipe = wide_recipe();
+        // One note across the whole sequence, over every marker there is.
+        recipe.tracks[0].events = vec![Event {
+            gate_beats: 34.0,
+            ..note("bed", 0.0)
+        }];
+        let driver = Driver::with_state(recipe, view(48.0, Snap::default()));
+        let s = distinct_style();
+        let painted = shapes(&driver.out);
+        let last_block = painted
+            .iter()
+            .rposition(|shape| matches!(shape, egui::Shape::Rect(r) if r.fill == instrument_tints(["bed"], &s)["bed"]))
+            .expect("the bed note's block");
+        let marker = painted
+            .iter()
+            .rposition(|shape| {
+                matches!(shape, egui::Shape::LineSegment { stroke, .. } if stroke.color == s.loop_start)
+            })
+            .expect("the loop start line");
+        assert!(
+            marker > last_block,
+            "the loop marker is painted at {marker}, under the note at {last_block}"
+        );
+        let band = painted
+            .iter()
+            .position(|shape| matches!(shape, egui::Shape::Rect(r) if r.fill == s.crossfade_band))
+            .expect("the crossfade band");
+        assert!(
+            band < last_block,
+            "the crossfade band is painted at {band}, over the note at {last_block}"
+        );
+    }
+
+    /// C3: a lane says which instrument it is for, in its gutter, where a
+    /// note block can never reach — so the name is the lane's and not some
+    /// note's that happens to read the same.
+    ///
+    /// Track 2 holds two `melody` notes and one `pluck`, so its name is
+    /// the instrument most of it plays and not the last one stored.
+    #[test]
+    fn a_lane_takes_its_name_from_its_dominant_instrument() {
+        let mut driver = Driver::new(wide_recipe());
+        driver.frame(Vec::new());
+        let ground = timeline_ground(&driver);
+        let gutter =
+            Rect::from_x_y_ranges(ground.left()..=ground.left() + GUTTER, ground.y_range());
+        for name in ["bed", "pluck", "melody"] {
+            let in_gutter = shapes(&driver.out).into_iter().any(|s| match s {
+                egui::Shape::Text(t) => {
+                    t.galley.text() == name && gutter.contains_rect(t.visual_bounding_rect())
+                }
+                _ => false,
+            });
+            assert!(
+                in_gutter,
+                "no lane gutter is named {name:?}: {:?}",
+                driver.texts()
+            );
+        }
+    }
+
+    /// C3: two instruments are two colours, and a note's colour is its
+    /// instrument's wherever the note is.
+    #[test]
+    fn notes_of_different_instruments_are_painted_different_colours() {
+        let mut driver = Driver::new(wide_recipe());
+        driver.frame(Vec::new());
+        let ground = timeline_ground(&driver);
+        let style = distinct_style();
+        // The blocks: rects on the timeline, shorter than a lane, that are
+        // none of the grounds the timeline paints under them.
+        let grounds = [
+            style.timeline_ground,
+            style.lane,
+            style.lane_alt,
+            style.crossfade_band,
+            style.release_tail,
+        ];
+        let fills: HashSet<Color32> = rects(&driver.out)
+            .into_iter()
+            .filter(|(r, fill)| {
+                ground.contains_rect(*r)
+                    && r.height() > 0.0
+                    && r.height() < LANE_H
+                    && !grounds.contains(fill)
+                    && fill.a() > 0
+            })
+            .map(|(_, fill)| fill)
+            .collect();
+        assert!(
+            fills.len() >= 3,
+            "three instruments' notes were painted {} colour(s): {fills:?}",
+            fills.len()
+        );
+    }
+
+    /// C3: a note off the native pitch says so on its block, and a block
+    /// says as much as it has room for and no more.
+    ///
+    /// At the fitted zoom a one-beat note is ten points wide, so the widest
+    /// label it can hold is nothing: a label was drawn at the block's left
+    /// edge whatever the width, and wrote its instrument's name across the
+    /// four notes after it. What fits at which zoom is the test.
+    #[test]
+    fn a_note_says_its_pitch_when_its_block_has_room_and_nothing_when_it_does_not() {
+        let mut driver = Driver::new(wide_recipe());
+        driver.frame(Vec::new());
+        // Fitted: the 34-beat note is wide enough for its name, the
+        // 4-beat ones for a pitch, the 1-beat ones for neither.
+        let ground = timeline_ground(&driver);
+        for (label, want) in [
+            ("bed", true),
+            ("\u{00D7}1.25", true),
+            ("pluck \u{00D7}1.5", false),
+        ] {
+            let on_a_block = shapes(&driver.out).into_iter().any(|s| match s {
+                egui::Shape::Text(t) => {
+                    t.galley.text() == label
+                        && t.visual_bounding_rect().left() > ground.left() + GUTTER
+                }
+                _ => false,
+            });
+            assert_eq!(
+                on_a_block,
+                want,
+                "{label:?} on a block at the fitted zoom: {:?}",
+                driver.texts()
+            );
+        }
+
+        // Zoomed in to edit, every note has room for both.
+        driver.state.zoom = Some(96.0);
+        driver.frame(Vec::new());
+        for label in ["pluck \u{00D7}1.5", "melody \u{00D7}1.25", "bed"] {
+            assert!(
+                driver.paints(label),
+                "no note says {label:?} at 96 points a beat: {:?}",
+                driver.texts()
+            );
+        }
+
+        // And a label never leaves the block it belongs to.
+        for note in driver.state.notes() {
+            let room = note.body.width() - LABEL_PAD;
+            for text in shapes(&driver.out) {
+                if let egui::Shape::Text(t) = text
+                    && t.galley.rect.left() >= 0.0
+                {
+                    let at = t.visual_bounding_rect();
+                    if at.center().y > note.body.top()
+                        && at.center().y < note.body.bottom()
+                        && (at.left() - note.body.left() - LABEL_PAD).abs() < 1.0
+                    {
+                        assert!(
+                            at.width() <= room + 1.0,
+                            "{:?} is {} points wide on a {}-point block",
+                            t.galley.text(),
+                            at.width(),
+                            note.body.width()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// C5: the timeline and the inspector say what a field does, not what
+    /// the schema calls it.
+    #[test]
+    fn the_labels_are_words_and_not_schema_names() {
+        let mut state = view(48.0, Snap::default());
+        state.set_selected_event(Some((2, 1)));
+        let mut driver = Driver::with_state(wide_recipe(), state);
+        driver.frame(Vec::new());
+        let texts = driver.texts();
+        for schema in [
+            "px/beat",
+            "duration (beats)",
+            "gate (beats)",
+            "release (beats)",
+            "seamless loop",
+            "crossfade (beats)",
+            "loop start (beats)",
+            "time (beats)",
+            "Varispeed",
+            "Time-preserving",
+        ] {
+            assert!(
+                !texts.iter().any(|t| t == schema),
+                "the editor still says {schema:?}"
+            );
+        }
+        for word in [
+            "Zoom",
+            "Length",
+            "Hold",
+            "Tail",
+            "Pitch",
+            "Loop",
+            "Blend into loop",
+        ] {
+            assert!(
+                texts.iter().any(|t| t.starts_with(word)),
+                "nothing says {word:?}: {texts:?}"
+            );
+        }
+    }
+
+    /// C5: the inspector's header counts tracks and notes from one, the
+    /// way its lanes are numbered on the ruler and the way anyone counts.
+    #[test]
+    fn the_inspector_header_counts_from_one() {
+        let mut state = view(48.0, Snap::default());
+        state.set_selected_event(Some((2, 1)));
+        let mut driver = Driver::with_state(wide_recipe(), state);
+        driver.frame(Vec::new());
+        assert!(
+            driver.paints("Track 3 \u{00B7} note 2"),
+            "the header is not 1-based: {:?}",
+            driver.texts()
+        );
+    }
+
+    /// C9: the genetics controls and the JSON box are off the front of the
+    /// editor and under More, the way #59 put the canvas's away.
+    #[test]
+    fn the_genetics_and_json_controls_live_under_more() {
+        let mut driver = Driver::new(wide_recipe());
+        driver.frame(Vec::new());
+        let labels = button_labels(&driver.out);
+        assert!(
+            labels.iter().any(|l| l == "More"),
+            "the timeline has no More menu: {labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|l| l.starts_with("Mutate")),
+            "Mutate recipe is still on the front row: {labels:?}"
+        );
+        assert!(
+            !driver.paints("Import / Export JSON"),
+            "the JSON fold is still on the front row"
+        );
+        driver.click("More");
+        let under = button_labels(&driver.out);
+        assert!(
+            under.iter().any(|l| l.starts_with("Mutate")),
+            "Mutate recipe is not under More either: {under:?}"
+        );
+    }
+
+    /// C4: the fit maths, at the sizes it is actually asked for.
+    ///
+    /// The gutter and the tail pad are not beats, so a fit that divided the
+    /// whole width by the beats would leave the last beat and the end
+    /// marker's label off the edge — the very thing the fit is for.
+    #[test]
+    fn the_fit_puts_every_beat_inside_the_width_it_is_given() {
+        // The seeded recipe in the host window's sequence slot: 40 beats of
+        // timeline (34 of sequence and the 4 spare beats, plus the held
+        // note's tail, rounded up) in a 900-point slot.
+        let ppb = fit_px_per_beat(900.0, 40.0);
+        assert!((ppb - (900.0 - GUTTER - TAIL_PAD) / 40.0).abs() < 1e-4);
+        // Every size where the fit is not up against the slider's floor: a
+        // sequence too long for MIN_PPB cannot fit and is scrolled instead,
+        // which the clamps below hold.
+        for (width, beats) in [(900.0, 40.0), (480.0, 40.0), (240.0, 8.0), (1836.0, 200.0)] {
+            let ppb = fit_px_per_beat(width, beats);
+            let drawn = GUTTER + beats * ppb + TAIL_PAD;
+            assert!(
+                drawn <= width + 1e-3,
+                "{beats} beats fitted to {width} points drew {drawn}"
+            );
+        }
+        // Held to the range the slider offers at both ends: a sequence too
+        // long to fit is scrolled, and a two-beat one is not magnified to
+        // the width of the panel.
+        assert_eq!(fit_px_per_beat(200.0, 4096.0), MIN_PPB);
+        assert_eq!(fit_px_per_beat(1836.0, 2.0), MAX_PPB);
+        // Nothing to divide by, and nothing to divide: no panic, no NaN.
+        assert!(fit_px_per_beat(0.0, 40.0).is_finite());
+        assert_eq!(fit_px_per_beat(-50.0, 40.0), MIN_PPB);
+        assert!(fit_px_per_beat(900.0, 0.0).is_finite());
+        assert!(fit_px_per_beat(900.0, -3.0).is_finite());
+    }
+
+    /// C4: a marker's label is inside the timeline wherever the marker is —
+    /// including at the very last beat, which is where the end marker
+    /// always is.
+    #[test]
+    fn a_marker_label_stays_inside_the_timeline_wherever_the_marker_is() {
+        let bounds = Rect::from_min_size(Pos2::new(30.0, 10.0), Vec2::new(400.0, 200.0));
+        let size = Vec2::new(52.0, 12.0);
+        for x in [-100.0, 30.0, 31.0, 200.0, 375.0, 380.0, 430.0, 900.0] {
+            let at = marker_label_rect(x, size, 24.0, bounds);
+            assert!(
+                bounds.contains_rect(at),
+                "a marker at {x} put its label at {at:?}, outside {bounds:?}"
+            );
+        }
+        // Right of the marker when there is room, left of it when there is
+        // not, so the label never covers the line it is about.
+        assert!(marker_label_rect(200.0, size, 24.0, bounds).left() > 200.0);
+        assert!(marker_label_rect(430.0, size, 24.0, bounds).right() < 430.0);
+        // A label wider than the timeline has nowhere to go and is clamped
+        // to the left edge rather than moved outside it.
+        let huge = marker_label_rect(200.0, Vec2::new(600.0, 12.0), 24.0, bounds);
+        assert_eq!(huge.left(), bounds.left() + LABEL_PAD);
+    }
+
+    /// C3: an instrument's colour is its own, the same every frame, and it
+    /// does not depend on which lane the notes are on or what order the
+    /// instruments are in.
+    /// The smallest gap between any two of `tints`, going round the hue
+    /// wheel whichever way is shorter.
+    fn closest_hues(tints: &[Color32]) -> f32 {
+        let hues: Vec<f32> = tints
+            .iter()
+            .map(|c| egui::ecolor::Hsva::from(*c).h)
+            .collect();
+        let mut closest = 1.0_f32;
+        for (i, a) in hues.iter().enumerate() {
+            for b in &hues[i + 1..] {
+                let d = (a - b).abs();
+                closest = closest.min(d.min(1.0 - d));
+            }
+        }
+        closest
+    }
+
+    #[test]
+    fn an_instruments_tint_follows_its_id_and_not_its_place() {
+        let style = distinct_style();
+        let names = ["bed", "gust", "pluck", "melody", "bass"];
+        let map = instrument_tints(names, &style);
+        let tints: Vec<Color32> = names.iter().map(|n| map[*n]).collect();
+        // Stable: the same recipe gives the same colours, asked again, and
+        // in any order.
+        assert_eq!(map, instrument_tints(names, &style));
+        let mut backwards = names;
+        backwards.reverse();
+        assert_eq!(map, instrument_tints(backwards, &style));
+        // Distinct, and distinct enough to tell apart. `gust` and `pluck`
+        // hash to within four degrees of each other, which is what made
+        // the seeded recipe's lanes one magenta in the picture that caught
+        // this — being different Color32s is not the bar.
+        let unique: HashSet<Color32> = tints.iter().copied().collect();
+        assert_eq!(unique.len(), names.len(), "two instruments share a tint");
+        let closest = closest_hues(&tints);
+        assert!(
+            closest >= 1.0 / HUE_BUCKETS as f32 - 1e-3,
+            "the two closest tints are {:.1} degrees apart",
+            closest * 360.0
+        );
+        // The control: their raw hashes are the collision this spreads.
+        let raw = [
+            instrument_tint("gust", &style),
+            instrument_tint("pluck", &style),
+        ];
+        assert_eq!(
+            closest_hues(&raw),
+            0.0,
+            "gust and pluck no longer ask for the same hue, so this test \
+             has stopped covering what it was written for"
+        );
+        // An id keeps the hue it asked for when nothing contests it.
+        assert_eq!(map["bed"], instrument_tint("bed", &style));
+        // More instruments than hues: they share rather than panic.
+        let many: Vec<String> = (0..HUE_BUCKETS + 4).map(|i| format!("inst{i}")).collect();
+        let crowd = instrument_tints(many.iter().map(String::as_str), &style);
+        assert_eq!(crowd.len(), many.len());
+
+        // And what the timeline paints for an id is the same whichever lane
+        // the note is on and whatever order the recipe lists it in.
+        let mut a = recipe_with(&["bed", "pluck"], 2);
+        a.tracks[0].events = vec![Event {
+            gate_beats: 8.0,
+            ..note("bed", 0.0)
+        }];
+        a.tracks[1].events = vec![Event {
+            gate_beats: 8.0,
+            ..note("pluck", 0.0)
+        }];
+        let mut b = recipe_with(&["pluck", "bed"], 2);
+        b.tracks[0].events = a.tracks[1].events.clone();
+        b.tracks[1].events = a.tracks[0].events.clone();
+
+        let painted = |recipe: SequenceRecipe| -> Vec<(String, Color32)> {
+            let driver = Driver::with_state(recipe, view(48.0, Snap::default()));
+            let mut found: Vec<(String, Color32)> = shapes(&driver.out)
+                .into_iter()
+                .filter_map(|s| match s {
+                    egui::Shape::Text(t) => {
+                        let name = t.galley.text().to_owned();
+                        let at = t.visual_bounding_rect();
+                        let block = block_under(&driver.out, &at)?;
+                        Some((name, block.fill))
+                    }
+                    _ => None,
+                })
+                .collect();
+            found.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.to_array().cmp(&b.1.to_array())));
+            found
+        };
+        let first = painted(a);
+        assert_eq!(
+            first,
+            painted(b),
+            "an instrument's notes changed colour when the lanes were swapped"
+        );
+        assert_eq!(first.len(), 2, "both notes were painted and labelled");
+        let map = instrument_tints(["bed", "pluck"], &style);
+        for (name, fill) in &first {
+            assert_eq!(*fill, map[name.as_str()], "{name}'s tint");
+        }
+    }
+
+    /// C3: every tint has the note fill's luminance, which is why one
+    /// contrast test covers all of them.
+    ///
+    /// Contrast is a function of luminance alone, so holding the luminance
+    /// makes `note_text` on any instrument's tint exactly as readable as
+    /// `note_text` on the style's own `note_fill` — the pair #58's test
+    /// already holds to AA. Rotating the hue at a fixed *value* instead
+    /// would not: a yellow and a blue of the same HSV value are four stops
+    /// of luminance apart.
+    #[test]
+    fn every_instrument_tint_reads_as_well_as_the_note_fill_it_came_from() {
+        for (theme, visuals) in [
+            ("dark", egui::Visuals::dark()),
+            ("light", egui::Visuals::light()),
+        ] {
+            let style = EditorStyle::from_visuals(&visuals);
+            let base = contrast_on(style.note_text, style.note_fill);
+            let ids = ["bed", "gust", "pluck", "melody", "bass", "", "inst1"];
+            let tints = instrument_tints(ids, &style);
+            for id in ids {
+                let tint = tints[id];
+                let ratio = contrast_on(style.note_text, tint);
+                assert!(
+                    (ratio - base).abs() < 0.25,
+                    "{theme}: {id:?} is {ratio:.2}:1 against the note fill's {base:.2}:1"
+                );
+                assert!(ratio >= AA, "{theme}: {id:?} is {ratio:.2}:1");
+                // A silent note is faint, and its name still reads on it.
+                let quiet = tint.gamma_multiply(volume_alpha(0.0));
+                let over_lane = contrast_on(style.note_text, style.lane.blend(quiet));
+                assert!(
+                    over_lane >= AA,
+                    "{theme}: {id:?} at volume 0 is {over_lane:.2}:1 on the lane"
+                );
+            }
+        }
+    }
+
+    /// C3: a lane's name is the instrument most of it plays, and a tie does
+    /// not depend on the order the events happen to be stored in.
+    #[test]
+    fn the_dominant_instrument_is_the_commonest_and_ties_break_on_time() {
+        let of = |events: Vec<Event>| {
+            let track = Track { events };
+            dominant_instrument(&track).map(|(id, n)| (id.to_owned(), n))
+        };
+        assert_eq!(of(Vec::new()), None, "an empty lane has no name");
+        assert_eq!(
+            of(vec![note("a", 0.0), note("b", 1.0), note("b", 2.0)]),
+            Some(("b".to_owned(), 2))
+        );
+        // A tie goes to whichever starts first, whichever order they are in.
+        assert_eq!(
+            of(vec![note("late", 8.0), note("early", 1.0)]),
+            Some(("early".to_owned(), 1))
+        );
+        assert_eq!(
+            of(vec![note("early", 1.0), note("late", 8.0)]),
+            Some(("early".to_owned(), 1))
+        );
+        // A tie on both counts and both times goes to the lower id, so it
+        // is an answer and not an accident.
+        assert_eq!(
+            of(vec![note("b", 1.0), note("a", 1.0)]),
+            Some(("a".to_owned(), 1))
+        );
+    }
+
+    /// C5: beats become a time anyone can hear, at the BPM in force.
+    #[test]
+    fn beats_are_written_as_a_time_at_the_recipes_bpm() {
+        assert_eq!(beats_as_time(34.0, 60.0), "34 s");
+        assert_eq!(beats_as_time(34.0, 120.0), "17 s");
+        assert_eq!(beats_as_time(34.0, 300.0), "6.8 s");
+        assert_eq!(beats_as_time(2.0, 60.0), "2.0 s");
+        assert_eq!(beats_as_time(0.25, 60.0), "0.2 s");
+        // Past a minute it is minutes and seconds, not "126 s".
+        assert_eq!(beats_as_time(126.0, 60.0), "2:06");
+        // A BPM of nothing is not a division by nothing.
+        assert_eq!(beats_as_time(34.0, 0.0), "0.0 s");
+    }
+
+    /// C3: a pitch is written the short way, and the native pitch — which
+    /// is every note's default — is not written at all.
+    #[test]
+    fn a_pitch_is_written_only_when_it_is_not_the_native_one() {
+        assert_eq!(pitch_label(1.0), None);
+        assert_eq!(pitch_label(1.001), None);
+        assert_eq!(pitch_label(1.5).as_deref(), Some("\u{00D7}1.5"));
+        assert_eq!(pitch_label(2.0).as_deref(), Some("\u{00D7}2"));
+        assert_eq!(pitch_label(0.75).as_deref(), Some("\u{00D7}0.75"));
+        // Two decimals, rounded the way Rust rounds them.
+        assert_eq!(pitch_label(1.125).as_deref(), Some("\u{00D7}1.12"));
+        assert_eq!(pitch_label(1.126).as_deref(), Some("\u{00D7}1.13"));
+    }
+
+    // ---- C6: adding, copying and moving notes --------------------------
+
+    /// A view state zoomed to `zoom` points a beat, on `snap`'s grid.
+    ///
+    /// Most of these tests set a zoom: at the fitted one a half-beat note is
+    /// a few points wide and holds no label, which is right for the picture
+    /// and useless for reading one back.
+    fn view(zoom: f32, snap: Snap) -> SequenceEditorState {
+        SequenceEditorState {
+            zoom: Some(zoom),
+            snap,
+            ..SequenceEditorState::default()
+        }
+    }
+
+    /// The `(track, event)` of every note whose block is picked, read off
+    /// the state rather than off a click count.
+    fn picked(driver: &Driver) -> Vec<(usize, usize)> {
+        let mut at: Vec<(usize, usize)> = driver.state.selected_events().collect();
+        at.sort_unstable();
+        at
+    }
+
+    /// Where every note on `track` starts.
+    fn starts(recipe: &SequenceRecipe, track: usize) -> Vec<f32> {
+        recipe.tracks[track]
+            .events
+            .iter()
+            .map(|e| e.time_beats)
+            .collect()
+    }
+
+    /// C6: a note added to a lane is one of that lane's instrument, not the
+    /// recipe's first — a note added to the bass lane used to arrive as a
+    /// `bed`, silent-looking in the wrong colour on the wrong row.
+    #[test]
+    fn a_note_added_to_a_lane_takes_that_lanes_instrument() {
+        let mut recipe = wide_recipe();
+        let mut state = view(48.0, Snap::Beat);
+        // The lane whose dominant instrument is not the recipe's first.
+        let track = 1;
+        assert_eq!(
+            dominant_instrument(&recipe.tracks[track]).map(|(id, _)| id),
+            Some("pluck")
+        );
+        let lane_names: Vec<Option<(String, usize)>> = recipe
+            .tracks
+            .iter()
+            .map(|t| dominant_instrument(t).map(|(id, n)| (id.to_owned(), n)))
+            .collect();
+        let res = apply_actions(
+            &mut recipe,
+            &mut state,
+            vec![Action::AddNote { track, beat: 7.4 }],
+            &lane_names,
+        );
+        assert!(res.changed && res.rebake, "adding a note commits: {res:?}");
+        let added = recipe.tracks[track].events.last().expect("the new note");
+        assert_eq!(added.instrument_id, "pluck");
+        assert_eq!(added.time_beats, 7.0, "and it lands on the grid");
+        assert_eq!(
+            state.selected_event,
+            Some((track, recipe.tracks[track].events.len() - 1)),
+            "the new note is the one the inspector opens on"
+        );
+
+        // An empty lane has no instrument of its own, so it falls back to
+        // the recipe's first rather than to no instrument at all, which
+        // would bake to silence.
+        let mut recipe = wide_recipe();
+        recipe.tracks.push(Track::default());
+        let empty = recipe.tracks.len() - 1;
+        let mut lane_names = lane_names.clone();
+        lane_names.push(None);
+        apply_actions(
+            &mut recipe,
+            &mut state,
+            vec![Action::AddNote {
+                track: empty,
+                beat: 0.0,
+            }],
+            &lane_names,
+        );
+        assert_eq!(recipe.tracks[empty].events[0].instrument_id, "bed");
+    }
+
+    /// C6: a duplicate copies every picked note, leaves the copies picked,
+    /// and is one step of the history.
+    #[test]
+    fn a_duplicate_copies_every_picked_note_and_leaves_the_copies_picked() {
+        let mut driver = Driver::with_state(wide_recipe(), view(48.0, Snap::default()));
+        let before = driver.recipe.clone();
+
+        driver.point_at_timeline();
+        driver.state.select_only((2, 0));
+        driver.state.select_also((2, 1));
+        driver.frame(Vec::new());
+        assert_eq!(picked(&driver), [(2, 0), (2, 1)]);
+
+        driver.frame(vec![chord(egui::Key::D, egui::Modifiers::COMMAND)]);
+        assert_eq!(
+            driver.recipe.tracks[2].events.len(),
+            before.tracks[2].events.len() + 2,
+            "two notes picked, two copies"
+        );
+        assert_eq!(
+            picked(&driver),
+            [(2, 3), (2, 4)],
+            "the copies are what a drag or a nudge now moves"
+        );
+        // A copy is the note it came from, in the same place: the drag it
+        // is about to be carried by decides where it goes.
+        for (copy, original) in [(3, 0), (4, 1)] {
+            assert_eq!(
+                driver.recipe.tracks[2].events[copy],
+                before.tracks[2].events[original]
+            );
+        }
+
+        // One undo takes the whole duplicate back.
+        assert!(driver.state.undo(&mut driver.recipe));
+        assert_eq!(driver.recipe, before);
+    }
+
+    /// C6: an arrow moves every picked note by the grid, and one undo takes
+    /// the whole nudge back.
+    #[test]
+    fn an_arrow_nudges_every_picked_note_by_the_grid() {
+        let mut driver = Driver::with_state(wide_recipe(), view(48.0, Snap::Beat));
+        let before = starts(&driver.recipe, 1);
+
+        driver.point_at_timeline();
+        driver.state.select_only((1, 0));
+        driver.state.select_also((1, 2));
+        driver.frame(Vec::new());
+
+        driver.frame(vec![key(egui::Key::ArrowRight)]);
+        let after = starts(&driver.recipe, 1);
+        assert_eq!(after[0], before[0] + 1.0);
+        assert_eq!(after[2], before[2] + 1.0);
+        assert_eq!(after[1], before[1], "a note nobody picked did not move");
+
+        // Shift is the fine step, an eighth of the grid.
+        driver.frame_held(
+            egui::Modifiers::SHIFT,
+            vec![chord(egui::Key::ArrowLeft, egui::Modifiers::SHIFT)],
+        );
+        let fine = starts(&driver.recipe, 1);
+        assert!((fine[0] - (after[0] - 0.125)).abs() < 1e-4, "{fine:?}");
+
+        // A note is never nudged before beat 0, where it cannot be baked.
+        driver.state.select_only((1, 0));
+        for _ in 0..40 {
+            driver.frame(vec![key(egui::Key::ArrowLeft)]);
+        }
+        assert_eq!(starts(&driver.recipe, 1)[0], 0.0);
+
+        // And every nudge was a step of its own on the one history.
+        assert!(driver.state.can_undo());
+        while driver.state.undo(&mut driver.recipe) {}
+        assert_eq!(starts(&driver.recipe, 1), before);
+    }
+
+    /// C6: the snap picker is what a drag lands on, division by division.
+    #[test]
+    fn the_snap_picker_is_the_grid_a_drag_lands_on() {
+        for snap in Snap::ALL {
+            let mut driver = Driver::with_state(wide_recipe(), view(48.0, snap));
+            driver.state.select_only((1, 0));
+            driver.frame(Vec::new());
+            // Put the note somewhere off every grid, and stop the drag.
+            driver.recipe.tracks[1].events[0].time_beats = 5.31;
+            driver.state.drag_mode = DragMode::Move;
+            driver.frame(Vec::new());
+            let at = driver.recipe.tracks[1].events[0].time_beats;
+            assert_eq!(at, 5.31, "{snap:?}: a note moved with no drag in progress");
+            assert_eq!(
+                snap_beat(at, snap),
+                match snap {
+                    Snap::Off => 5.31,
+                    Snap::Eighth => 5.25,
+                    Snap::Quarter => 5.25,
+                    Snap::Beat => 5.0,
+                    Snap::Bar => 4.0,
+                },
+                "{snap:?}"
+            );
+        }
+        // The picker offers exactly the divisions the maths knows.
+        let mut driver = Driver::with_state(wide_recipe(), view(48.0, Snap::Bar));
+        driver.frame(Vec::new());
+        assert!(driver.paints("bar"), "the picker shows the grid in force");
+        for snap in Snap::ALL {
+            driver.state.set_snap(snap);
+            driver.frame(Vec::new());
+            assert_eq!(driver.state.snap(), snap);
+            assert!(
+                driver.paints(snap.label()),
+                "the picker does not show {snap:?}"
+            );
+        }
+    }
+
+    /// C6: a box dragged out over the lanes picks the notes it covers, and
+    /// Escape lets them go one press at a time.
+    #[test]
+    fn a_box_dragged_over_the_lanes_picks_the_notes_it_covers() {
+        // A zoom that puts the three notes the box will cover inside the
+        // panel: the editor only takes the keyboard while it has the
+        // pointer, so a box dragged off the panel cannot then be Escaped.
+        let mut driver = Driver::with_state(wide_recipe(), view(24.0, Snap::default()));
+        driver.frame(Vec::new());
+
+        // The notes are where the timeline says they are, not where a
+        // second reckoning of the zoom and the scroll would put them.
+        let notes = driver.state.notes().to_vec();
+        assert!(!notes.is_empty(), "the timeline published no geometry");
+        let over = |track: usize, event: usize| {
+            notes
+                .iter()
+                .find(|n| n.track == track && n.event == event)
+                .map(|n| n.body)
+                .expect("the note was drawn")
+        };
+        let first = over(1, 0);
+        let third = over(1, 2);
+        let from = Pos2::new(first.left() - 2.0, first.top() - 1.0);
+        let to = Pos2::new(third.right() + 2.0, third.bottom() + 1.0);
+
+        driver.frame(vec![
+            egui::Event::PointerMoved(from),
+            egui::Event::PointerButton {
+                pos: from,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        driver.frame(vec![egui::Event::PointerMoved(to)]);
+        driver.frame(vec![egui::Event::PointerMoved(to)]);
+        assert!(
+            driver.state.marquee.is_some(),
+            "no box was dragged out: {:?}",
+            driver.state.marquee
+        );
+        assert_eq!(
+            picked(&driver),
+            [(1, 0), (1, 1), (1, 2)],
+            "the box picked what it covers"
+        );
+
+        driver.frame(vec![egui::Event::PointerButton {
+            pos: to,
+            button: egui::PointerButton::Primary,
+            pressed: false,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+        assert!(driver.state.marquee.is_none(), "the box stayed up");
+        assert_eq!(
+            picked(&driver),
+            [(1, 0), (1, 1), (1, 2)],
+            "and the notes stay picked"
+        );
+
+        // Escape spends one press per step: the selection, and nothing
+        // after it, so the host's Esc ladder keeps its rung.
+        let res = driver.frame(vec![key(egui::Key::Escape)]);
+        assert!(picked(&driver).is_empty());
+        assert!(
+            driver.state.took_escape(),
+            "the editor did not claim the Escape"
+        );
+        assert!(!res.changed, "clearing a selection is not an edit");
+        driver.frame(vec![key(egui::Key::Escape)]);
+        assert!(
+            !driver.state.took_escape(),
+            "a second Escape with nothing picked took a rung off the host's ladder"
+        );
+    }
+
+    /// C6: the inspector edits the last note picked and says how many are.
+    #[test]
+    fn the_inspector_edits_one_of_the_picked_notes_and_says_how_many_there_are() {
+        let mut driver = Driver::with_state(wide_recipe(), view(48.0, Snap::default()));
+        driver.state.select_only((2, 0));
+        driver.state.select_also((2, 2));
+        driver.frame(Vec::new());
+        assert_eq!(driver.state.selected_event(), Some((2, 2)));
+        assert!(
+            driver.paints("2 notes picked"),
+            "the inspector does not say how many: {:?}",
+            driver.texts()
+        );
+        assert!(
+            driver.paints("Track 3 \u{00B7} note 3"),
+            "and which one it edits"
+        );
+
+        // Delete takes all of them, highest index first so the removals do
+        // not move each other out from under themselves.
+        let before = driver.recipe.tracks[2].events.len();
+        driver.click("Delete 2 notes");
+        assert_eq!(driver.recipe.tracks[2].events.len(), before - 2);
+        assert_eq!(
+            driver.recipe.tracks[2].events[0].pitch_multiplier, 1.25,
+            "the note between them is the one left"
+        );
+        assert!(picked(&driver).is_empty());
+    }
+
+    /// A shift-click adds a note to the picked set and takes it out again.
+    #[test]
+    fn a_shift_click_adds_a_note_to_the_selection_and_takes_it_out_again() {
+        let mut driver = Driver::with_state(wide_recipe(), view(48.0, Snap::default()));
+        driver.state.select_only((0, 0));
+        driver.state.select_also((1, 0));
+        assert_eq!(picked(&driver), [(0, 0), (1, 0)]);
+        driver.state.select_also((1, 0));
+        assert_eq!(picked(&driver), [(0, 0)]);
+        assert_eq!(
+            driver.state.selected_event(),
+            Some((0, 0)),
+            "the inspector moved to what is left, not to nothing"
+        );
+        // And a plain click is only ever the one note.
+        driver.state.select_only((1, 1));
+        assert_eq!(picked(&driver), [(1, 1)]);
+    }
+
+    /// A removal moves the indices after it down, so a selection kept
+    /// across one is pruned rather than left meaning different notes.
+    #[test]
+    fn a_selection_never_outlives_the_notes_it_names() {
+        let mut driver = Driver::with_state(wide_recipe(), view(48.0, Snap::default()));
+        driver.state.select_only((1, 5));
+        driver.state.select_also((1, 4));
+        driver.recipe.tracks[1].events.truncate(2);
+        driver.frame(Vec::new());
+        assert!(
+            picked(&driver).is_empty(),
+            "notes that are gone are still picked: {:?}",
+            picked(&driver)
+        );
+        assert_eq!(driver.state.selected_event(), None);
+
+        // A track that goes altogether takes its notes' selection with it.
+        driver.state.select_only((2, 0));
+        driver.recipe.tracks.truncate(2);
+        driver.frame(Vec::new());
+        assert!(picked(&driver).is_empty());
+    }
+
+    /// C6: a drag carries every picked note, and Alt makes it carry copies
+    /// and leave the originals where they were.
+    ///
+    /// Driven through the real pointer, because the mechanism is egui's:
+    /// a drag belongs to the id of the widget the press landed on, and an
+    /// Alt-drag's copies have ids nothing has pressed — so the drag has to
+    /// keep reading the original's response and carry the copies by its
+    /// delta, which is what `drag_anchor` is for.
+    #[test]
+    fn a_drag_carries_every_picked_note_and_alt_carries_copies_instead() {
+        for alt in [false, true] {
+            let mut driver = Driver::with_state(wide_recipe(), view(24.0, Snap::Beat));
+            driver.frame(Vec::new());
+            let before = starts(&driver.recipe, 1);
+            let held = if alt {
+                egui::Modifiers::ALT
+            } else {
+                egui::Modifiers::NONE
+            };
+
+            // Pick two of the six plucks, and press the first of them well
+            // clear of its right edge so the drag moves rather than resizes.
+            driver.state.select_only((1, 0));
+            driver.state.select_also((1, 2));
+            driver.frame(Vec::new());
+            let body = driver
+                .state
+                .notes()
+                .iter()
+                .find(|n| (n.track, n.event) == (1, 0))
+                .map(|n| n.body)
+                .expect("the note was drawn");
+            let from = Pos2::new(body.left() + 2.0, body.center().y);
+            let to = Pos2::new(from.x + 2.0 * 24.0, from.y);
+
+            driver.frame_held(held, vec![egui::Event::PointerMoved(from)]);
+            driver.frame_held(
+                held,
+                vec![egui::Event::PointerButton {
+                    pos: from,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: held,
+                }],
+            );
+            driver.frame_held(held, vec![egui::Event::PointerMoved(to)]);
+            driver.frame_held(held, vec![egui::Event::PointerMoved(to)]);
+            driver.frame_held(
+                held,
+                vec![egui::Event::PointerButton {
+                    pos: to,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: held,
+                }],
+            );
+            driver.frame(Vec::new());
+
+            let after = starts(&driver.recipe, 1);
+            if alt {
+                assert_eq!(
+                    after.len(),
+                    before.len() + 2,
+                    "an Alt-drag left no copies: {after:?}"
+                );
+                assert_eq!(
+                    &after[..before.len()],
+                    &before[..],
+                    "an Alt-drag moved the originals"
+                );
+                assert_eq!(
+                    &after[before.len()..],
+                    &[before[0] + 2.0, before[2] + 2.0],
+                    "the copies did not follow the drag"
+                );
+                assert_eq!(
+                    picked(&driver),
+                    [(1, 6), (1, 7)],
+                    "the copies are what is picked at the end"
+                );
+            } else {
+                assert_eq!(after.len(), before.len(), "a plain drag copied something");
+                assert_eq!(after[0], before[0] + 2.0, "the note under the pointer");
+                assert_eq!(after[2], before[2] + 2.0, "and the other picked one");
+                assert_eq!(after[1], before[1], "a note nobody picked did not move");
+            }
+            // Either way it is one step of the history.
+            assert!(driver.state.undo(&mut driver.recipe));
+            assert_eq!(starts(&driver.recipe, 1), before, "alt={alt}");
+        }
+    }
+
+    /// C6: a right-click on a track opens its menu at the beat pressed, and
+    /// the note it adds is of that track's instrument.
+    ///
+    /// The menu is where the add control lives because nothing that acts on
+    /// a press may be drawn where that press lands: 7b's remove cross at a
+    /// wire's midpoint took the click that was picking the wire, and a
+    /// floating add button on a lane would take the click that picks a note
+    /// (crate #67, third coordinate fact).
+    #[test]
+    fn a_right_click_on_a_track_offers_a_note_of_that_tracks_instrument() {
+        let mut driver = Driver::with_state(wide_recipe(), view(24.0, Snap::Beat));
+        driver.frame(Vec::new());
+
+        // Clear ground on track 1, between two plucks.
+        let tl = driver.state.timeline_rect();
+        let at = Pos2::new(
+            tl.left() + GUTTER + 4.2 * 24.0,
+            tl.top() + RULER_H + 1.5 * LANE_H,
+        );
+        driver.frame(vec![egui::Event::PointerMoved(at)]);
+        for pressed in [true, false] {
+            driver.frame(vec![egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Secondary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            }]);
+        }
+        // The menu is an Area of its own, so it is painted the frame after
+        // the click that opened it.
+        driver.frame(Vec::new());
+        assert!(
+            driver.paints("Add a pluck note here"),
+            "no track menu opened at the pointer: {:?}",
+            driver.texts()
+        );
+        assert!(driver.paints("Track 2"), "and it says which track it is");
+
+        // Into the menu, as anyone choosing from it has to: the lane is no
+        // longer under the pointer there, which is what greyed the item out
+        // until the beat was remembered instead of re-read.
+        driver.frame(vec![egui::Event::PointerMoved(at + Vec2::new(14.0, 18.0))]);
+        let enabled = driver
+            .nodes()
+            .any(|(_, n)| n.label() == Some("Add a pluck note here") && !n.is_disabled());
+        assert!(
+            enabled,
+            "the menu item greyed out once the pointer reached it"
+        );
+
+        let before = driver.recipe.tracks[1].events.len();
+        driver.click("Add a pluck note");
+        driver.frame(Vec::new());
+        assert_eq!(driver.recipe.tracks[1].events.len(), before + 1);
+        let added = driver.recipe.tracks[1].events.last().expect("the new note");
+        assert_eq!(added.instrument_id, "pluck");
+        assert_eq!(added.time_beats, 4.0, "on the grid the picker is set to");
+    }
+
+    /// The timeline hands out the geometry it painted, which is what a host
+    /// overlay and a scripted harness press against.
+    #[test]
+    fn the_timeline_publishes_the_geometry_it_painted() {
+        let mut driver = Driver::with_state(wide_recipe(), view(48.0, Snap::default()));
+        driver.frame(Vec::new());
+
+        let tl = driver.state.timeline_rect();
+        assert!(tl.is_positive(), "the timeline published no rect");
+        let notes = driver.state.notes();
+        assert_eq!(
+            notes.len(),
+            driver
+                .recipe
+                .tracks
+                .iter()
+                .map(|t| t.events.len())
+                .sum::<usize>(),
+            "one rect per note"
+        );
+        for note in notes {
+            assert!(
+                tl.contains_rect(note.body.intersect(tl)),
+                "note {:?} is not on the timeline",
+                (note.track, note.event)
+            );
+            let event = &driver.recipe.tracks[note.track].events[note.event];
+            let want = tl.left() + GUTTER + event.time_beats * 48.0;
+            assert!(
+                (note.body.left() - want).abs() < 0.01,
+                "note {:?} at beat {} was published at {}, not {want}",
+                (note.track, note.event),
+                event.time_beats,
+                note.body.left()
+            );
+            assert!(
+                note.extent.contains_rect(note.body),
+                "a note's extent does not contain its block"
+            );
+        }
+        // Empty before it has been drawn, so nobody reads a stale rect.
+        let fresh = SequenceEditorState::default();
+        assert_eq!(fresh.timeline_rect(), Rect::NOTHING);
+        assert!(fresh.notes().is_empty());
     }
 }

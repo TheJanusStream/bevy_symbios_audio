@@ -99,6 +99,19 @@
 //! context menu on node #0's grip, each held open for the picture:
 //!   cargo run --example host_window --features egui -- --menu add --shot menu.png
 //!
+//! `--notes <what>` drives the sequence slot's timeline: `picked` picks two
+//! notes on one track, so the picture shows their outlines and the
+//! inspector's count; `box` holds a marquee out over three of them; `snap`
+//! opens the snap picker; and `track` opens a track's own menu at a beat on
+//! a clear stretch of it. Each finds its notes through
+//! [`SequenceEditorState::notes`], the geometry the timeline publishes,
+//! rather than through the AccessKit tree, where a painted block has no
+//! bounds of its own:
+//!   cargo run --example host_window --features egui -- --notes picked --shot picked.png
+//!   cargo run --example host_window --features egui -- --notes box --shot box.png
+//!   cargo run --example host_window --features egui -- --notes snap --shot snap.png
+//!   cargo run --example host_window --features egui -- --notes track --shot track.png
+//!
 //! # Why a scripted gesture waits
 //!
 //! Every one of those presses where a widget *is*, and for the opening
@@ -213,10 +226,17 @@ fn main() -> AppExit {
         .init_resource::<Dragger>()
         .init_resource::<Hoverer>()
         .init_resource::<Menuer>()
+        .init_resource::<Noter>()
         .add_systems(Startup, setup_camera)
         .add_systems(
             PreUpdate,
-            (type_the_rename, drag_a_wire, hover_a_wire, open_a_menu)
+            (
+                type_the_rename,
+                drag_a_wire,
+                hover_a_wire,
+                open_a_menu,
+                work_the_timeline,
+            )
                 .after(EguiPreUpdateSet::ProcessInput)
                 .before(EguiPreUpdateSet::BeginPass),
         )
@@ -247,6 +267,7 @@ struct Args {
     pick: bool,
     unheard: bool,
     menu: Option<Menu>,
+    notes: Option<Notes>,
     broken: bool,
     status: Option<Status>,
     shot: Option<String>,
@@ -268,6 +289,34 @@ impl Menu {
             "node" => Self::Node,
             other => {
                 eprintln!("--menu {other}: expected add or node");
+                std::process::exit(2);
+            }
+        }
+    }
+}
+
+/// What `--notes` does to the sequence slot's timeline.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Notes {
+    /// Pick two notes on one track with a click and a shift-click.
+    Picked,
+    /// Hold a marquee out over three of them.
+    Box,
+    /// Open the toolbar's snap picker.
+    Snap,
+    /// Open a track's own menu at a beat on a clear stretch of it.
+    Track,
+}
+
+impl Notes {
+    fn parse(name: &str) -> Self {
+        match name {
+            "picked" => Self::Picked,
+            "box" => Self::Box,
+            "snap" => Self::Snap,
+            "track" => Self::Track,
+            other => {
+                eprintln!("--notes {other}: expected picked, box, snap or track");
                 std::process::exit(2);
             }
         }
@@ -326,6 +375,7 @@ impl Args {
             pick: args.iter().any(|a| a == "--pick"),
             unheard: args.iter().any(|a| a == "--unheard"),
             menu: value("--menu", "add").as_deref().map(Menu::parse),
+            notes: value("--notes", "picked").as_deref().map(Notes::parse),
             broken: args.iter().any(|a| a == "--broken") || status == Some(Status::Error),
             status,
             shot,
@@ -336,7 +386,11 @@ impl Args {
     /// find their widgets in the AccessKit tree, which is off unless one
     /// does.
     fn scripted(&self) -> bool {
-        self.rename.is_some() || self.drag || self.wire || self.menu.is_some()
+        self.rename.is_some()
+            || self.drag
+            || self.wire
+            || self.menu.is_some()
+            || self.notes.is_some()
     }
 
     /// Whether the gesture this run asked for is in place, so `--shot` can
@@ -346,6 +400,7 @@ impl Args {
         (!self.drag || matches!(*gestures.dragger, Dragger::Holding(_)))
             && (!self.wire || matches!(*gestures.hoverer, Hoverer::Parked(_)))
             && (self.menu.is_none() || matches!(*gestures.menuer, Menuer::Open(_)))
+            && (self.notes.is_none() || matches!(*gestures.noter, Noter::Done(_)))
     }
 }
 
@@ -356,6 +411,7 @@ struct Gestures<'w> {
     dragger: Res<'w, Dragger>,
     hoverer: Res<'w, Hoverer>,
     menuer: Res<'w, Menuer>,
+    noter: Res<'w, Noter>,
 }
 
 /// The toolbar button that adds a node, by the label it wears: the harness
@@ -1193,6 +1249,228 @@ fn open_a_menu(
             *menuer = Menuer::Open(park);
         }
         Menuer::Open(park) => input.0.events.push(egui::Event::PointerMoved(park)),
+    }
+}
+
+/// Which track `--notes picked` and `--notes box` work on.
+///
+/// The seeded recipe's `bass` track: four notes of seven and a half beats
+/// each, so at the zoom the timeline opens at they are the only blocks wide
+/// enough to see an outline on, let alone a label.
+const NOTES_TRACK: usize = 4;
+/// Which track `--notes track` opens its menu on: the `pluck` track, whose
+/// notes are a quarter beat each and whose gaps are four, so there is a
+/// clear stretch to right-click that no block is under.
+const MENU_TRACK: usize = 2;
+
+/// Where `--notes` is: looking for its notes, in the middle of its gesture,
+/// or done and holding whatever it opened.
+#[derive(Resource, Default)]
+enum Noter {
+    #[default]
+    Finding,
+    /// Clicked the first note; the shift-click at this point comes next.
+    Clicked(egui::Pos2),
+    /// Pressed at the first point; the drag to the second comes next.
+    Pressed(egui::Pos2, egui::Pos2, u32),
+    /// Clicked what opens a menu; the pointer moves into it next.
+    Opened(egui::Pos2),
+    /// In place, with the pointer parked where it has to stay.
+    Done(egui::Pos2),
+}
+
+/// `--notes`: drive the sequence slot's timeline into the state a picture
+/// wants — notes picked, a box held out over them, the snap picker open, or
+/// a track's own menu open.
+///
+/// The notes come from [`SequenceEditorState::notes`], which is the
+/// timeline's own record of what it painted. The AccessKit tree cannot
+/// answer this: a note block is painted and interacted, not laid out, so
+/// the tree has no bounds for one, and working the rects out again from the
+/// zoom, the gutter and the scroll offset would be a second answer waiting
+/// to disagree with the first (crate #67).
+///
+/// Like every gesture here it waits for [`layout_is_final`] and then for its
+/// own points to hold still, because the audition starting grows the strip
+/// above it and moves everything below by the height of a waveform.
+fn work_the_timeline(
+    args: Res<Args>,
+    editor: Res<Editor>,
+    monitor: Res<AudioMonitor>,
+    mut noter: ResMut<Noter>,
+    mut settle: Local<Settle>,
+    mut contexts: Query<(&mut EguiInput, &EguiOutput), With<PrimaryEguiContext>>,
+) {
+    let Some(what) = args.notes else {
+        return;
+    };
+    let Ok((mut input, output)) = contexts.single_mut() else {
+        return;
+    };
+    match *noter {
+        Noter::Done(at) => {
+            input.0.events.push(egui::Event::PointerMoved(at));
+            return;
+        }
+        // A shift-click adds the second note to the picked set. The
+        // modifier goes on the frame's raw input as well as on the event:
+        // egui reads a chord from the event and `modifiers.shift` from the
+        // frame, and the editor needs the first.
+        Noter::Clicked(second) => {
+            input.0.modifiers = egui::Modifiers::SHIFT;
+            input.0.events.push(egui::Event::PointerMoved(second));
+            input.0.events.push(egui::Event::PointerButton {
+                pos: second,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::SHIFT,
+            });
+            input.0.events.push(egui::Event::PointerButton {
+                pos: second,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::SHIFT,
+            });
+            info!("--notes picked: shift-clicking the second note at {second:?}");
+            *noter = Noter::Done(second);
+            return;
+        }
+        // The box is held *down*: a marquee is gone the moment the button
+        // comes up, so the press stays down for the picture and the
+        // pointer is put back at the far corner every frame.
+        Noter::Pressed(from, to, held) => {
+            input.0.events.push(egui::Event::PointerMoved(to));
+            if held == 0 {
+                info!("--notes box: dragging from {from:?} to {to:?}");
+            }
+            *noter = if held >= DRAG_FRAMES {
+                Noter::Done(to)
+            } else {
+                Noter::Pressed(from, to, held + 1)
+            };
+            return;
+        }
+        Noter::Opened(at) => {
+            let park = at + MENU_PARK;
+            input.0.events.push(egui::Event::PointerMoved(park));
+            info!("--notes {what:?}: holding the menu open at {park:?}");
+            *noter = Noter::Done(park);
+            return;
+        }
+        Noter::Finding => {}
+    }
+
+    let Some(window) = editor.shown[1] else {
+        return;
+    };
+    if !layout_is_final(&args, &editor, &monitor) {
+        return;
+    }
+
+    match what {
+        Notes::Picked | Notes::Box => {
+            let state = &editor.sequence_state;
+            let at = |event: usize| {
+                state
+                    .notes()
+                    .iter()
+                    .find(|n| n.track == NOTES_TRACK && n.event == event)
+                    .map(|n| n.body)
+            };
+            // Well clear of a block's right edge, which is its resize grip.
+            let inside = |body: egui::Rect| egui::pos2(body.left() + 2.0, body.center().y);
+            let (Some(first), Some(last)) = (at(0), at(2)) else {
+                return;
+            };
+            if !window.contains(first.center()) || !window.contains(last.center()) {
+                warn!("--notes: the notes are not inside the sequence slot");
+                return;
+            }
+            let (from, to) = if what == Notes::Box {
+                // A corner outside the three blocks, so the box is drawn
+                // round them rather than starting on one of them — a press
+                // on a block is a move, not a marquee.
+                (
+                    egui::pos2(first.left() - 6.0, first.top() - 3.0),
+                    egui::pos2(last.right() + 6.0, last.bottom() + 3.0),
+                )
+            } else {
+                (inside(first), inside(at(1).unwrap_or(last)))
+            };
+            let Some(points) = settle.settled(vec![from, to]) else {
+                return;
+            };
+            let (from, to) = (points[0], points[1]);
+            if what == Notes::Box {
+                press_at(&mut input, from, egui::PointerButton::Primary);
+                *noter = Noter::Pressed(from, to, 0);
+            } else {
+                info!("--notes picked: clicking the first note at {from:?}");
+                press_at(&mut input, from, egui::PointerButton::Primary);
+                release_at(&mut input, from, egui::PointerButton::Primary);
+                *noter = Noter::Clicked(to);
+            }
+        }
+        Notes::Snap => {
+            // By the grid it shows, not by being a combo box: the slot has
+            // a Sample rate combo too, and picking "the leftmost combo in
+            // the window" opened that one instead.
+            let showing = editor.sequence_state.snap().label();
+            // A combo box reports its selected text as its *value*, not as
+            // its label — egui's `WidgetInfo::current_text_value` — so
+            // asking for the label found nothing and the gesture timed out.
+            let Some(rect) = in_the_patch_window(output, window, "the snap picker", &|n| {
+                n.role() == accesskit::Role::ComboBox
+                    && (n.value() == Some(showing) || n.label() == Some(showing))
+            }) else {
+                return;
+            };
+            let Some(points) = settle.settled(vec![rect.center()]) else {
+                return;
+            };
+            info!(
+                "--notes snap: opening the {showing} picker at {:?}",
+                points[0]
+            );
+            press_at(&mut input, points[0], egui::PointerButton::Primary);
+            release_at(&mut input, points[0], egui::PointerButton::Primary);
+            *noter = Noter::Opened(points[0]);
+        }
+        Notes::Track => {
+            // Halfway between the tail of one note and the start of the
+            // next: clear ground on the track, found from the rects the
+            // timeline published rather than from a beat and a gutter
+            // width this example would have to know.
+            let on = |event: usize| {
+                editor
+                    .sequence_state
+                    .notes()
+                    .iter()
+                    .find(|n| n.track == MENU_TRACK && n.event == event)
+                    .copied()
+            };
+            let (Some(first), Some(second)) = (on(0), on(1)) else {
+                return;
+            };
+            let at = egui::pos2(
+                0.5 * (first.extent.right() + second.body.left()),
+                first.body.center().y,
+            );
+            if !window.contains(at) {
+                warn!("--notes track: the gap between the first two notes is off the slot");
+                return;
+            }
+            let Some(points) = settle.settled(vec![at]) else {
+                return;
+            };
+            info!(
+                "--notes track: right-clicking clear ground at {:?}",
+                points[0]
+            );
+            press_at(&mut input, points[0], egui::PointerButton::Secondary);
+            release_at(&mut input, points[0], egui::PointerButton::Secondary);
+            *noter = Noter::Opened(points[0]);
+        }
     }
 }
 
