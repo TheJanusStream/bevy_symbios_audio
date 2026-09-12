@@ -48,6 +48,7 @@ use crate::patch::AudioPatch;
 use crate::sequence::{Event, Instrument, PitchMode, SequenceRecipe, Track};
 
 use super::evolve::fresh_rng;
+use super::history::EditHistory;
 use super::io::json_io;
 use super::style::{EditorStyle, editor_style};
 use super::{
@@ -96,6 +97,15 @@ pub struct SequenceEditorState {
     /// Names being typed into instrument rows, keyed by row. The recipe is
     /// renamed only when one is committed; see [`NameEdit`].
     name_edits: HashMap<usize, NameEdit>,
+    /// Undo/redo over the whole recipe (#60). An instrument's patch is part
+    /// of the recipe, so this is the *only* history in the sequence editor:
+    /// the embedded canvas's own is turned off in
+    /// [`active_instrument_canvas`].
+    history: EditHistory<SequenceRecipe>,
+    /// The sequence editor took this frame's keyboard.
+    owns_keys: bool,
+    /// It acted on an Escape this frame.
+    took_escape: bool,
 }
 
 impl Default for SequenceEditorState {
@@ -109,6 +119,9 @@ impl Default for SequenceEditorState {
             mutate_rate: 0.3,
             json: JsonIoState::default(),
             name_edits: HashMap::new(),
+            history: EditHistory::default(),
+            owns_keys: false,
+            took_escape: false,
         }
     }
 }
@@ -338,6 +351,53 @@ fn unique_instrument_id(recipe: &SequenceRecipe) -> String {
     }
 }
 
+impl SequenceEditorState {
+    /// Step the recipe back to before the last committed edit. `true` if
+    /// anything moved.
+    ///
+    /// There is one history for the whole recipe, an open instrument's
+    /// patch included: the patch is part of the recipe, so an edit made in
+    /// the embedded canvas is a step on this stack and not on that canvas's
+    /// (#60, Overlands #1333).
+    pub fn undo(&mut self, recipe: &mut SequenceRecipe) -> bool {
+        self.history.undo(recipe)
+    }
+
+    /// Step the recipe forward again after an [`Self::undo`].
+    pub fn redo(&mut self, recipe: &mut SequenceRecipe) -> bool {
+        self.history.redo(recipe)
+    }
+
+    /// Whether there is a committed edit to undo.
+    pub fn can_undo(&self) -> bool {
+        self.history.can_undo()
+    }
+
+    /// Whether there is an undone edit to redo.
+    pub fn can_redo(&self) -> bool {
+        self.history.can_redo()
+    }
+
+    /// Tell the editor its recipe was replaced from outside, so the swap
+    /// becomes a step in its history. See
+    /// [`crate::ui::PatchEditorState::note_external_change`].
+    pub fn note_external_change(&mut self, recipe: &SequenceRecipe) {
+        self.history.commit(recipe);
+    }
+
+    /// Whether the sequence editor took this frame's keyboard. See
+    /// [`crate::ui::PatchEditorState::wants_keyboard`].
+    pub fn wants_keyboard(&self) -> bool {
+        self.owns_keys
+    }
+
+    /// Whether it acted on an Escape this frame by clearing its selection.
+    /// See [`crate::ui::PatchEditorState::took_escape`].
+    pub fn took_escape(&self) -> bool {
+        self.took_escape
+    }
+}
+
 /// Edit a whole [`SequenceRecipe`]: transport, instruments, the track/event
 /// timeline, and the selected-event inspector.
 ///
@@ -352,6 +412,7 @@ pub fn sequence_recipe_editor(
 ) -> EditorResponse {
     let mut res = EditorResponse::NONE;
     let style = editor_style(ui);
+    state.history.begin(recipe);
 
     egui::CollapsingHeader::new("Transport")
         .default_open(true)
@@ -384,6 +445,55 @@ pub fn sequence_recipe_editor(
             res.merge(event_inspector(ui, recipe, state, &style))
         });
 
+    res.merge(recipe_keys(ui, recipe, state, ui.min_rect()));
+    if res.rebake {
+        state.history.commit(recipe);
+    }
+    res
+}
+
+/// The sequence editor's keyboard: undo and redo over the whole recipe, and
+/// Escape to clear the selected event.
+///
+/// The same ownership rule as the canvas's — the pointer over the editor,
+/// nothing holding text focus — so typing an instrument's name keeps its
+/// own keys. The *canvas* half of the sequence editor reads its keys
+/// through this too, via [`active_instrument_canvas`]: one recipe, one
+/// history, one place the keys land.
+fn recipe_keys(
+    ui: &mut egui::Ui,
+    recipe: &mut SequenceRecipe,
+    state: &mut SequenceEditorState,
+    region: egui::Rect,
+) -> EditorResponse {
+    use egui::{Key, Modifiers};
+
+    let mut res = EditorResponse::NONE;
+    state.took_escape = false;
+    let typing = ui.memory(|m| m.focused()).is_some();
+    state.owns_keys = !typing && ui.rect_contains_pointer(region);
+    if !state.owns_keys {
+        return res;
+    }
+    // Most specific first: `consume_key` ignores extra Shift, so Ctrl+Z
+    // would swallow Ctrl+Shift+Z the other way round.
+    let (redo, undo, escape) = ui.input_mut(|i| {
+        (
+            i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z)
+                | i.consume_key(Modifiers::COMMAND, Key::Y),
+            i.consume_key(Modifiers::COMMAND, Key::Z),
+            i.consume_key(Modifiers::NONE, Key::Escape),
+        )
+    });
+    if redo {
+        res.rebake = state.history.redo(recipe);
+    } else if undo {
+        res.rebake = state.history.undo(recipe);
+    }
+    res.changed = res.rebake;
+    if escape && state.selected_event.take().is_some() {
+        state.took_escape = true;
+    }
     res
 }
 
@@ -418,13 +528,26 @@ pub fn active_instrument_canvas(
     };
     let inst_id = recipe.instruments[i].id.clone();
     ui.label(format!("Patch for instrument \u{201C}{inst_id}\u{201D}"));
+    state.history.begin(recipe);
     let canvas_state = state.canvas_states.entry(inst_id).or_default();
-    audio_patch_canvas(
+    // This patch is part of the recipe, so the recipe's history owns it.
+    // With both on, one Ctrl+Z would walk two stacks at once and the
+    // recipe's would go stale (#60, Overlands #1333).
+    canvas_state.disable_history();
+    let mut res = audio_patch_canvas(
         ui,
         &mut recipe.instruments[i].patch,
         canvas_state,
         id.with("inst_canvas"),
-    )
+    );
+    // The canvas's own keys are its own (delete, duplicate, nudge, fit);
+    // undo and redo are the recipe's, and reach it from here.
+    let region = ui.min_rect();
+    res.merge(recipe_keys(ui, recipe, state, region));
+    if res.rebake {
+        state.history.commit(recipe);
+    }
+    res
 }
 
 // ---------------------------------------------------------------------------
@@ -2017,5 +2140,72 @@ mod tests {
             Vec::<String>::new(),
             "buttons labelled with a glyph where the vocabulary says a word"
         );
+    }
+
+    // ---- step 7a (#60, Overlands #1333): one history per recipe ---------
+
+    /// An instrument's patch lives inside the recipe, so an edit to it in
+    /// the embedded canvas is an edit to the recipe — and the recipe's
+    /// history is the one that takes the step. Were the canvas's own
+    /// history on as well, one Ctrl+Z would walk two stacks at once.
+    #[test]
+    fn the_sequence_editor_has_exactly_one_history() {
+        let state = SequenceEditorState {
+            active_instrument: Some(0),
+            ..Default::default()
+        };
+        let mut driver = Driver::with_state(two_instrument_recipe(), state);
+        let before = driver.recipe.clone();
+        assert!(!driver.state.can_undo(), "nothing edited yet");
+
+        // Add a node to the open instrument's patch, through its canvas.
+        driver.click("Add node");
+        assert_ne!(driver.recipe, before, "the canvas edited the recipe");
+
+        // The embedded canvas keeps no history of its own.
+        let canvas = driver
+            .state
+            .canvas_states
+            .values()
+            .next()
+            .expect("the open instrument has a canvas state");
+        assert!(
+            !canvas.history_is_enabled(),
+            "the embedded patch canvas is keeping a second history of the recipe"
+        );
+        assert!(!canvas.can_undo(), "and it offers no undo of its own");
+
+        // The recipe's history has it, and one undo takes it all back.
+        assert!(driver.state.can_undo());
+        assert!(driver.state.undo(&mut driver.recipe));
+        assert_eq!(driver.recipe, before);
+        assert!(driver.state.redo(&mut driver.recipe));
+        assert_ne!(driver.recipe, before);
+    }
+
+    /// An edit made in the recipe's own widgets goes on the same one
+    /// history as an edit made in the embedded canvas.
+    #[test]
+    fn the_recipes_own_edits_and_its_patches_share_the_one_history() {
+        let state = SequenceEditorState {
+            active_instrument: Some(0),
+            ..Default::default()
+        };
+        let mut driver = Driver::with_state(two_instrument_recipe(), state);
+        let start = driver.recipe.clone();
+
+        driver.click("Add track");
+        let after_track = driver.recipe.clone();
+        assert_ne!(after_track, start);
+
+        driver.click("Add node");
+        let after_node = driver.recipe.clone();
+        assert_ne!(after_node, after_track);
+
+        assert!(driver.state.undo(&mut driver.recipe));
+        assert_eq!(driver.recipe, after_track, "the node edit came off first");
+        assert!(driver.state.undo(&mut driver.recipe));
+        assert_eq!(driver.recipe, start, "then the track edit");
+        assert!(!driver.state.can_undo());
     }
 }

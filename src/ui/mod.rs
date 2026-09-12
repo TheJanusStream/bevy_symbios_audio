@@ -76,6 +76,7 @@ use bevy_egui::egui;
 pub mod audition;
 pub mod evolve;
 pub mod graph;
+mod history;
 pub mod io;
 pub mod node;
 pub mod preview;

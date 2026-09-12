@@ -88,6 +88,7 @@ use crate::patch::{AudioPatch, Connection, GraphError, GraphNode, NodeGraph, Nod
 
 use super::EditorResponse;
 use super::evolve::{fresh_rng, mutate_node_kind, mutate_patch, randomize_seed};
+use super::history::EditHistory;
 use super::io::json_io;
 use super::node::{node_kind_body, node_kind_label, node_kind_picker};
 use super::style::{EditorStyle, editor_style};
@@ -140,6 +141,13 @@ pub struct PatchEditorState {
     relayout: bool,
     /// Whether the JSON box is open, from the toolbar's More menu.
     show_json: bool,
+    /// Undo/redo over the patch (#60). Off in the sequence editor's
+    /// embedded canvas, where the recipe's history owns the value.
+    history: EditHistory<AudioPatch>,
+    /// The canvas took this frame's keyboard.
+    owns_keys: bool,
+    /// The canvas acted on an Escape this frame — it cleared a selection.
+    took_escape: bool,
     /// The [`egui::Scene`] view rectangle — pan and zoom live here.
     scene_rect: Rect,
     /// Selected node (delete target + highlight).
@@ -169,6 +177,9 @@ impl Default for PatchEditorState {
             selected: None,
             mutate_rate: 0.3,
             json: super::JsonIoState::default(),
+            history: EditHistory::default(),
+            owns_keys: false,
+            took_escape: false,
             ports: Vec::new(),
             outputs: HashMap::new(),
             boxes: Vec::new(),
@@ -322,6 +333,88 @@ impl PatchEditorState {
     /// until it has drawn one.
     fn size_of(&self, id: NodeId) -> Vec2 {
         self.sizes.get(&id).copied().unwrap_or(UNMEASURED)
+    }
+
+    /// Step the patch back to before the last committed edit. `true` if
+    /// anything moved.
+    ///
+    /// A step is a committed edit — a drag is one, however many frames it
+    /// took. The canvas does this itself on Ctrl+Z while it owns the
+    /// keyboard; this is for a host that offers undo of its own (a menu
+    /// item, a toolbar). In the sequence editor's embedded canvas there is
+    /// no history to walk and this returns `false`: the recipe's history
+    /// owns an instrument's patch, since the patch is part of the recipe.
+    pub fn undo(&mut self, patch: &mut AudioPatch) -> bool {
+        self.history.undo(patch)
+    }
+
+    /// Step the patch forward again after an [`Self::undo`].
+    pub fn redo(&mut self, patch: &mut AudioPatch) -> bool {
+        self.history.redo(patch)
+    }
+
+    /// Whether there is a committed edit to undo.
+    pub fn can_undo(&self) -> bool {
+        self.history.can_undo()
+    }
+
+    /// Whether there is an undone edit to redo.
+    pub fn can_redo(&self) -> bool {
+        self.history.can_redo()
+    }
+
+    /// Tell the canvas its patch was replaced from outside — a host's undo,
+    /// a reload, a re-rolled seed — so the swap becomes a step in the
+    /// editor's own history.
+    ///
+    /// Call it *after* writing the new value. Without it the history's
+    /// baseline still describes the value before the swap, and the next
+    /// undo would step back over both the outside change and the edit made
+    /// since, in one jump. With it, a Ctrl+Z inside the editor returns to
+    /// what was there before the outside change — which, for a host that
+    /// takes the editor's commits as ordinary edits, lands as a forward
+    /// edit on its own history (Overlands #1333 A9).
+    ///
+    /// Nothing is recorded if the value did not actually change, and
+    /// nothing is recorded in the sequence editor's embedded canvas, whose
+    /// history belongs to the recipe.
+    pub fn note_external_change(&mut self, patch: &AudioPatch) {
+        self.history.commit(patch);
+    }
+
+    /// Whether the canvas took this frame's keyboard — the pointer was over
+    /// it and nothing in it held text focus.
+    ///
+    /// A host whose own shortcuts read the platform's keys rather than
+    /// egui's cannot tell that the canvas has consumed a Ctrl+Z, and would
+    /// act on it a second time. Ask this first and stand down (Overlands
+    /// #1333).
+    pub fn wants_keyboard(&self) -> bool {
+        self.owns_keys
+    }
+
+    /// Whether the canvas acted on an Escape this frame by clearing its
+    /// selection.
+    ///
+    /// An Escape ladder should spend this press on that and close nothing:
+    /// one step per press. `false` when there was no selection to clear, so
+    /// a ladder loses no rung to a no-op.
+    pub fn took_escape(&self) -> bool {
+        self.took_escape
+    }
+
+    /// Hand this patch's history to whoever owns the value it is part of.
+    /// See [`crate::ui::history`].
+    pub(crate) fn disable_history(&mut self) {
+        self.history.disable();
+    }
+
+    /// Whether this canvas keeps a history of its own — false inside the
+    /// sequence editor, where the recipe's history owns the patch. Read by
+    /// the test that holds that rule.
+    #[cfg(test)]
+    pub(crate) fn history_is_enabled(&self) -> bool {
+        self.history.is_enabled()
     }
 
     /// Forget everything remembered about nodes the patch no longer has, so
@@ -557,6 +650,12 @@ enum Action {
         from: NodeId,
         at: Pos2,
     },
+    /// The node's context menu, applied after the loop like every other
+    /// structural edit.
+    MutateNode(NodeId),
+    SetOutput(NodeId),
+    Duplicate(NodeId),
+    Delete(NodeId),
 }
 
 /// Draw and edit a whole [`AudioPatch`] as a pannable/zoomable node graph.
@@ -597,6 +696,8 @@ pub fn audio_patch_canvas(
     let style = editor_style(ui);
     let mut res = EditorResponse::NONE;
     state.forget_missing(patch);
+    // Before any widget sees the patch: what an undo goes back to.
+    state.history.begin(patch);
     res.merge(toolbar(ui, patch, state, &style));
     if state.show_json {
         res.merge(json_io(ui, patch, &mut state.json, id.with("patch_json")));
@@ -621,7 +722,175 @@ pub fn audio_patch_canvas(
     });
     state.scene_rect = scene_rect;
     res.merge(inner.inner);
+    // This frame's widget edit, recorded before the keyboard is read so a
+    // Ctrl+Z in the same frame steps back over it rather than swallowing it.
+    if res.rebake {
+        state.history.commit(patch);
+    }
+    let keys = canvas_keys(ui, patch, state, ground);
+    if keys.rebake {
+        // An undo or a redo leaves the history's baseline where it put the
+        // patch, so this records only a key that *edited* — a delete, a
+        // duplicate, a nudge.
+        state.history.commit(patch);
+    }
+    res.merge(keys);
     res
+}
+
+/// How far an arrow key moves the selected node, in scene units; Shift
+/// makes it one unit, for placing a box exactly.
+const NUDGE: f32 = 8.0;
+
+/// The canvas's keyboard, read only while the canvas owns it (#60,
+/// Overlands #1333 B12).
+///
+/// Ownership is the pointer being over the canvas with nothing in it
+/// holding text focus — type a name into the JSON box and Delete belongs to
+/// the text, not to the selected node. Keys are taken with
+/// `consume_key`, so a key the canvas acts on does not also reach a widget
+/// behind it; a host reading the platform's keys instead of egui's cannot
+/// see that, which is what [`PatchEditorState::wants_keyboard`] is for.
+///
+/// Order matters: `consume_key` ignores *extra* Shift and Alt, so Ctrl+Z
+/// would swallow Ctrl+Shift+Z if undo were matched first. Most specific
+/// first, as egui's own docs say.
+fn canvas_keys(
+    ui: &mut egui::Ui,
+    patch: &mut AudioPatch,
+    state: &mut PatchEditorState,
+    ground: Rect,
+) -> EditorResponse {
+    use egui::{Key, Modifiers};
+
+    let mut res = EditorResponse::NONE;
+    state.took_escape = false;
+    let typing = ui.memory(|m| m.focused()).is_some();
+    state.owns_keys = !typing && ui.rect_contains_pointer(ground);
+    if !state.owns_keys {
+        return res;
+    }
+
+    let shift_arrow = Modifiers::SHIFT;
+    let keys = ui.input_mut(|i| Keys {
+        redo: i.consume_key(Modifiers::COMMAND | Modifiers::SHIFT, Key::Z)
+            | i.consume_key(Modifiers::COMMAND, Key::Y),
+        undo: i.consume_key(Modifiers::COMMAND, Key::Z),
+        duplicate: i.consume_key(Modifiers::COMMAND, Key::D),
+        delete: i.consume_key(Modifiers::NONE, Key::Delete)
+            | i.consume_key(Modifiers::NONE, Key::Backspace),
+        fit: i.consume_key(Modifiers::NONE, Key::F),
+        escape: i.consume_key(Modifiers::NONE, Key::Escape),
+        nudge: [
+            (Key::ArrowLeft, Vec2::new(-1.0, 0.0)),
+            (Key::ArrowRight, Vec2::new(1.0, 0.0)),
+            (Key::ArrowUp, Vec2::new(0.0, -1.0)),
+            (Key::ArrowDown, Vec2::new(0.0, 1.0)),
+        ]
+        .into_iter()
+        .filter(|(key, _)| i.consume_key(shift_arrow, *key) || i.consume_key(Modifiers::NONE, *key))
+        .map(|(_, dir)| dir)
+        .fold(Vec2::ZERO, |a, b| a + b),
+        fine: i.modifiers.shift,
+    });
+
+    if keys.redo {
+        res.rebake |= state.history.redo(patch);
+        res.changed |= res.rebake;
+        return res;
+    }
+    if keys.undo {
+        res.rebake |= state.history.undo(patch);
+        res.changed |= res.rebake;
+        return res;
+    }
+    if keys.fit {
+        // A zero-size rect makes Scene auto-fit to the content next frame.
+        state.scene_rect = Rect::ZERO;
+    }
+    if keys.escape && state.selected.take().is_some() {
+        state.took_escape = true;
+    }
+    if let Some(sel) = state.selected {
+        if keys.duplicate
+            && let Some(copy) = duplicate_node(patch, state, sel)
+        {
+            state.selected = Some(copy);
+            res.changed = true;
+            res.rebake = true;
+        }
+        if keys.delete && patch.graph.nodes.len() > 1 {
+            delete_node(patch, sel);
+            state.forget_missing(patch);
+            res.changed = true;
+            res.rebake = true;
+        }
+        if keys.nudge != Vec2::ZERO {
+            let step = if keys.fine { 1.0 } else { NUDGE };
+            *state.positions.entry(sel).or_default() += keys.nudge * step;
+            // A nudged node is placed by hand from now on.
+            state.auto.remove(&sel);
+            res.changed = true;
+            res.rebake = true;
+        }
+    }
+    res
+}
+
+/// What [`canvas_keys`] found in one frame's input.
+struct Keys {
+    undo: bool,
+    redo: bool,
+    duplicate: bool,
+    delete: bool,
+    fit: bool,
+    escape: bool,
+    /// Summed direction of the arrows pressed this frame.
+    nudge: Vec2,
+    /// Shift is down: nudge by one unit rather than [`NUDGE`].
+    fine: bool,
+}
+
+/// Copy `target` beside itself, with its parameters and the wires *into*
+/// it, and return the copy's id.
+///
+/// The incoming wires are the point: a filter duplicated without them is a
+/// filter you have to re-wire, which is most of the work the duplicate was
+/// meant to save. Outgoing wires are not copied — two nodes feeding the
+/// same port would double that port, which is a change to the sound rather
+/// than a copy of a node.
+fn duplicate_node(
+    patch: &mut AudioPatch,
+    state: &mut PatchEditorState,
+    target: NodeId,
+) -> Option<NodeId> {
+    let source = patch.graph.nodes.iter().find(|n| n.id == target)?;
+    let new_id = NodeId(
+        patch
+            .graph
+            .nodes
+            .iter()
+            .map(|n| n.id.0)
+            .max()
+            .map_or(0, |m| m + 1),
+    );
+    let copy = GraphNode {
+        id: new_id,
+        kind: source.kind.clone(),
+        inputs: source.inputs.clone(),
+    };
+    patch.graph.nodes.push(copy);
+    // Beside the original, and placed by hand: the auto-layout would
+    // otherwise stack it into a column and the copy would appear somewhere
+    // other than where it was made.
+    let at = state
+        .positions
+        .get(&target)
+        .copied()
+        .unwrap_or(LAYOUT_ORIGIN)
+        + Vec2::splat(NODE_GAP);
+    state.positions.insert(new_id, at);
+    Some(new_id)
 }
 
 /// The canvas's grid, drawn inside the scene so it moves with the ground:
@@ -958,25 +1227,35 @@ fn canvas_contents(
                         )
                         .sense(Sense::click_and_drag()),
                     )
-                    .on_hover_text("Drag to move this node, click to select it");
+                    .on_hover_text(
+                        "Drag to move this node, click to select it, \
+                         right-click for what can be done to it",
+                    );
                 if grip.dragged() {
                     actions.push(Action::Move(nid, grip.drag_delta()));
                 }
                 if grip.clicked() {
                     actions.push(Action::Select(nid));
                 }
+                // The per-node actions, on the title rather than on it: a
+                // one-click Mutate used to sit a pixel from the drag handle
+                // with nothing to undo it (#60, Overlands #1333 B7).
+                grip.context_menu(|ui| {
+                    for (label, action) in [
+                        ("Mutate this node", Action::MutateNode(nid)),
+                        ("Set as output", Action::SetOutput(nid)),
+                        ("Duplicate", Action::Duplicate(nid)),
+                        ("Delete", Action::Delete(nid)),
+                    ] {
+                        if ui.button(label).clicked() {
+                            actions.push(action);
+                            ui.close();
+                        }
+                    }
+                });
                 res.merge(node_kind_picker(ui, &mut node.kind, Id::new(("nk", nid.0))));
                 if output_id == nid {
                     out_badge(ui, style);
-                }
-                if ui
-                    .small_button("Mutate")
-                    .on_hover_text("Mutate this node")
-                    .clicked()
-                {
-                    mutate_node_kind(&mut node.kind, &mut fresh_rng(), mutate_rate);
-                    res.changed = true;
-                    res.rebake = true;
                 }
             });
             rule(ui, &mut rules);
@@ -1143,6 +1422,35 @@ fn canvas_contents(
                         .entry(target.port.clone())
                         .or_default()
                         .push(Connection::from_node(from));
+                    res.changed = true;
+                    res.rebake = true;
+                }
+            }
+            Action::MutateNode(nid) => {
+                if let Some(n) = patch.graph.nodes.iter_mut().find(|n| n.id == nid) {
+                    mutate_node_kind(&mut n.kind, &mut fresh_rng(), mutate_rate);
+                    res.changed = true;
+                    res.rebake = true;
+                }
+            }
+            Action::SetOutput(nid) => {
+                if patch.graph.output != nid {
+                    patch.graph.output = nid;
+                    res.changed = true;
+                    res.rebake = true;
+                }
+            }
+            Action::Duplicate(nid) => {
+                if let Some(copy) = duplicate_node(patch, state, nid) {
+                    state.selected = Some(copy);
+                    res.changed = true;
+                    res.rebake = true;
+                }
+            }
+            Action::Delete(nid) => {
+                if patch.graph.nodes.len() > 1 {
+                    delete_node(patch, nid);
+                    state.forget_missing(patch);
                     res.changed = true;
                     res.rebake = true;
                 }
@@ -2903,9 +3211,16 @@ mod tests {
             );
         }
         let buttons = canvas.buttons();
-        // The per-node Mutate button stays in each box; these are the
-        // front row's.
-        for gone in ["Copy JSON", "Load current", "Apply", "Reroll seed"] {
+        // Every one of these is now a menu item — the genetics controls
+        // and the JSON box under More, the per-node Mutate in a node's own
+        // context menu (#60) — so none is drawn until it is asked for.
+        for gone in [
+            "Copy JSON",
+            "Load current",
+            "Apply",
+            "Reroll seed",
+            "Mutate this node",
+        ] {
             assert!(
                 !buttons.iter().any(|l| l == gone),
                 "{gone:?} is still on the front row; buttons: {buttons:?}"
@@ -2962,6 +3277,230 @@ mod tests {
             "no edge around the canvas"
         );
         assert!(painted.contains(&s.canvas_grid), "no grid on the canvas");
+    }
+
+    // ---- step 7a (#60, Overlands #1333): history and keys ---------------
+
+    /// Move the pointer into the canvas, so the editor owns the keyboard,
+    /// and hold it there while `events` are delivered.
+    fn keys_over_the_canvas(canvas: &mut Canvas, events: Vec<egui::Event>) {
+        let over = canvas.state.boxes[0].1.center();
+        let at = canvas.to_screen() * over;
+        canvas.frame(vec![egui::Event::PointerMoved(at)]);
+        canvas.frame(events);
+        canvas.frame(Vec::new());
+    }
+
+    /// One key press with modifiers, down then up.
+    fn press(key: egui::Key, modifiers: egui::Modifiers) -> Vec<egui::Event> {
+        vec![
+            egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers,
+            },
+            egui::Event::Key {
+                key,
+                physical_key: None,
+                pressed: false,
+                repeat: false,
+                modifiers,
+            },
+        ]
+    }
+
+    /// B7: a committed edit can be taken back. Add node is the simplest
+    /// one-click structural edit — before this step nothing on the canvas
+    /// could be undone at all.
+    #[test]
+    fn undo_and_redo_round_trip_an_edit_on_the_canvas() {
+        let mut canvas = Canvas::new(three_node_patch());
+        assert!(!canvas.state.can_undo(), "nothing has been edited yet");
+
+        canvas.click("Add node");
+        assert_eq!(canvas.patch.graph.nodes.len(), 4);
+        assert!(canvas.state.can_undo());
+        assert!(!canvas.state.can_redo());
+
+        assert!(canvas.state.undo(&mut canvas.patch));
+        assert_eq!(canvas.patch.graph.nodes.len(), 3);
+        assert!(canvas.state.can_redo());
+        assert!(!canvas.state.can_undo());
+
+        assert!(canvas.state.redo(&mut canvas.patch));
+        assert_eq!(canvas.patch.graph.nodes.len(), 4);
+        assert!(!canvas.state.can_redo());
+    }
+
+    /// A deletion is a committed edit like any other, so it comes back.
+    /// Delete took a node and every wire into it with nothing to undo it.
+    #[test]
+    fn undo_brings_back_a_deleted_node_and_its_wires() {
+        let mut canvas = Canvas::new(three_node_patch());
+        let before = canvas.patch.clone();
+        canvas.state.selected = Some(NodeId(0));
+        canvas.frame(Vec::new());
+        canvas.click("Delete");
+        assert!(canvas.patch.graph.nodes.iter().all(|n| n.id != NodeId(0)));
+
+        assert!(canvas.state.undo(&mut canvas.patch));
+        assert_eq!(
+            canvas.patch, before,
+            "the node and the wire into the filter's \"in\" are both back"
+        );
+    }
+
+    /// B12: the canvas reads the keyboard. Ctrl+Z undoes, Ctrl+Shift+Z and
+    /// Ctrl+Y redo, all injected as real key events on a headless context.
+    #[test]
+    fn ctrl_z_on_the_canvas_undoes_and_ctrl_y_redoes() {
+        for redo_with in [
+            (
+                egui::Key::Z,
+                egui::Modifiers::COMMAND.plus(egui::Modifiers::SHIFT),
+            ),
+            (egui::Key::Y, egui::Modifiers::COMMAND),
+        ] {
+            let mut canvas = Canvas::new(three_node_patch());
+            canvas.click("Add node");
+            assert_eq!(canvas.patch.graph.nodes.len(), 4);
+
+            keys_over_the_canvas(&mut canvas, press(egui::Key::Z, egui::Modifiers::COMMAND));
+            assert_eq!(
+                canvas.patch.graph.nodes.len(),
+                3,
+                "Ctrl+Z did not undo the added node"
+            );
+
+            keys_over_the_canvas(&mut canvas, press(redo_with.0, redo_with.1));
+            assert_eq!(
+                canvas.patch.graph.nodes.len(),
+                4,
+                "{:?} did not redo",
+                redo_with.0
+            );
+        }
+    }
+
+    /// Delete removes the selection, and Ctrl+D duplicates it — with the
+    /// wires *into* it, which is what makes a duplicate worth having.
+    #[test]
+    fn delete_and_ctrl_d_act_on_the_selection() {
+        let mut canvas = Canvas::new(three_node_patch());
+        canvas.state.selected = Some(NodeId(2));
+        canvas.frame(Vec::new());
+
+        // #2 is the filter, wired from #0 and #1.
+        keys_over_the_canvas(&mut canvas, press(egui::Key::D, egui::Modifiers::COMMAND));
+        assert_eq!(
+            canvas.patch.graph.nodes.len(),
+            4,
+            "Ctrl+D did not duplicate"
+        );
+        let copy = canvas
+            .patch
+            .graph
+            .nodes
+            .iter()
+            .find(|n| n.id != NodeId(2) && matches!(n.kind, NodeKind::BiquadLowpass(_)))
+            .expect("a second lowpass");
+        assert_eq!(
+            copy.inputs.len(),
+            2,
+            "the copy did not keep the wires into it: {:?}",
+            copy.inputs
+        );
+        let duplicated = copy.id;
+
+        canvas.state.selected = Some(duplicated);
+        canvas.frame(Vec::new());
+        keys_over_the_canvas(&mut canvas, press(egui::Key::Delete, egui::Modifiers::NONE));
+        assert!(
+            canvas.patch.graph.nodes.iter().all(|n| n.id != duplicated),
+            "Delete did not remove the selection"
+        );
+    }
+
+    /// Esc clears the selection, and the editor says it took the Escape so a
+    /// host's own Escape ladder can stand down for that press (#1333).
+    #[test]
+    fn escape_clears_the_selection_and_is_reported_to_the_host() {
+        let mut canvas = Canvas::new(three_node_patch());
+        canvas.state.selected = Some(NodeId(1));
+        canvas.frame(Vec::new());
+        assert!(!canvas.state.took_escape());
+
+        let over = canvas.state.boxes[0].1.center();
+        let at = canvas.to_screen() * over;
+        canvas.frame(vec![egui::Event::PointerMoved(at)]);
+        canvas.frame(press(egui::Key::Escape, egui::Modifiers::NONE));
+        assert_eq!(canvas.state.selected, None, "Escape did not deselect");
+        assert!(
+            canvas.state.took_escape(),
+            "the editor did not report the Escape it acted on"
+        );
+
+        // With nothing selected there is nothing to clear, so the Escape is
+        // the host's: its ladder must not lose a rung to a no-op.
+        canvas.frame(press(egui::Key::Escape, egui::Modifiers::NONE));
+        assert!(!canvas.state.took_escape());
+    }
+
+    /// The keys are the editor's only while it owns them. With the pointer
+    /// away from the canvas a Ctrl+Z belongs to whatever else is on screen.
+    #[test]
+    fn the_canvas_takes_the_keys_only_while_it_owns_them() {
+        let mut canvas = Canvas::new(three_node_patch());
+        canvas.click("Add node");
+        assert_eq!(canvas.patch.graph.nodes.len(), 4);
+
+        // Pointer far outside the canvas.
+        canvas.frame(vec![egui::Event::PointerMoved(Pos2::new(1590.0, 5.0))]);
+        assert!(!canvas.state.wants_keyboard());
+        canvas.frame(press(egui::Key::Z, egui::Modifiers::COMMAND));
+        assert_eq!(
+            canvas.patch.graph.nodes.len(),
+            4,
+            "a Ctrl+Z outside the canvas was taken by it anyway"
+        );
+
+        let at = canvas.to_screen() * canvas.state.boxes[0].1.center();
+        canvas.frame(vec![egui::Event::PointerMoved(at)]);
+        assert!(canvas.state.wants_keyboard());
+    }
+
+    /// B7: the per-node actions live in a context menu on the title, where
+    /// the die used to sit a pixel from the drag handle.
+    #[test]
+    fn the_node_title_carries_a_context_menu_of_its_actions() {
+        let mut canvas = Canvas::new(three_node_patch());
+        // `label` already returns a screen rect.
+        let grip = canvas.label("#1");
+        canvas.frame(vec![
+            egui::Event::PointerMoved(grip.center()),
+            egui::Event::PointerButton {
+                pos: grip.center(),
+                button: egui::PointerButton::Secondary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+            egui::Event::PointerButton {
+                pos: grip.center(),
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]);
+        canvas.frame(Vec::new());
+        let buttons = canvas.buttons();
+        for item in ["Mutate this node", "Set as output", "Duplicate", "Delete"] {
+            assert!(
+                buttons.iter().any(|l| l == item),
+                "no {item:?} in the node's context menu; buttons {buttons:?}"
+            );
+        }
     }
 
     /// B16: what a constant does to a port is said where it is offered, not
