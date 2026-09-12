@@ -122,6 +122,15 @@ pub struct EditorStyle {
     pub waveform_zero: Color32,
     /// A waveform's trace.
     pub waveform_trace: Color32,
+    /// The playhead: the line on a waveform and on the timeline that says
+    /// where the monitor is in what it is playing (#65, Overlands #1338
+    /// D1).
+    ///
+    /// Deliberately neither [`Self::loop_start`]'s accent nor
+    /// [`Self::loop_end`]'s strong text: all three are vertical lines on
+    /// the same timeline, and the two that do not move must not be
+    /// mistaken for the one that does.
+    pub playhead: Color32,
 }
 
 impl EditorStyle {
@@ -180,6 +189,7 @@ impl EditorStyle {
             waveform_ground: ground,
             waveform_zero: edge,
             waveform_trace: ok,
+            playhead: accent.lerp_to_gamma(strong, 0.5),
         }
     }
 }
@@ -291,6 +301,7 @@ pub(crate) mod tests {
             &mut style.waveform_ground,
             &mut style.waveform_zero,
             &mut style.waveform_trace,
+            &mut style.playhead,
         ];
         for (i, role) in roles.into_iter().enumerate() {
             let step = u8::try_from(i).expect("fewer than 32 roles") * 8;
@@ -474,6 +485,7 @@ pub(crate) mod tests {
             s.waveform_ground,
             s.waveform_zero,
             s.waveform_trace,
+            s.playhead,
         ];
         for (i, a) in all.iter().enumerate() {
             assert!(all[i + 1..].iter().all(|b| a != b), "role {i} repeats");

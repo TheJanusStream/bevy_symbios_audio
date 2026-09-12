@@ -41,7 +41,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use bevy::audio::{AudioPlayer, AudioSource, PlaybackSettings};
+use bevy::audio::{AudioPlayer, AudioSink, AudioSinkPlayback, AudioSource, PlaybackSettings};
 use bevy::prelude::*;
 use bevy::tasks::{AsyncComputeTaskPool, Task, block_on, poll_once};
 use bevy_egui::egui;
@@ -125,6 +125,133 @@ pub fn waveform_sized(ui: &mut egui::Ui, samples: &[f32], size: egui::Vec2) -> e
     resp
 }
 
+/// What a [`waveform_with_cursor`] was asked for: its response, and where a
+/// click on it asked to move the playhead.
+#[derive(Clone, Debug)]
+pub struct WaveformResponse {
+    /// The widget's own response, as [`waveform_sized`] returns.
+    pub response: egui::Response,
+    /// Where a click landed, in seconds from the buffer's start, or `None`
+    /// on a frame with no click. Already inside `0.0..secs`.
+    pub seek: Option<f32>,
+}
+
+/// Draw `samples` as [`waveform_sized`] does, with a playhead at
+/// `position` and a seconds axis along the bottom, and report where a click
+/// asked to seek to.
+///
+/// `secs` is what the whole buffer is worth in seconds — the loop length,
+/// not the visible width — and `position` is a place inside it, already
+/// wrapped (see [`AudioMonitor::position_secs`]). A `position` outside
+/// `0.0..secs` draws no cursor rather than one clamped to an end it is not
+/// at: a cursor parked on the last pixel says "playing the final sample",
+/// which would be a lie told every frame after a stop.
+///
+/// [`WaveformResponse::seek`] reports where a click landed. It is NOT a
+/// promise that the audition can be moved there: every looping Bevy sink
+/// refuses a seek today ([`MonitorControl::Seek`] says why, with the
+/// measurement). Nothing here draws a seek affordance for that reason.
+///
+/// The axis thins its own labels out so they never crowd, so a 0.2 s patch
+/// audition and a 34 s bed are both readable at the same width.
+pub fn waveform_with_cursor(
+    ui: &mut egui::Ui,
+    samples: &[f32],
+    position: Option<f32>,
+    secs: f32,
+    size: egui::Vec2,
+) -> WaveformResponse {
+    let style = super::style::editor_style(ui);
+    let response = waveform_sized(ui, samples, size);
+    let rect = response.rect;
+    if samples.is_empty() || !secs.is_finite() || secs <= 0.0 {
+        return WaveformResponse {
+            response,
+            seek: None,
+        };
+    }
+    let painter = ui.painter_at(rect);
+    let x_of = |t: f32| rect.left() + (t / secs).clamp(0.0, 1.0) * rect.width();
+
+    paint_seconds_axis(&painter, rect, secs, &style, ui);
+
+    if let Some(t) = position
+        && (0.0..secs).contains(&t)
+    {
+        let x = x_of(t);
+        painter.line_segment(
+            [
+                egui::pos2(x, rect.top() + 1.0),
+                egui::pos2(x, rect.bottom() - 1.0),
+            ],
+            egui::Stroke::new(1.5, style.playhead),
+        );
+    }
+
+    // A click reports where it landed, for a host whose backend can act
+    // on it. NO pointing-hand cursor and no "click to seek" wording here:
+    // every looping Bevy sink refuses a seek (see [`MonitorControl::Seek`]),
+    // and an affordance that cannot be honoured is worse than none.
+    let response = response.interact(egui::Sense::click());
+    let seek = response
+        .clicked()
+        .then(|| response.interact_pointer_pos())
+        .flatten()
+        .map(|p| ((p.x - rect.left()) / rect.width().max(1.0) * secs).clamp(0.0, secs));
+    WaveformResponse { response, seek }
+}
+
+/// The narrowest a seconds-axis label may sit from its neighbour before the
+/// axis draws fewer of them, in points.
+const AXIS_LABEL_GAP: f32 = 56.0;
+
+/// Tick marks and second labels along the bottom of a waveform.
+///
+/// The step is chosen so labels never come closer than [`AXIS_LABEL_GAP`]:
+/// a 0.2 s patch audition and a 34 s bed are drawn by the same code at the
+/// same width, and a fixed "one tick a second" would put 34 overlapping
+/// labels on the second of them.
+fn paint_seconds_axis(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    secs: f32,
+    style: &super::EditorStyle,
+    ui: &egui::Ui,
+) {
+    let most = (rect.width() / AXIS_LABEL_GAP).floor().max(1.0);
+    let rough = secs / most;
+    // A step from the 1-2-5 ladder at or above `rough`, so the labels are
+    // numbers a reader can hold (0.5, 1, 2, 5, 10…) rather than 0.37.
+    let magnitude = 10.0_f32.powf(rough.max(f32::MIN_POSITIVE).log10().floor());
+    let step = [1.0, 2.0, 5.0, 10.0]
+        .into_iter()
+        .map(|m| m * magnitude)
+        .find(|s| *s >= rough)
+        .unwrap_or(magnitude * 10.0);
+    let decimals = if step < 1.0 { 1 } else { 0 };
+    let font = egui::FontId::proportional(9.0);
+    let mut t = step;
+    while t < secs {
+        let x = rect.left() + (t / secs) * rect.width();
+        painter.line_segment(
+            [
+                egui::pos2(x, rect.bottom() - 5.0),
+                egui::pos2(x, rect.bottom() - 1.0),
+            ],
+            egui::Stroke::new(1.0, style.waveform_zero),
+        );
+        painter.text(
+            egui::pos2(x + 2.0, rect.bottom() - 1.0),
+            egui::Align2::LEFT_BOTTOM,
+            format!("{t:.decimals$} s"),
+            font.clone(),
+            style.ground_text,
+        );
+        t += step;
+    }
+    let _ = ui;
+}
+
 // ---------------------------------------------------------------------------
 // Bake-and-play monitor (Bevy)
 // ---------------------------------------------------------------------------
@@ -176,10 +303,58 @@ pub enum MonitorStatus {
     Error(String),
 }
 
+/// Ask the monitor to do something to the voice that is already playing,
+/// rather than to bake a different one.
+///
+/// A separate message from [`MonitorRequest`] on purpose. `MonitorRequest`
+/// is not `#[non_exhaustive]`, so growing *it* would break every exhaustive
+/// match a host has written — the breaking change the epic collects for a
+/// single 0.5 rather than dribbling out (Overlands #1326). This type is new,
+/// so adding it breaks nothing, and it is `#[non_exhaustive]` from birth so
+/// the next thing that wants to steer a playing voice needs no second type.
+///
+/// Write these the way you write a [`MonitorRequest`]; [`AudioEditorPlugin`]
+/// registers both. The audition strip returns them through
+/// [`AuditionState::take_controls`](super::AuditionState::take_controls).
+#[derive(Message, Clone, Copy, Debug, PartialEq)]
+#[non_exhaustive]
+pub enum MonitorControl {
+    /// Move the playing voice to `secs` into its buffer.
+    ///
+    /// Clamped into the buffer, so a click past the end of a waveform asks
+    /// for the end rather than for an error. Ignored when nothing plays.
+    ///
+    /// # Every looping Bevy sink refuses this today
+    ///
+    /// Measured, not assumed. `AudioSinkPlayback::try_seek` exists and
+    /// compiles, but `PlaybackMode::Loop` appends
+    /// `decoder.repeat_infinite()` (bevy_audio 0.19
+    /// `src/audio_output.rs:165`), and `repeat_infinite` wraps its source
+    /// in `rodio::source::buffered::Buffered`, whose `try_seek` returns
+    /// `SeekError::NotSupported` unconditionally (rodio 0.22
+    /// `src/source/buffered.rs:240`). The monitor loops, so every voice it
+    /// plays goes down that path and every seek is refused — the error
+    /// names `Buffered<Decoder<Cursor<AudioSource>>>`.
+    ///
+    /// It is kept because the request is the right one and the refusal is
+    /// correct behaviour rather than broken behaviour: nothing moves, the
+    /// audition goes on playing, and the published position is left alone
+    /// rather than made to lie. A host should NOT offer a "click to seek"
+    /// affordance on this backend — see [`waveform_with_cursor`], which
+    /// draws the cursor and promises nothing about moving it.
+    Seek(f32),
+    /// Set the monitor's own output level, `0.0..=1.0`.
+    ///
+    /// The monitor's, not the app's: it scales this author monitor's voice
+    /// and nothing else the host plays. It survives a re-bake, because it
+    /// is a property of the monitor rather than of the buffer in it.
+    Volume(f32),
+}
+
 /// Resource holding monitor state: the in-flight bake task, the playing voice
 /// entity, the current [`MonitorStatus`], and the last baked buffer (so a
 /// [`waveform`] can be drawn).  Added by [`AudioEditorPlugin`].
-#[derive(Resource, Default)]
+#[derive(Resource)]
 pub struct AudioMonitor {
     task: Option<Task<BakeResult>>,
     /// The currently-playing voice entity, despawned when replaced or stopped.
@@ -204,6 +379,33 @@ pub struct AudioMonitor {
     pub last_samples: Vec<f32>,
     /// Sample rate of [`Self::last_samples`].
     pub sample_rate: u32,
+    /// Where the playing voice is in its buffer, in seconds, wrapped to the
+    /// buffer's own length. `None` when nothing is playing, and on a
+    /// platform whose sink does not report a position.
+    ///
+    /// Private and assign-on-change: see [`publish_monitor_position`].
+    position: Option<f32>,
+    /// The monitor's own output level, from [`MonitorControl::Volume`].
+    volume: f32,
+}
+
+impl Default for AudioMonitor {
+    fn default() -> Self {
+        Self {
+            task: None,
+            current: None,
+            cancel: None,
+            bake_started: None,
+            auditioning: None,
+            samples_of: None,
+            status: MonitorStatus::default(),
+            last_samples: Vec::new(),
+            sample_rate: 0,
+            position: None,
+            // Full: a monitor nobody has turned down is not turned down.
+            volume: 1.0,
+        }
+    }
 }
 
 impl AudioMonitor {
@@ -216,6 +418,34 @@ impl AudioMonitor {
     /// is baking.
     pub fn bake_elapsed(&self) -> Option<Duration> {
         self.bake_started.map(|started| started.elapsed())
+    }
+
+    /// How long [`Self::last_samples`] is, in seconds — the length the
+    /// playing voice loops at. `None` when there is no buffer, or when its
+    /// sample rate is zero (nothing has baked yet).
+    pub fn loop_secs(&self) -> Option<f32> {
+        if self.last_samples.is_empty() || self.sample_rate == 0 {
+            return None;
+        }
+        Some(self.last_samples.len() as f32 / self.sample_rate as f32)
+    }
+
+    /// Where the playing voice is in its buffer, in seconds, wrapped into
+    /// `0.0..loop_secs()`. `None` when nothing is playing, and on a
+    /// platform whose sink reports no position.
+    ///
+    /// Already wrapped: the sink's own position counts up forever across a
+    /// loop — `PlaybackMode::Loop` appends `repeat_infinite()` and rodio's
+    /// counter accumulates across the repeats — and every caller wants the
+    /// place in the buffer rather than the time since the voice started.
+    pub fn position_secs(&self) -> Option<f32> {
+        self.position
+    }
+
+    /// The monitor's own output level, `0.0..=1.0`. Set with
+    /// [`MonitorControl::Volume`].
+    pub fn volume(&self) -> f32 {
+        self.volume
     }
 
     /// The fingerprint of the request [`Self::status`] is about, or `None`
@@ -312,10 +542,17 @@ pub struct AudioEditorPlugin;
 impl Plugin for AudioEditorPlugin {
     fn build(&self, app: &mut App) {
         app.add_message::<MonitorRequest>()
+            .add_message::<MonitorControl>()
             .init_resource::<AudioMonitor>()
             .add_systems(
                 Update,
-                (handle_monitor_requests, poll_monitor_bakes).chain(),
+                (
+                    handle_monitor_requests,
+                    poll_monitor_bakes,
+                    apply_monitor_controls,
+                    publish_monitor_position,
+                )
+                    .chain(),
             );
     }
 }
@@ -382,6 +619,16 @@ fn poll_monitor_bakes(
     mut commands: Commands,
     mut sources: ResMut<Assets<AudioSource>>,
 ) {
+    // `is_some` through the immutable deref first: `take()` is a
+    // `deref_mut`, and a `deref_mut` stamps a change tick whether or not
+    // anything is written. Unguarded, this system stamped `AudioMonitor`
+    // on every frame of every session — nearly all of which have no bake
+    // in flight at all — which is the defect Overlands #1340 is filed for
+    // (#65, Overlands #1338 D1). Found by the guard test on the position
+    // publisher next door, which could not pass while this one stamped.
+    if monitor.task.is_none() {
+        return;
+    }
     let Some(mut task) = monitor.task.take() else {
         return;
     };
@@ -398,8 +645,14 @@ fn poll_monitor_bakes(
     match result {
         Ok((samples, sample_rate)) => {
             let handle = sources.add(samples_to_audio_source(&samples, sample_rate));
+            // At the monitor's own level, not full: the level belongs to
+            // the monitor rather than to the buffer in it, so a re-bake
+            // after an edit must not undo a turn-down.
             let entity = commands
-                .spawn((AudioPlayer::new(handle), PlaybackSettings::LOOP))
+                .spawn((
+                    AudioPlayer::new(handle),
+                    PlaybackSettings::LOOP.with_volume(bevy::audio::Volume::Linear(monitor.volume)),
+                ))
                 .id();
             monitor.current = Some(entity);
             monitor.sample_rate = sample_rate;
@@ -415,11 +668,148 @@ fn poll_monitor_bakes(
     }
 }
 
+/// Where a voice that has been playing for `elapsed` sits inside a buffer
+/// `loop_secs` long, in seconds from the buffer's start.
+///
+/// `PlaybackSettings::LOOP` appends the decoder `repeat_infinite()`, and
+/// rodio's position counter accumulates across the repeats rather than
+/// resetting at each one — so a sink 7.3 s into a 2 s bed reports 7.3, not
+/// 1.3. The wrap is this function, and it is the whole of the correctness
+/// in a playhead: without it the cursor walks off the right of the waveform
+/// after one loop and never comes back.
+///
+/// `None` when there is nothing to be inside: no buffer, or a
+/// non-positive, non-finite length.
+fn loop_position(elapsed: Duration, loop_secs: f32) -> Option<f32> {
+    if !loop_secs.is_finite() || loop_secs <= 0.0 {
+        return None;
+    }
+    // In f64 and then narrowed: a monitor left looping for an hour is
+    // 3600 s against a 2 s buffer, where f32's 24-bit mantissa has already
+    // coarsened to a quarter-millisecond and `rem_euclid` would quantise
+    // the cursor visibly.
+    let wrapped = (elapsed.as_secs_f64()).rem_euclid(f64::from(loop_secs));
+    Some(wrapped as f32)
+}
+
+/// Where a seek to `secs` actually lands in a buffer `loop_secs` long, or
+/// `None` when there is no buffer to land in.
+///
+/// Clamped rather than refused: a click a pixel past the right-hand end of
+/// a waveform means "the end", and a click a pixel before its left means
+/// "the start". Neither is a mistake worth an error, and a seek that
+/// silently did nothing at the very edges would read as a dead zone.
+fn seek_target(secs: f32, loop_secs: Option<f32>) -> Option<f32> {
+    let loop_secs = loop_secs?;
+    if !secs.is_finite() {
+        return None;
+    }
+    Some(secs.clamp(0.0, loop_secs))
+}
+
+/// Publish the playing voice's position in its buffer, for a waveform or a
+/// timeline to draw a cursor at.
+///
+/// # Why this reads through `ResMut` before it writes
+///
+/// `ResMut::deref_mut` stamps a change tick whether or not anything is
+/// actually written, and this system runs every frame of every session —
+/// including the overwhelming majority in which no audition is playing at
+/// all. Taking the `&mut` unconditionally would stamp [`AudioMonitor`] on
+/// every one of those frames, which is the defect Overlands #1340 is
+/// filed for, arriving here instead of there. So: return before touching
+/// anything when there is no voice, and otherwise compare first and assign
+/// only on a real difference. A moving playhead does stamp a tick — it
+/// genuinely changed — and nothing in this crate or in Overlands reads
+/// this resource's change tick, so that cost stops at the resource.
+fn publish_monitor_position(mut monitor: ResMut<AudioMonitor>, sinks: Query<&AudioSink>) {
+    let Some(entity) = monitor.current else {
+        // No voice: there is no position, and on the overwhelming majority
+        // of frames this is where the system returns having touched
+        // nothing.
+        if monitor.position.is_some() {
+            monitor.position = None;
+        }
+        return;
+    };
+    // A voice whose sink has not arrived yet keeps the position it has.
+    //
+    // Bevy inserts `AudioSink` in its own system, a frame after the
+    // `AudioPlayer` is spawned, so every fresh voice has a gap of at least
+    // one frame in which the entity exists and the sink does not. Clearing
+    // through that gap would blink the cursor off at the start of every
+    // audition, and would throw away the position a seek had just written
+    // before the sink could confirm it.
+    let Ok(sink) = sinks.get(entity) else {
+        return;
+    };
+    let next = monitor
+        .loop_secs()
+        .and_then(|loop_secs| loop_position(sink.position(), loop_secs));
+    // Immutable deref: reading through a `ResMut` stamps nothing.
+    if monitor.position != next {
+        monitor.position = next;
+    }
+}
+
+/// Apply [`MonitorControl`]s to the voice that is playing.
+///
+/// A seek with nothing playing, or into a sink whose backend cannot seek,
+/// is dropped rather than surfaced: neither is a fault in the patch being
+/// edited, and [`MonitorStatus::Error`] is reserved for a bake that failed.
+fn apply_monitor_controls(
+    mut controls: MessageReader<MonitorControl>,
+    mut monitor: ResMut<AudioMonitor>,
+    mut sinks: Query<&mut AudioSink>,
+) {
+    // Nothing to apply: do not take the `&mut` at all (see
+    // `publish_monitor_position` on why that matters).
+    if controls.is_empty() {
+        return;
+    }
+    for control in controls.read() {
+        match *control {
+            MonitorControl::Seek(secs) => {
+                let Some(target) = seek_target(secs, monitor.loop_secs()) else {
+                    continue;
+                };
+                let took = monitor.current.is_some_and(|entity| {
+                    sinks
+                        .get(entity)
+                        .is_ok_and(|sink| sink.try_seek(Duration::from_secs_f32(target)).is_ok())
+                });
+                // Published only when the sink actually took it. A cursor
+                // that jumps to the click while the sound carries on from
+                // where it was is worse than one that does not move: it
+                // says the audition is somewhere it is not, every frame
+                // until the publisher corrects it back. On every looping
+                // Bevy sink today, `took` is false — see
+                // [`MonitorControl::Seek`].
+                if took && monitor.position != Some(target) {
+                    monitor.position = Some(target);
+                }
+            }
+            MonitorControl::Volume(level) => {
+                let level = level.clamp(0.0, 1.0);
+                if monitor.volume != level {
+                    monitor.volume = level;
+                }
+                if let Some(entity) = monitor.current
+                    && let Ok(mut sink) = sinks.get_mut(entity)
+                {
+                    sink.set_volume(bevy::audio::Volume::Linear(level));
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AudioEditorPlugin, AudioMonitor, MonitorStatus, waveform};
+    use super::{AudioEditorPlugin, AudioMonitor, MonitorControl, MonitorStatus, waveform};
     use bevy::prelude::*;
     use bevy_egui::egui;
+    use std::time::Duration;
 
     #[test]
     fn waveform_renders_headless_for_empty_and_full_buffers() {
@@ -687,6 +1077,271 @@ mod tests {
         assert_eq!(monitor.status, MonitorStatus::Idle);
         assert!(monitor.bake_elapsed().is_none());
         assert_eq!(voices(&mut app), 0);
+    }
+
+    // -- D1: the published position (#65, Overlands #1338) ----------------
+
+    /// THE HEADLINE: a looping sink's position wrapped to the buffer.
+    ///
+    /// `PlaybackSettings::LOOP` appends `repeat_infinite()` and rodio's
+    /// counter accumulates across the repeats, so the sink reports time
+    /// since the voice started and not a place in the buffer. The wrap is
+    /// the whole correctness of a playhead — including the wrap itself,
+    /// not just a midpoint: the first loop is the case every naive
+    /// implementation gets right.
+    #[test]
+    fn a_looping_positions_wraps_to_the_buffer_rather_than_counting_up() {
+        use super::loop_position;
+        let secs = 2.0_f32;
+        let at = |t: f64| loop_position(Duration::from_secs_f64(t), secs).expect("a real buffer");
+
+        // Inside the first loop: position is elapsed.
+        assert!((at(0.0) - 0.0).abs() < 1e-4);
+        assert!((at(0.5) - 0.5).abs() < 1e-4, "{}", at(0.5));
+        assert!((at(1.999) - 1.999).abs() < 1e-3);
+
+        // THE WRAP. Exactly at the boundary the cursor is back at the
+        // start, not parked on the last pixel.
+        assert!(
+            at(2.0) < 1e-4,
+            "at the loop point the cursor is at 0, got {}",
+            at(2.0)
+        );
+        // And past it, repeatedly. Without the modulo every one of these
+        // is off the right-hand end of the waveform for ever.
+        assert!((at(2.5) - 0.5).abs() < 1e-3, "second loop: {}", at(2.5));
+        assert!((at(7.3) - 1.3).abs() < 1e-3, "fourth loop: {}", at(7.3));
+        // An hour in, where an f32 accumulator would have coarsened past a
+        // quarter of a millisecond and the cursor would visibly step.
+        assert!(
+            (at(3600.5) - 0.5).abs() < 1e-3,
+            "an hour in: {}",
+            at(3600.5)
+        );
+
+        // Every result is inside the buffer, which is what a drawer needs.
+        for ms in 0..4000 {
+            let t = at(f64::from(ms) * 0.003);
+            assert!((0.0..secs).contains(&t), "{t} is outside 0..{secs}");
+        }
+    }
+
+    /// Nothing to be inside means no position, rather than a cursor at zero
+    /// on a buffer that is not there.
+    #[test]
+    fn a_position_needs_a_buffer_with_a_length() {
+        use super::loop_position;
+        for bad in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            assert_eq!(
+                loop_position(Duration::from_secs_f32(1.0), bad),
+                None,
+                "a {bad} long buffer has no inside"
+            );
+        }
+    }
+
+    /// The loop length is the buffer's own, and is `None` before anything
+    /// has baked — a monitor with no samples has nothing to be a length of.
+    #[test]
+    fn the_loop_length_is_the_buffers_own() {
+        let mut monitor = AudioMonitor::default();
+        assert_eq!(monitor.loop_secs(), None, "nothing baked yet");
+        monitor.last_samples = vec![0.0; 11_025];
+        assert_eq!(monitor.sample_rate, 0);
+        assert_eq!(
+            monitor.loop_secs(),
+            None,
+            "samples but no rate is no length"
+        );
+        monitor.sample_rate = 22_050;
+        assert_eq!(monitor.loop_secs(), Some(0.5));
+    }
+
+    /// #1340's shape, guarded: the position publisher runs every frame of
+    /// every session, and `ResMut::deref_mut` stamps a change tick whether
+    /// or not anything is written. With nothing playing it must touch
+    /// nothing at all.
+    ///
+    /// The control is below: this fails if the system takes its `&mut`
+    /// before knowing there is a change to make.
+    #[test]
+    fn publishing_a_position_with_nothing_playing_stamps_nothing() {
+        let mut app = monitor_app();
+        app.update();
+        // The resource's own last-changed tick, not `is_changed()` read
+        // from outside a system: `app.update()` moves the world's
+        // last-change tick past the stamp before a caller out here can see
+        // it, so `is_changed()` reads false either way and the test would
+        // pass on the very code it is meant to refuse.
+        let tick_of = |app: &App| {
+            app.world()
+                .get_resource_change_ticks::<AudioMonitor>()
+                .expect("the monitor")
+                .changed
+        };
+        let before = tick_of(&app);
+        for frame in 0..8 {
+            app.update();
+            assert_eq!(
+                tick_of(&app),
+                before,
+                "frame {frame}: the monitor was stamped with nothing playing"
+            );
+        }
+    }
+
+    /// The other half of the guard: a real change IS published. Without
+    /// this the test above passes on a system that never writes anything.
+    #[test]
+    fn a_position_that_really_changed_is_published() {
+        let mut app = monitor_app();
+        app.update();
+        app.world_mut().resource_mut::<AudioMonitor>().position = Some(0.25);
+        assert_eq!(
+            app.world().resource::<AudioMonitor>().position_secs(),
+            Some(0.25),
+            "the accessor reads the published position"
+        );
+        // And the publisher clears it again once there is no voice: a
+        // cursor left behind after a stop is a cursor that lies.
+        app.update();
+        assert_eq!(
+            app.world().resource::<AudioMonitor>().position_secs(),
+            None,
+            "with no voice the position goes away rather than freezing"
+        );
+    }
+
+    /// A monitor nobody has turned down is at full level, and
+    /// `MonitorControl::Volume` moves it and holds it across a re-bake —
+    /// the level belongs to the monitor, not to the buffer in it.
+    #[test]
+    fn the_monitor_volume_is_the_monitors_and_survives_a_re_bake() {
+        let mut app = monitor_app();
+        assert_eq!(app.world().resource::<AudioMonitor>().volume(), 1.0);
+        app.world_mut().write_message(MonitorControl::Volume(0.25));
+        app.update();
+        assert_eq!(app.world().resource::<AudioMonitor>().volume(), 0.25);
+
+        app.world_mut().write_message(MonitorRequest::PlayPatch {
+            patch: sine(),
+            sample_rate: 22_050,
+            duration_secs: 0.25,
+        });
+        until_settled(&mut app);
+        assert_eq!(
+            app.world().resource::<AudioMonitor>().volume(),
+            0.25,
+            "a re-bake after an edit must not undo a turn-down"
+        );
+    }
+
+    /// Out-of-range levels are clamped rather than honoured: a negative
+    /// gain inverts a waveform and a host that sends one has a bug.
+    #[test]
+    fn a_monitor_volume_is_clamped_into_range() {
+        let mut app = monitor_app();
+        for (sent, want) in [(-1.0_f32, 0.0_f32), (4.0, 1.0), (0.5, 0.5)] {
+            app.world_mut().write_message(MonitorControl::Volume(sent));
+            app.update();
+            assert_eq!(app.world().resource::<AudioMonitor>().volume(), want);
+        }
+    }
+
+    /// A seek with nothing baked moves nothing and raises nothing: it is
+    /// not a fault in the patch, and `MonitorStatus::Error` is for a bake
+    /// that failed.
+    #[test]
+    fn a_seek_with_nothing_baked_is_dropped_quietly() {
+        let mut app = monitor_app();
+        app.world_mut().write_message(MonitorControl::Seek(1.0));
+        app.update();
+        let monitor = app.world().resource::<AudioMonitor>();
+        assert_eq!(monitor.position_secs(), None);
+        assert_eq!(monitor.status, MonitorStatus::Idle);
+    }
+
+    /// A seek is clamped into the buffer, so a click past the end of a
+    /// waveform lands at its end rather than in an error.
+    ///
+    /// Asked of `seek_target` rather than through the app, because the
+    /// place a seek lands is the only part a test without an audio device
+    /// can see: these tests run on a bare app with no device, so no
+    /// `AudioSink` component ever exists and `try_seek` is never reached.
+    /// What that leaves verifiable is exactly the arithmetic, and that is
+    /// what is asked here.
+    #[test]
+    fn a_seek_is_clamped_into_the_buffer() {
+        use super::seek_target;
+        let half = Some(0.5_f32);
+        assert_eq!(
+            seek_target(9.0, half),
+            Some(0.5),
+            "past the end lands at the end"
+        );
+        assert_eq!(
+            seek_target(-3.0, half),
+            Some(0.0),
+            "before the start lands at the start"
+        );
+        assert_eq!(seek_target(0.2, half), Some(0.2), "inside is left alone");
+        assert_eq!(
+            seek_target(0.5, half),
+            Some(0.5),
+            "the end itself is reachable"
+        );
+        // No buffer, nowhere to land.
+        assert_eq!(seek_target(0.2, None), None);
+        // A non-finite ask is a bug in the caller, not a place.
+        assert_eq!(seek_target(f32::NAN, half), None);
+        assert_eq!(seek_target(f32::INFINITY, half), None);
+    }
+
+    /// A seek the backend refuses moves NOTHING — not the voice, and not
+    /// the published cursor.
+    ///
+    /// This is the honest state of the world rather than a limitation of
+    /// the test: `PlaybackMode::Loop` appends `decoder.repeat_infinite()`,
+    /// which wraps its source in `rodio::source::buffered::Buffered`,
+    /// whose `try_seek` returns `NotSupported` unconditionally. Every
+    /// voice this monitor plays loops, so every seek is refused. Measured
+    /// by running one, not inferred from the trait having the method.
+    ///
+    /// The cursor must not move on a refused seek: one that jumps to the
+    /// click while the sound carries on from where it was says the
+    /// audition is somewhere it is not.
+    #[test]
+    fn a_seek_the_backend_refuses_moves_nothing() {
+        let mut app = monitor_app();
+        app.world_mut().write_message(MonitorRequest::PlayPatch {
+            patch: sine(),
+            sample_rate: 22_050,
+            duration_secs: 0.5,
+        });
+        until_settled(&mut app);
+        assert_eq!(
+            app.world().resource::<AudioMonitor>().loop_secs(),
+            Some(0.5)
+        );
+        let before = app.world().resource::<AudioMonitor>().position_secs();
+
+        app.world_mut().write_message(MonitorControl::Seek(0.3));
+        app.update();
+        assert_eq!(
+            app.world().resource::<AudioMonitor>().position_secs(),
+            before,
+            "a refused seek moved the cursor, which would say the audition \
+             is somewhere it is not"
+        );
+
+        // And the audition is still playing: a seek that cannot be done is
+        // not a fault in the patch, so nothing is stopped and no error is
+        // raised.
+        assert_eq!(
+            app.world().resource::<AudioMonitor>().status,
+            MonitorStatus::Playing,
+            "a refused seek disturbed the audition"
+        );
     }
 
     /// A sequence bake cannot be cancelled upstream, so a request that

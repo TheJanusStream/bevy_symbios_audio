@@ -108,7 +108,7 @@ mod test_paint;
 
 pub use audition::{AUTO_QUIET_SECS, AuditionSource, AuditionState, audition_strip};
 pub use evolve::{mutate_node_kind, mutate_patch, randomize_seed};
-pub use graph::{PatchEditorState, WireGeom, audio_patch_canvas};
+pub use graph::{PatchEditorState, WireGeom, audio_patch_canvas, patch_hearing};
 pub use io::{JsonIoState, json_io};
 pub use limits::{Cap, CapState, CapTone, EditorLimits, cap_readout};
 pub use node::{
@@ -118,7 +118,8 @@ pub use node::{
     square_osc_editor, triangle_osc_editor, white_noise_editor,
 };
 pub use preview::{
-    AudioEditorPlugin, AudioMonitor, MonitorRequest, MonitorStatus, waveform, waveform_sized,
+    AudioEditorPlugin, AudioMonitor, MonitorControl, MonitorRequest, MonitorStatus, waveform,
+    waveform_sized, waveform_with_cursor,
 };
 pub use sequence::{
     DEFAULT_SAMPLE_RATES, NoteGeom, SequenceEditorState, Snap, active_instrument_canvas,
@@ -415,6 +416,49 @@ mod glyph_guard {
                     .expect("an egui default face parses");
                 font.charmap().map(c).is_some()
             })
+    }
+
+    /// Print the editor's glyph inventory, lexed rather than grepped, for a
+    /// host refreshing its own hosted-glyph floor on a bump.
+    ///
+    /// `cargo test --features egui --lib print_editor_glyph_inventory -- --nocapture --ignored`
+    ///
+    /// Ignored because it asserts nothing; it exists so the list a host
+    /// copies comes out of the same lexer the guard above uses. A regex
+    /// over the source counts doc comments — this crate's own docs quote
+    /// several of these code points while explaining them — and a raw grep
+    /// misses every `\u{...}` escape, which is how most of them are written.
+    #[test]
+    #[ignore = "a report, not an assertion"]
+    fn print_editor_glyph_inventory() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/ui");
+        let mut sources: Vec<_> = std::fs::read_dir(&dir)
+            .expect("src/ui is readable")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+            .collect();
+        sources.sort();
+        let mut seen: std::collections::BTreeMap<char, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for path in &sources {
+            let source = std::fs::read_to_string(path).expect("editor source is readable");
+            let file = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            for literal in string_literals(&source) {
+                for c in literal.chars().filter(|c| !c.is_ascii()) {
+                    let at = seen.entry(c).or_default();
+                    if !at.contains(&file) {
+                        at.push(file.clone());
+                    }
+                }
+            }
+        }
+        for (c, files) in &seen {
+            println!("GLYPH {c} U+{:04X}  {}", u32::from(*c), files.join(" "));
+        }
     }
 
     #[test]

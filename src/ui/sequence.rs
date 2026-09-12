@@ -236,6 +236,23 @@ pub struct SequenceEditorState {
     /// to disagree (crate #67).
     timeline_rect: Rect,
     notes: Vec<NoteGeom>,
+    /// Where the monitor is in what it is playing, in seconds, as the host
+    /// last told us with [`Self::set_playhead`]. `None` when nothing of
+    /// this recipe is playing.
+    playhead_secs: Option<f32>,
+    /// Where the playhead was DRAWN on the last frame, in screen points —
+    /// published rather than left to be re-derived from the zoom, the
+    /// gutter and the scroll offset, like every other piece of this
+    /// timeline's geometry (crate #67).
+    playhead_x: Option<f32>,
+    /// Tracks the owner has silenced, by index.
+    ///
+    /// Index-keyed like [`Self::selection`], and pruned the same way when
+    /// the recipe loses tracks under it.
+    muted_tracks: HashSet<usize>,
+    /// Tracks the owner has soloed, by index. Any solo at all silences
+    /// every track that is not soloed.
+    soloed_tracks: HashSet<usize>,
     /// Names being typed into instrument rows, keyed by row. The recipe is
     /// renamed only when one is committed; see [`NameEdit`].
     name_edits: HashMap<usize, NameEdit>,
@@ -332,6 +349,10 @@ impl Default for SequenceEditorState {
             json: JsonIoState::default(),
             timeline_rect: Rect::NOTHING,
             notes: Vec::new(),
+            playhead_secs: None,
+            playhead_x: None,
+            muted_tracks: HashSet::new(),
+            soloed_tracks: HashSet::new(),
             name_edits: HashMap::new(),
             history: EditHistory::default(),
             owns_keys: false,
@@ -592,6 +613,116 @@ impl SequenceEditorState {
         &self.notes
     }
 
+    /// Tell the timeline where the monitor is in what it is playing, in
+    /// seconds from the start of the bake, so it can draw a cursor there.
+    ///
+    /// `None` when nothing of this recipe is playing, which takes the
+    /// cursor away. Feed it
+    /// [`AudioMonitor::position_secs`](crate::ui::AudioMonitor::position_secs)
+    /// — already wrapped into the loop — and only while the monitor is
+    /// playing THIS recipe: a cursor running over a timeline whose sound
+    /// is not the one in the room says this recipe is sounding when it is
+    /// not.
+    ///
+    /// A setter rather than an argument, like
+    /// [`set_limits`](Self::set_limits) and
+    /// [`set_sample_rates`](Self::set_sample_rates): the editor's
+    /// signature is the host's contract, and a per-frame value does not
+    /// belong in it.
+    pub fn set_playhead(&mut self, secs: Option<f32>) {
+        self.playhead_secs = secs;
+    }
+
+    /// Where the playhead is, in seconds, as the host last set it.
+    pub fn playhead(&self) -> Option<f32> {
+        self.playhead_secs
+    }
+
+    /// Where the playhead was DRAWN on the last frame, in screen points,
+    /// or `None` if it was not drawn — nothing playing, or a position off
+    /// the end of the timeline.
+    ///
+    /// Published rather than re-derived: only the timeline knows its zoom,
+    /// its gutter and how far its `ScrollArea` is scrolled, and a reader
+    /// working those out again is a second answer waiting to disagree with
+    /// the paint (crate #67).
+    pub fn playhead_x(&self) -> Option<f32> {
+        self.playhead_x
+    }
+
+    /// Whether track `track` is silenced by its own mute.
+    pub fn track_muted(&self, track: usize) -> bool {
+        self.muted_tracks.contains(&track)
+    }
+
+    /// Whether track `track` is soloed.
+    pub fn track_soloed(&self, track: usize) -> bool {
+        self.soloed_tracks.contains(&track)
+    }
+
+    /// Whether `track` is actually heard, once solo and mute are both
+    /// taken into account.
+    ///
+    /// Solo wins over mute, and any solo at all silences every track that
+    /// is not soloed — the convention every mixer has, and the one that
+    /// makes "solo" mean something on a recipe with twenty tracks.
+    pub fn track_heard(&self, track: usize) -> bool {
+        if self.soloed_tracks.is_empty() {
+            !self.muted_tracks.contains(&track)
+        } else {
+            self.soloed_tracks.contains(&track)
+        }
+    }
+
+    /// A COPY of `recipe` holding only the tracks that are heard, or
+    /// `None` when every track is heard and the recipe itself will do.
+    ///
+    /// `recipe` is not changed: solo and mute are ways of listening, not
+    /// edits, and must not reach the host's record. `None` rather than an
+    /// identical clone so the ordinary case — nothing soloed, nothing
+    /// muted — costs nothing at all.
+    ///
+    /// Every track silenced gives back a recipe with no tracks, which
+    /// bakes to silence. That is what the owner asked for by muting them
+    /// all, and it is undone by the same buttons.
+    pub fn heard_recipe(&self, recipe: &SequenceRecipe) -> Option<SequenceRecipe> {
+        let all_heard = (0..recipe.tracks.len()).all(|t| self.track_heard(t));
+        if all_heard {
+            return None;
+        }
+        let mut copy = recipe.clone();
+        let mut track = 0;
+        copy.tracks.retain(|_| {
+            let heard = self.track_heard(track);
+            track += 1;
+            heard
+        });
+        Some(copy)
+    }
+
+    /// Forget the undo history, leaving every other piece of view state —
+    /// which instrument is open, the selection, the zoom, each embedded
+    /// canvas's layout — exactly as it is.
+    ///
+    /// For a host that keeps a timeline's VIEW across a close of its
+    /// editor but re-seeds the recipe when it reopens (Overlands #1338
+    /// A6). The two are different promises: which instrument the owner had
+    /// open is still true when the window comes back, but the undo ring
+    /// describes a chain of values the re-seeded recipe is no longer the
+    /// tail of, so a Ctrl+Z after reopening would resurrect edits from the
+    /// previous session.
+    ///
+    /// The embedded canvases' own histories go too: they are off in the
+    /// sequence editor (the recipe's history owns the value), but a canvas
+    /// carried across a close would otherwise keep one from before it was
+    /// embedded.
+    pub fn forget_history(&mut self) {
+        self.history = EditHistory::default();
+        for canvas in self.canvas_states.values_mut() {
+            canvas.forget_history();
+        }
+    }
+
     /// Pick `at` and nothing else, as a plain click on a note does.
     fn select_only(&mut self, at: (usize, usize)) {
         self.selection.clear();
@@ -623,6 +754,11 @@ impl SequenceEditorState {
     /// A removal moves the indices after it down, so a selection kept
     /// across one would otherwise come to mean different notes.
     fn forget_missing_notes(&mut self, recipe: &SequenceRecipe) {
+        // Solo and mute are index-keyed too, so a removed track must not
+        // leave its silence behind on whatever slid into its place.
+        let tracks = recipe.tracks.len();
+        self.muted_tracks.retain(|t| *t < tracks);
+        self.soloed_tracks.retain(|t| *t < tracks);
         self.selection.retain(|(track, event)| {
             recipe
                 .tracks
@@ -1932,6 +2068,11 @@ enum Action {
     /// in [`apply_actions`], because both doors arrive here (#63, Overlands
     /// #1336 C2).
     RemoveTrack(usize),
+    /// Flip track `0`'s mute. Not an edit: nothing is written to the
+    /// recipe, so this never reaches a host's record or its undo history.
+    ToggleMute(usize),
+    /// Flip track `0`'s solo, on the same terms.
+    ToggleSolo(usize),
     /// A removal the user has confirmed.
     RemoveTrackNow(usize),
     /// Copy every selected note in place, and drag the copies instead of
@@ -2001,6 +2142,10 @@ fn timeline(
     // below is inert while one is up, and every Add is held to these.
     let asking = state.pending_removal.is_some();
     let limits = state.limits;
+    // Copied out before the lane loop borrows `state` mutably, the way
+    // `lane_names` is.
+    let muted_now = state.muted_tracks.clone();
+    let soloed_now = state.soloed_tracks.clone();
     let mut asks: Vec<Rect> = Vec::new();
     if state.show_json {
         res.merge(json_io(ui, recipe, &mut state.json, id.with("recipe_json")));
@@ -2075,6 +2220,8 @@ fn timeline(
                     id,
                     style,
                     asking,
+                    muted_now.contains(&ti),
+                    soloed_now.contains(&ti),
                     &mut asks,
                     &mut actions,
                 ));
@@ -2276,6 +2423,19 @@ fn timeline(
                 style,
             );
             paint_marquee(&painter, state.marquee, style);
+            // Last of all, over everything: the playhead is the one line
+            // that moves, and a note or a marker drawn over it would make
+            // it flicker as it passed. Same reason the loop markers go
+            // over the notes.
+            state.playhead_x = paint_playhead(
+                &painter,
+                rect,
+                state.playhead_secs,
+                bpm,
+                ppb,
+                bx(0.0),
+                style,
+            );
         });
 
     // A marquee that ended over a note, or outside the timeline, never sees
@@ -2287,6 +2447,57 @@ fn timeline(
     state.removal_asks.extend(asks);
     res.merge(apply_actions(recipe, state, actions, &lane_names));
     res
+}
+
+/// The playhead: where the monitor is in what it is playing, as a line
+/// down the lanes.
+///
+/// `secs` is in seconds and `bpm` turns it into beats, because the
+/// timeline's x axis is beats and the monitor's clock is seconds — the
+/// conversion has to happen once, here, where the recipe's own BPM is
+/// known.
+///
+/// Returns where it was drawn, in screen points, for
+/// [`SequenceEditorState::playhead_x`]. `None` when there is nothing
+/// playing, or when the position falls outside the timeline — a cursor
+/// clamped to an end it is not at would be a lie told every frame.
+///
+/// Not drawn across the gutter: the gutter is names and buttons, not time,
+/// and a line through it would read as pointing at a track.
+fn paint_playhead(
+    painter: &egui::Painter,
+    rect: Rect,
+    secs: Option<f32>,
+    bpm: f32,
+    ppb: f32,
+    x0: f32,
+    style: &EditorStyle,
+) -> Option<f32> {
+    let secs = secs?;
+    if !secs.is_finite() || !bpm.is_finite() || bpm <= 0.0 {
+        return None;
+    }
+    let beat = secs * bpm / 60.0;
+    let x = x0 + beat * ppb;
+    let lanes_left = rect.left() + GUTTER;
+    if x < lanes_left || x > rect.right() {
+        return None;
+    }
+    painter.line_segment(
+        [
+            Pos2::new(x, rect.top() + RULER_H * 0.5),
+            Pos2::new(x, rect.bottom()),
+        ],
+        egui::Stroke::new(1.5, style.playhead),
+    );
+    // A small head on the ruler, so the line is findable at a glance on a
+    // timeline crowded with notes.
+    painter.circle_filled(
+        Pos2::new(x, rect.top() + RULER_H * 0.5),
+        3.0,
+        style.playhead,
+    );
+    Some(x)
 }
 
 /// The row above the lanes: a track, the zoom and a Fit, the snap grid, how
@@ -2591,6 +2802,8 @@ fn lane_gutter(
     id: Id,
     style: &EditorStyle,
     asking: bool,
+    muted: bool,
+    soloed: bool,
     asks: &mut Vec<Rect>,
     actions: &mut Vec<Action>,
 ) -> EditorResponse {
@@ -2634,9 +2847,85 @@ fn lane_gutter(
         actions.push(Action::RemoveTrack(track));
     }
 
+    // Solo and mute at the gutter's right edge, between the name and the
+    // lane. Letters rather than marks: "S" and "M" are ASCII, so they
+    // cannot become tofu in a host whose face is missing a symbol — the
+    // failure the glyph guard exists to catch.
+    let mut buttons = Vec::new();
+    let right = lane.left() + GUTTER - 4.0;
+    for (i, (letter, soloing)) in [("M", false), ("S", true)].into_iter().rev().enumerate() {
+        let at = Rect::from_min_size(
+            Pos2::new(right - (i as f32 + 1.0) * 16.0, lane.center().y - 7.0),
+            Vec2::splat(14.0),
+        );
+        buttons.push(at);
+        let on = if soloing { soloed } else { muted };
+        let resp = ui
+            .interact(
+                at,
+                id.with((if soloing { "solo" } else { "mute" }, track)),
+                Sense::click(),
+            )
+            .on_hover_text(if soloing {
+                if on {
+                    format!(
+                        "Track {} is soloed: only soloed tracks are heard. Click to stop",
+                        track + 1
+                    )
+                } else {
+                    format!("Hear track {} alone. Solo wins over mute", track + 1)
+                }
+            } else if on {
+                format!("Track {} is silenced. Click to hear it again", track + 1)
+            } else {
+                format!(
+                    "Silence track {} in the audition. The recipe is not changed",
+                    track + 1
+                )
+            });
+        // The LETTER is always a readable tone and the CHIP behind it
+        // carries the state. Tinting the letter itself was the obvious
+        // thing and it does not survive measurement: half-strength ground
+        // text is 2.24:1 on a dark lane, and `warn` — the natural colour
+        // for "silenced" — is 2.79:1 on a light one. Both are letters
+        // nobody can read, in the state the control spends nearly all its
+        // life in. Full `ground_text` is 5.12:1 and 7.59:1, which is what
+        // the remove cross beside it already uses.
+        let tone = if on || resp.hovered() {
+            style.node_title
+        } else {
+            style.ground_text
+        };
+        if on {
+            let chip = if soloing {
+                style.loop_start
+            } else {
+                style.warn
+            };
+            painter.rect_filled(at, 3.0, chip.gamma_multiply(0.35));
+        }
+        painter.text(
+            at.center(),
+            Align2::CENTER_CENTER,
+            letter,
+            egui::FontId::proportional(11.0),
+            tone,
+        );
+        if resp.clicked() {
+            actions.push(if soloing {
+                Action::ToggleSolo(track)
+            } else {
+                Action::ToggleMute(track)
+            });
+        }
+    }
+
     let text = Rect::from_min_max(
         Pos2::new(cross.right() + 4.0, lane.top()),
-        Pos2::new(lane.left() + GUTTER - 4.0, lane.bottom()),
+        Pos2::new(
+            buttons.iter().fold(right, |a, b| a.min(b.left())) - 4.0,
+            lane.bottom(),
+        ),
     );
     let (label, colour) = match name {
         Some((name, _)) => (name.clone(), style.ground_text),
@@ -2914,6 +3203,20 @@ fn apply_actions(
                 state.select_only((track, recipe.tracks[track].events.len() - 1));
                 res.changed = true;
                 res.rebake = true;
+            }
+            Action::ToggleMute(track) => {
+                // Nothing is written to the recipe and `res` is not
+                // touched: solo and mute are ways of listening, so an
+                // audition must not land on the host's undo stack or in
+                // the record everyone else reads (#65, Overlands #1338 D3).
+                if !state.muted_tracks.remove(&track) {
+                    state.muted_tracks.insert(track);
+                }
+            }
+            Action::ToggleSolo(track) => {
+                if !state.soloed_tracks.remove(&track) {
+                    state.soloed_tracks.insert(track);
+                }
             }
             Action::RemoveTrack(track) => {
                 let Some(events) = recipe.tracks.get(track).map(|t| t.events.len()) else {
@@ -5081,6 +5384,273 @@ mod tests {
     }
 
     // ---- C6: adding, copying and moving notes --------------------------
+
+    // -- D1/D3: the playhead, solo and mute (#65, Overlands #1338) --------
+    /// The timeline draws a cursor where the monitor is, converting the
+    /// monitor's seconds into the timeline's beats at the recipe's own BPM.
+    #[test]
+    fn the_timeline_draws_the_playhead_where_the_monitor_is() {
+        let (mut recipe, state) = two_lane_recipe();
+        recipe.bpm = 60.0; // one beat a second, so the arithmetic is legible
+        let mut driver = Driver::with_state(recipe, state);
+        driver.frame(Vec::new());
+        assert_eq!(
+            driver.state.playhead_x(),
+            None,
+            "nothing playing draws no cursor"
+        );
+
+        // Two seconds in at 60 BPM is beat 2.
+        driver.state.set_playhead(Some(2.0));
+        driver.frame(Vec::new());
+        let at_two = driver.state.playhead_x().expect("a cursor at beat 2");
+        driver.state.set_playhead(Some(4.0));
+        driver.frame(Vec::new());
+        let at_four = driver.state.playhead_x().expect("a cursor at beat 4");
+
+        // Beat 4 is twice as far along as beat 2, measured from beat 0.
+        driver.state.set_playhead(Some(0.0));
+        driver.frame(Vec::new());
+        let at_zero = driver.state.playhead_x().expect("a cursor at beat 0");
+        let two = at_two - at_zero;
+        let four = at_four - at_zero;
+        assert!(two > 1.0, "beat 2 is to the right of beat 0");
+        assert!(
+            (four - two * 2.0).abs() < 0.5,
+            "beat 4 is not twice beat 2: {two} then {four}"
+        );
+
+        // And the BPM is really what converts: at 120 the same seconds
+        // land twice as far along.
+        driver.recipe.bpm = 120.0;
+        driver.state.set_playhead(Some(2.0));
+        driver.frame(Vec::new());
+        let faster = driver.state.playhead_x().expect("a cursor") - at_zero;
+        assert!(
+            (faster - two * 2.0).abs() < 0.5,
+            "the bpm does not convert: {two} at 60, {faster} at 120"
+        );
+
+        // Taken away again when nothing plays.
+        driver.state.set_playhead(None);
+        driver.frame(Vec::new());
+        assert_eq!(driver.state.playhead_x(), None);
+    }
+
+    /// A playhead past the end of the timeline is not drawn, rather than
+    /// clamped to the last pixel — a cursor parked on the right-hand edge
+    /// says "playing the final beat", every frame, whether or not it is.
+    #[test]
+    fn a_playhead_off_the_timeline_is_not_drawn() {
+        let (mut recipe, state) = two_lane_recipe();
+        recipe.bpm = 60.0;
+        let mut driver = Driver::with_state(recipe, state);
+        driver.state.set_playhead(Some(100_000.0));
+        driver.frame(Vec::new());
+        assert_eq!(driver.state.playhead_x(), None, "far past the end");
+        // A nonsense position is no position.
+        for bad in [f32::NAN, f32::INFINITY] {
+            driver.state.set_playhead(Some(bad));
+            driver.frame(Vec::new());
+            assert_eq!(driver.state.playhead_x(), None, "a {bad} position");
+        }
+    }
+
+    /// A lane's M and S are letters, and a letter has to be readable in
+    /// both themes, in its off state as well as its on one — an off
+    /// control is the state it spends nearly all its life in.
+    ///
+    /// This caught a real defect: the first version drew them at half the
+    /// ground text, which measured 2.24:1 on a lane in dark. A picture is
+    /// what raised the suspicion; this is what settled it.
+    #[test]
+    fn a_lanes_solo_and_mute_read_on_their_lane_in_both_themes() {
+        use crate::ui::style::tests::AA;
+        use crate::ui::test_paint::contrast_on;
+        for (theme, visuals) in [
+            ("dark", egui::Visuals::dark()),
+            ("light", egui::Visuals::light()),
+        ] {
+            let style = EditorStyle::from_visuals(&visuals);
+            // The letter's own tones. The state's colour is the chip
+            // BEHIND the letter, which is a mark rather than text — the
+            // letter has to read whatever the chip is doing.
+            for (what, tone) in [
+                ("off", style.ground_text),
+                ("on or hovered", style.node_title),
+            ] {
+                for (which, lane) in [("lane", style.lane), ("lane_alt", style.lane_alt)] {
+                    let ratio = contrast_on(tone, lane);
+                    assert!(
+                        ratio >= AA,
+                        "{theme}: an {what} M/S is {ratio:.2}:1 on {which}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Solo and mute decide what is HEARD, on the mixer convention: any
+    /// solo at all silences every track that is not soloed, and solo wins
+    /// over mute.
+    #[test]
+    fn solo_wins_over_mute_and_silences_everything_else() {
+        let mut state = SequenceEditorState::default();
+        // Nothing set: everything is heard.
+        assert!(state.track_heard(0) && state.track_heard(1) && state.track_heard(2));
+
+        state.muted_tracks.insert(1);
+        assert!(state.track_heard(0));
+        assert!(!state.track_heard(1), "a muted track is not heard");
+        assert!(state.track_heard(2));
+
+        // A solo anywhere silences everything that is not soloed —
+        // including track 0, which nobody muted.
+        state.soloed_tracks.insert(2);
+        assert!(!state.track_heard(0), "a solo elsewhere silences this one");
+        assert!(!state.track_heard(1));
+        assert!(state.track_heard(2));
+
+        // Solo wins over mute on the same track.
+        state.soloed_tracks.insert(1);
+        assert!(state.track_heard(1), "solo beats mute on the same track");
+    }
+
+    /// THE FAILURE WORTH FEARING, the sequence half: auditioning a subset
+    /// of the tracks must not change the recipe.
+    #[test]
+    fn hearing_some_tracks_leaves_the_recipe_alone() {
+        let (recipe, mut state) = two_lane_recipe();
+        let before = recipe.clone();
+
+        // Nothing set: no copy at all, so the ordinary case costs nothing.
+        assert!(
+            state.heard_recipe(&recipe).is_none(),
+            "an untouched recipe should need no copy"
+        );
+
+        state.muted_tracks.insert(0);
+        let heard = state
+            .heard_recipe(&recipe)
+            .expect("a copy with one track gone");
+        assert_eq!(recipe, before, "the original recipe was modified");
+        assert_eq!(heard.tracks.len(), 1, "the muted track is not in the copy");
+        assert_eq!(
+            heard.tracks[0].events, before.tracks[1].events,
+            "the kick survived"
+        );
+        // Everything that is not a track rides along, so the copy sounds
+        // like this recipe with a track off rather than like a new one.
+        assert_eq!(heard.bpm, before.bpm);
+        assert_eq!(heard.sample_rate, before.sample_rate);
+        assert_eq!(heard.instruments, before.instruments);
+        assert_eq!(heard.loop_start_beats, before.loop_start_beats);
+
+        // Solo, from the other side.
+        state.muted_tracks.clear();
+        state.soloed_tracks.insert(0);
+        let heard = state
+            .heard_recipe(&recipe)
+            .expect("a copy with only the solo");
+        assert_eq!(heard.tracks.len(), 1);
+        assert_eq!(
+            heard.tracks[0].events, before.tracks[0].events,
+            "the wind survived"
+        );
+        assert_eq!(recipe, before);
+
+        // Everything muted is a silent recipe, which is what was asked
+        // for, not a reason to fall back to playing it all.
+        state.soloed_tracks.clear();
+        state.muted_tracks.insert(0);
+        state.muted_tracks.insert(1);
+        let heard = state.heard_recipe(&recipe).expect("a copy");
+        assert!(heard.tracks.is_empty());
+        assert_eq!(recipe, before);
+    }
+
+    /// The gutter's S and M press, and pressing them is not an edit: the
+    /// recipe is untouched and nothing is marked for a re-bake of the
+    /// record.
+    #[test]
+    fn the_gutter_solo_and_mute_press_without_editing_the_recipe() {
+        let (recipe, state) = two_lane_recipe();
+        let before = recipe.clone();
+        let mut driver = Driver::with_state(recipe, state);
+        driver.frame(Vec::new());
+
+        // The buttons sit at the gutter's right edge, on the lane's centre
+        // line — found from the timeline's own published rect rather than
+        // guessed.
+        let visible = driver.state.timeline_rect().intersect(driver.panel);
+        let lane_mid = |track: usize| visible.top() + RULER_H + (track as f32 + 0.5) * LANE_H;
+        let solo_at = Pos2::new(visible.left() + GUTTER - 4.0 - 8.0, lane_mid(0));
+        let mute_at = Pos2::new(visible.left() + GUTTER - 4.0 - 24.0, lane_mid(0));
+
+        let res = driver.click_at(solo_at, egui::PointerButton::Primary);
+        assert!(driver.state.track_soloed(0), "S did not solo track 1");
+        assert!(
+            !res.changed && !res.rebake,
+            "soloing marked the recipe edited: changed {} rebake {}",
+            res.changed,
+            res.rebake
+        );
+        assert_eq!(driver.recipe, before, "soloing changed the recipe");
+
+        // And again turns it off.
+        driver.click_at(solo_at, egui::PointerButton::Primary);
+        assert!(!driver.state.track_soloed(0), "S does not toggle off");
+
+        let res = driver.click_at(mute_at, egui::PointerButton::Primary);
+        assert!(driver.state.track_muted(0), "M did not mute track 1");
+        assert!(
+            !res.changed && !res.rebake,
+            "muting marked the recipe edited"
+        );
+        assert_eq!(driver.recipe, before);
+    }
+
+    /// A track removed under a solo or a mute must not leave its silence
+    /// behind on whatever slides into its index.
+    #[test]
+    fn removing_a_track_takes_its_solo_and_mute_with_it() {
+        let (recipe, mut state) = two_lane_recipe();
+        state.muted_tracks.insert(1);
+        state.soloed_tracks.insert(1);
+        let mut driver = Driver::with_state(recipe, state);
+        driver.frame(Vec::new());
+        assert!(driver.state.track_muted(1) && driver.state.track_soloed(1));
+
+        driver.recipe.tracks.pop();
+        driver.frame(Vec::new());
+        assert!(
+            !driver.state.track_muted(1) && !driver.state.track_soloed(1),
+            "a gone track left its silence behind"
+        );
+        // And the track that remains is heard, rather than silenced by a
+        // solo that belonged to something that no longer exists.
+        assert!(driver.state.track_heard(0), "the surviving track is silent");
+    }
+
+    /// Forgetting the history keeps every other piece of view state — the
+    /// two are different promises (Overlands #1338 A6).
+    #[test]
+    fn forgetting_the_sequences_history_keeps_the_view() {
+        let (recipe, mut state) = two_lane_recipe();
+        state.set_active_instrument(Some(1));
+        state.set_selected_event(Some((1, 0)));
+        state.set_snap(Snap::Eighth);
+        state.muted_tracks.insert(0);
+        let zoom = state.zoom;
+
+        state.forget_history();
+
+        assert_eq!(state.active_instrument(), Some(1), "the open instrument");
+        assert_eq!(state.selected_event(), Some((1, 0)), "the selection");
+        assert_eq!(state.zoom, zoom, "the zoom");
+        assert!(state.track_muted(0), "the mute");
+        let _ = &recipe;
+    }
 
     /// A view state zoomed to `zoom` points a beat, on `snap`'s grid.
     ///

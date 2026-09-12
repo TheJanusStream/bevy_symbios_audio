@@ -54,6 +54,17 @@
 //! a loop in its graph, so the canvas outlines the two nodes of the loop and
 //! names them:
 //!   cargo run --example host_window --features egui -- --status baking --shot baking.png
+//!
+//! `--playhead <secs>` seeks the audition to `secs` once its bake has
+//! landed, so the cursor on the waveform and on the timeline is in the same
+//! place in every run. Through a real seek, the path a click on the
+//! waveform takes — under `--shot` every sink is muted, and muting is
+//! `set_volume(0)` rather than a pause, so a voice does go on advancing,
+//! but how far it has got when the picture is taken depends on the
+//! machine. Use it with `--status playing` for the patch waveform's cursor
+//! and `--status baking` for the timeline's:
+//!
+//!   cargo run --example host_window --features egui -- --status playing --playhead 0.6 --shot cursor.png
 //!   cargo run --example host_window --features egui -- --status error --shot error.png
 //!
 //! A `baking` picture needs a bake slower than a few frames: the dev profile
@@ -164,8 +175,9 @@ use bevy_symbios_audio::{
     sequence::Event,
     ui::{
         AudioEditorPlugin, AudioMonitor, AuditionSource, AuditionState, EditorLimits,
-        MonitorRequest, MonitorStatus, PatchEditorState, SequenceEditorState,
-        active_instrument_canvas, audio_patch_canvas, audition_strip, sequence_recipe_editor,
+        MonitorControl, MonitorRequest, MonitorStatus, PatchEditorState, SequenceEditorState,
+        active_instrument_canvas, audio_patch_canvas, audition_strip, patch_hearing,
+        sequence_recipe_editor,
     },
 };
 
@@ -264,6 +276,7 @@ fn main() -> AppExit {
             (
                 log_window_sizes,
                 ask_for_the_status,
+                move_the_playhead,
                 silence_the_sinks,
                 shoot,
             ),
@@ -273,8 +286,8 @@ fn main() -> AppExit {
 
 /// The command line: `--light`, `--orphan`, `--rename <name>`, `--drag`,
 /// `--wire`, `--menu <which>`, `--notes <what>`, `--limits`, `--confirm`,
-/// `--beyond`, `--hover <label>`, `--broken`, `--status <state>` and
-/// `--shot <path>`.
+/// `--beyond`, `--hover <label>`, `--broken`, `--status <state>`,
+/// `--playhead <secs>` and `--shot <path>`.
 #[derive(Resource)]
 struct Args {
     light: bool,
@@ -304,6 +317,9 @@ struct Args {
     notice: Option<String>,
     notice_live: bool,
     status: Option<Status>,
+    /// `--playhead <secs>`: seek the audition to `secs` once it is
+    /// playing, so a picture of the cursor is the same picture every run.
+    playhead: Option<f32>,
     shot: Option<String>,
 }
 
@@ -363,6 +379,11 @@ enum Status {
     Idle,
     Baking,
     Playing,
+    /// The SEQUENCE slot playing, asked for early enough that its bake has
+    /// landed and its timeline is showing a cursor when the picture is
+    /// taken. `baking` asks for the same slot at the shot frame itself, to
+    /// picture the Baking chip; this one asks with time to spare.
+    PlayingSequence,
     Muted,
     Error,
 }
@@ -374,9 +395,13 @@ impl Status {
             "baking" => Self::Baking,
             "playing" => Self::Playing,
             "muted" => Self::Muted,
+            "playing-sequence" => Self::PlayingSequence,
             "error" => Self::Error,
             other => {
-                eprintln!("--status {other}: expected idle, baking, playing, muted or error");
+                eprintln!(
+                    "--status {other}: expected idle, baking, playing, \
+                     playing-sequence, muted or error"
+                );
                 std::process::exit(2);
             }
         }
@@ -418,6 +443,7 @@ impl Args {
             notice: value("--notice", "").or_else(|| value("--notice-live", "")),
             notice_live: args.iter().any(|a| a == "--notice-live"),
             status,
+            playhead: value("--playhead", "1.0").and_then(|v| v.parse().ok()),
             shot,
         }
     }
@@ -638,12 +664,43 @@ fn ask_for_the_status(
             let source = AuditionSource::patch(&editor.patch, PATCH_SAMPLE_RATE, PATCH_SECS);
             editor.patch_audition.play(&source)
         }
-        Status::Baking => editor
+        Status::Baking | Status::PlayingSequence => editor
             .sequence_audition
             .play(&AuditionSource::sequence(&editor.recipe)),
     };
     info!("--status {status:?}: asking the monitor to play a slot");
     requests.write(request);
+}
+
+/// `--playhead <secs>`: put the audition's cursor at `secs`, once there is
+/// a bake for it to be inside.
+///
+/// Through a real [`MonitorControl::Seek`], not by writing a position: it
+/// is the same path a click on the waveform takes, so the picture proves
+/// the mechanism rather than a value poked past it. Under `--shot` every
+/// sink is muted — muting is `set_volume(0)`, not a pause, so a voice does
+/// go on advancing — but how far it has got by the time the picture is
+/// taken depends on the machine, and a cursor that lands somewhere
+/// different every run is a picture nothing can be checked against. This
+/// pins it.
+fn move_the_playhead(
+    args: Res<Args>,
+    editor: Res<Editor>,
+    monitor: Res<AudioMonitor>,
+    mut controls: MessageWriter<MonitorControl>,
+    mut asked: Local<bool>,
+) {
+    let Some(secs) = args.playhead else {
+        return;
+    };
+    // Once the bake has landed: a seek before there is a buffer has
+    // nowhere to land and is dropped.
+    if *asked || editor.frames_shown < STATUS_AT_FRAMES || monitor.loop_secs().is_none() {
+        return;
+    }
+    *asked = true;
+    info!("--playhead: seeking the audition to {secs} s");
+    controls.write(MonitorControl::Seek(secs));
 }
 
 /// Hold every sink to the host bar's Mute, and silence them all under
@@ -665,6 +722,7 @@ fn render_ui(
     mut editor: ResMut<Editor>,
     monitor: Res<AudioMonitor>,
     mut requests: MessageWriter<MonitorRequest>,
+    mut controls: MessageWriter<MonitorControl>,
 ) {
     let Ok(ctx) = contexts.ctx_mut() else {
         return;
@@ -711,8 +769,24 @@ fn render_ui(
     let patch_at = free.left_top() + egui::vec2(GAP, GAP);
     let sequence_at = patch_at + egui::vec2(SLOT.x + GAP, 0.0);
     editor.shown = [
-        patch_slot(ctx, editor, &monitor, &mut requests, patch_at, free),
-        sequence_slot(ctx, editor, &monitor, &mut requests, sequence_at, free),
+        patch_slot(
+            ctx,
+            editor,
+            &monitor,
+            &mut requests,
+            &mut controls,
+            patch_at,
+            free,
+        ),
+        sequence_slot(
+            ctx,
+            editor,
+            &monitor,
+            &mut requests,
+            &mut controls,
+            sequence_at,
+            free,
+        ),
     ];
     if editor.shown.iter().all(Option::is_some) {
         editor.frames_shown += 1;
@@ -757,6 +831,7 @@ fn patch_slot(
     editor: &mut Editor,
     monitor: &AudioMonitor,
     requests: &mut MessageWriter<MonitorRequest>,
+    controls: &mut MessageWriter<MonitorControl>,
     pos: egui::Pos2,
     free: egui::Rect,
 ) -> Option<egui::Rect> {
@@ -776,6 +851,9 @@ fn patch_slot(
             ) {
                 requests.write(request);
             }
+            for control in editor.patch_audition.take_controls() {
+                controls.write(control);
+            }
             ui.separator();
             let res = audio_patch_canvas(
                 ui,
@@ -784,6 +862,16 @@ fn patch_slot(
                 id.with("canvas"),
             );
             editor.patch_committed = res.rebake;
+            // "Hear this node": a COPY of the patch, output moved, played
+            // in place of the whole thing. The patch itself is untouched
+            // (#65, Overlands #1338 D3).
+            if let Some(node) = editor.patch_state.take_hear_node() {
+                requests.write(MonitorRequest::PlayPatch {
+                    patch: patch_hearing(&editor.patch, node),
+                    sample_rate: PATCH_SAMPLE_RATE,
+                    duration_secs: PATCH_SECS,
+                });
+            }
         })
         .map(|shown| shown.response.rect)
 }
@@ -796,6 +884,7 @@ fn sequence_slot(
     editor: &mut Editor,
     monitor: &AudioMonitor,
     requests: &mut MessageWriter<MonitorRequest>,
+    controls: &mut MessageWriter<MonitorControl>,
     pos: egui::Pos2,
     free: egui::Rect,
 ) -> Option<egui::Rect> {
@@ -804,16 +893,35 @@ fn sequence_slot(
     slot_window("Sequence slot", pos, free)
         .show(ctx, |ui| {
             host_notice(ui, editor.notice.as_deref(), editor.notice_live);
+            // Solo and mute decide what the audition plays: a copy with
+            // the silenced tracks left out, or the recipe itself when
+            // every track is heard.
+            let heard = editor.sequence_state.heard_recipe(&editor.recipe);
+            let playing = heard.as_ref().unwrap_or(&editor.recipe);
             if let Some(request) = audition_strip(
                 ui,
                 monitor,
                 &mut editor.sequence_audition,
-                AuditionSource::sequence(&editor.recipe),
+                AuditionSource::sequence(playing),
                 editor.sequence_committed,
                 editor.muted,
             ) {
                 requests.write(request);
             }
+            for control in editor.sequence_audition.take_controls() {
+                controls.write(control);
+            }
+            // The timeline's cursor, but ONLY while the monitor is playing
+            // this slot's own audition: a cursor running over a timeline
+            // whose sound is not the one in the room says this recipe is
+            // sounding when it is not.
+            editor.sequence_state.set_playhead(
+                editor
+                    .sequence_audition
+                    .is_playing(monitor)
+                    .then(|| monitor.position_secs())
+                    .flatten(),
+            );
             ui.separator();
             let mut committed = false;
             // Panel ids are global, so they are salted with the slot: two
@@ -1767,6 +1875,13 @@ fn status_reached(status: Option<Status>, monitor: &AudioMonitor) -> Result<bool
     Ok(match status {
         None | Some(Status::Idle) => true,
         Some(Status::Playing | Status::Muted) => monitor.status == MonitorStatus::Playing,
+        // Playing AND far enough in for the cursor to be off the very
+        // start: a playhead pinned to beat 0 in every picture is a picture
+        // that proves nothing.
+        Some(Status::PlayingSequence) => {
+            monitor.status == MonitorStatus::Playing
+                && monitor.position_secs().is_some_and(|at| at > 0.2)
+        }
         Some(Status::Error) => matches!(monitor.status, MonitorStatus::Error(_)),
         Some(Status::Baking) => match monitor.bake_elapsed() {
             Some(elapsed) => elapsed >= BAKING_FOR,

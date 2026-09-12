@@ -50,7 +50,9 @@ use std::time::Duration;
 use bevy_egui::egui;
 
 use super::graph::describe_graph_error;
-use super::preview::{AudioMonitor, MonitorRequest, MonitorStatus, fingerprint, waveform};
+use super::preview::{
+    AudioMonitor, MonitorControl, MonitorRequest, MonitorStatus, fingerprint, waveform_with_cursor,
+};
 use super::style::editor_style;
 use crate::patch::{AudioPatch, topo_sort};
 use crate::sequence::SequenceRecipe;
@@ -210,6 +212,15 @@ pub struct AuditionState {
     due: Option<f64>,
     /// The fingerprint of the last play request this strip made.
     mine: Option<u64>,
+    /// What the strip asked of the playing voice this frame — a seek from
+    /// a click on the waveform, a level from the volume slider — for the
+    /// host to drain with [`Self::take_controls`].
+    ///
+    /// A second channel from the returned [`MonitorRequest`] because these
+    /// steer the voice that is already playing rather than replacing it,
+    /// and because [`MonitorControl`] could be added without breaking the
+    /// exhaustive matches a host has written over `MonitorRequest`.
+    controls: Vec<MonitorControl>,
 }
 
 impl AuditionState {
@@ -241,6 +252,35 @@ impl AuditionState {
         if !on {
             self.due = None;
         }
+    }
+
+    /// Whether the monitor is playing THIS strip's audition right now.
+    ///
+    /// Several strips share one monitor, and each shows only its own
+    /// audition. A host drawing a playhead needs the same answer the strip
+    /// uses for its own chip and waveform: a cursor running over an editor
+    /// whose sound is not the one in the room says that slot is sounding
+    /// when it is not.
+    pub fn is_playing(&self, monitor: &AudioMonitor) -> bool {
+        let about = monitor.auditioning();
+        about.is_some() && about == self.mine && monitor.status == MonitorStatus::Playing
+    }
+
+    /// Take what the strip asked of the playing voice this frame, and
+    /// leave the strip with nothing owed.
+    ///
+    /// Drain this every frame you draw a strip and write the results as
+    /// messages, beside the [`MonitorRequest`] the strip returns:
+    ///
+    /// ```ignore
+    /// requests.write_batch(audition_strip(ui, monitor, state, source, committed, muted));
+    /// controls.write_batch(state.take_controls());
+    /// ```
+    ///
+    /// Empty on almost every frame: a click on the waveform and a drag of
+    /// the volume slider are the only things that fill it.
+    pub fn take_controls(&mut self) -> Vec<MonitorControl> {
+        std::mem::take(&mut self.controls)
     }
 }
 
@@ -321,6 +361,7 @@ pub fn audition_strip(
             state.set_auto(on);
         }
         status_chip(ui, &status, monitor.bake_elapsed(), muted);
+        monitor_volume(ui, monitor, state, muted);
     });
     ui.label(egui::RichText::new(source.caption()).weak());
     if let MonitorStatus::Error(message) = &status {
@@ -330,7 +371,26 @@ pub fn audition_strip(
     }
     let samples = monitor.samples_of();
     if !monitor.last_samples.is_empty() && (samples.is_none() || samples == state.mine) {
-        waveform(ui, &monitor.last_samples);
+        // The cursor is this strip's only while the monitor is playing
+        // THIS strip's audition: several strips share one monitor, and a
+        // playhead running over another slot's waveform would say this
+        // slot is sounding when it is not.
+        let position = live.then(|| monitor.position_secs()).flatten();
+        let drawn = waveform_with_cursor(
+            ui,
+            &monitor.last_samples,
+            position,
+            monitor.loop_secs().unwrap_or(0.0),
+            egui::vec2(ui.available_width(), 72.0),
+        );
+        if let Some(secs) = drawn.seek {
+            state.controls.push(MonitorControl::Seek(secs));
+        }
+        drawn.response.on_hover_text(if live {
+            "What is playing, with the line showing where it has got to"
+        } else {
+            "The last bake. Audition to play it"
+        });
     }
 
     if asked.is_none()
@@ -344,6 +404,45 @@ pub fn audition_strip(
         }
     }
     asked
+}
+
+/// The monitor's own output level, as a compact slider on the strip's row.
+///
+/// The MONITOR's level, not the app's: it scales this author monitor and
+/// nothing else the host plays, which is why it sits here beside Audition
+/// and Stop rather than anywhere near the app's mute. Its hover says so,
+/// because a second volume control in a world that already has one is
+/// otherwise a thing to be afraid of.
+///
+/// Muted is a state of the app, not of this slider, so the slider still
+/// moves while the app's sound is off — it is setting what will be heard
+/// when the sound comes back — and says as much.
+fn monitor_volume(
+    ui: &mut egui::Ui,
+    monitor: &AudioMonitor,
+    state: &mut AuditionState,
+    muted: bool,
+) {
+    let mut level = monitor.volume();
+    let hover = if muted {
+        "How loud this slot's audition plays — this monitor only, not the \
+         world's sound. The app's sound is muted, so this sets what you \
+         will hear when it is not."
+    } else {
+        "How loud this slot's audition plays — this monitor only, not the \
+         world's sound"
+    };
+    let changed = ui
+        .add(
+            egui::Slider::new(&mut level, 0.0..=1.0)
+                .show_value(false)
+                .text("Level"),
+        )
+        .on_hover_text(hover)
+        .changed();
+    if changed {
+        state.controls.push(MonitorControl::Volume(level));
+    }
 }
 
 /// The Auto toggle's hover, which says why it starts off where it does.

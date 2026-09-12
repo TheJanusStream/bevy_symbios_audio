@@ -179,6 +179,10 @@ pub struct PatchEditorState {
     /// Undo/redo over the patch (#60). Off in the sequence editor's
     /// embedded canvas, where the recipe's history owns the value.
     history: EditHistory<AudioPatch>,
+    /// A node the owner asked to hear on its own, for the host to drain
+    /// with [`Self::take_hear_node`]. Not an edit: see
+    /// [`Action::HearNode`].
+    hear_node: Option<NodeId>,
     /// The canvas took this frame's keyboard.
     owns_keys: bool,
     /// The canvas acted on an Escape this frame — it cleared a selection.
@@ -247,6 +251,7 @@ impl Default for PatchEditorState {
             mutate_rate: 0.3,
             json: super::JsonIoState::default(),
             history: EditHistory::default(),
+            hear_node: None,
             owns_keys: false,
             took_escape: false,
             ports: Vec::new(),
@@ -554,6 +559,39 @@ impl PatchEditorState {
         self.history.commit(patch);
     }
 
+    /// Take the node the owner asked to hear on its own, if any, and
+    /// leave the canvas with nothing owed.
+    ///
+    /// Drain this every frame you draw a canvas. Turn it into an audition
+    /// with [`patch_hearing`], which copies the patch rather than changing
+    /// it:
+    ///
+    /// ```ignore
+    /// if let Some(node) = state.take_hear_node() {
+    ///     let heard = patch_hearing(patch, node);
+    ///     requests.push(MonitorRequest::PlayPatch { patch: heard, sample_rate, duration_secs });
+    /// }
+    /// ```
+    ///
+    /// `None` on almost every frame: only the node context menu fills it.
+    pub fn take_hear_node(&mut self) -> Option<NodeId> {
+        self.hear_node.take()
+    }
+
+    /// Forget the undo history, leaving every other piece of view state —
+    /// node positions, pan and zoom, the selection — exactly as it is.
+    ///
+    /// For a host that keeps a canvas's LAYOUT across a close of its
+    /// editor but re-seeds the patch when it reopens (Overlands #1338 A6).
+    /// The two are different promises: where the owner put the boxes is
+    /// still true when the window comes back, but the undo ring describes
+    /// a chain of values the re-seeded patch is no longer the tail of, so
+    /// a Ctrl+Z after reopening would jump to something that was never on
+    /// screen in this session.
+    pub fn forget_history(&mut self) {
+        self.history = EditHistory::default();
+    }
+
     /// The caps this canvas holds its patch to.
     pub fn limits(&self) -> &EditorLimits {
         &self.limits
@@ -577,6 +615,32 @@ impl PatchEditorState {
     /// #1333).
     pub fn wants_keyboard(&self) -> bool {
         self.owns_keys
+    }
+
+    /// Where node `id` sits on the canvas, in scene units, or `None` for a
+    /// node the canvas has not placed yet.
+    ///
+    /// Scene units, not screen: [`Self::canvas_to_screen`] takes one to the
+    /// screen. Published for the same reason [`Self::wires`] is — a reader
+    /// that works a node's place out again from the auto-layout is a second
+    /// answer waiting to disagree with the first.
+    pub fn node_position(&self, id: NodeId) -> Option<Pos2> {
+        self.positions.get(&id).copied()
+    }
+
+    /// Put node `id` at `at`, in scene units, as a drag of its title does.
+    ///
+    /// The node is marked as placed by hand, so a Tidy is what moves it
+    /// next rather than the next auto-layout — otherwise a position set
+    /// here would be overwritten the moment the boxes were measured.
+    ///
+    /// For a host restoring a layout it kept, and for a harness placing
+    /// nodes without dragging them. Node positions are editor state and
+    /// are deliberately not part of an [`AudioPatch`], so nothing here
+    /// writes them to a record.
+    pub fn set_node_position(&mut self, id: NodeId, at: Pos2) {
+        self.positions.insert(id, at);
+        self.auto.remove(&id);
     }
 
     /// Every wire the canvas drew on its last frame, in canvas units.
@@ -689,6 +753,223 @@ fn input_ports(kind: &NodeKind) -> &'static [&'static str] {
         // core crate); a not-yet-known kind contributes no input ports here.
         _ => &[],
     }
+}
+
+/// A COPY of `patch` whose output is `node`, for auditioning one node on
+/// its own.
+///
+/// `patch` is not changed — that is the whole point, and the failure worth
+/// fearing. "Hear this node" is a way of listening, not an edit: it must
+/// not reach the owner's record, their undo history, or the other people
+/// the host is broadcasting to. The audition plays the copy and the copy is
+/// dropped when it has been baked.
+///
+/// Everything upstream of `node` is heard, because that is what makes the
+/// node sound like itself; everything downstream is not, because that is
+/// what "this node" means. Nothing is pruned: the baker already walks only
+/// what the output depends on (`topo_sort`), so a copy with a different
+/// output bakes only the nodes that feed it.
+///
+/// A `node` that is not in the patch gives a copy with the output it
+/// already had, rather than a patch with a dangling output: an id that has
+/// gone is a stale menu, and silence with no explanation would be a worse
+/// answer than the sound the owner last had.
+pub fn patch_hearing(patch: &AudioPatch, node: NodeId) -> AudioPatch {
+    let mut copy = patch.clone();
+    if copy.graph.nodes.iter().any(|n| n.id == node) {
+        copy.graph.output = node;
+    }
+    copy
+}
+
+// ---------------------------------------------------------------------------
+// What a port does, and what a wire into it actually sweeps (B14)
+// ---------------------------------------------------------------------------
+
+/// What driving a port does to the node that owns it.
+///
+/// Every port on every node is read the same way by the baker — each
+/// connection is `outputs[src] * amount`, a port's connections are summed,
+/// and the node ADDS that sum to its own parameter (symbios-audio
+/// `src/bake.rs:259`, then e.g. `src/filter.rs:156`). That is not visible
+/// anywhere on screen, and "amt" beside a number says nothing about which
+/// number it is or what it is added to (#65, Overlands #1338 B14).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum PortRole {
+    /// The audio this node processes, rather than a parameter of it.
+    Signal,
+    /// Opens the envelope while it is above the gate threshold.
+    Gate,
+    /// Adds to one named parameter, whose own value is `base`.
+    Adds {
+        /// The parameter's name, exactly as its own slider is labelled, so
+        /// the port and the control it moves read as the same thing.
+        label: &'static str,
+        /// Its unit, `" Hz"` or `""`, as the slider's suffix.
+        unit: &'static str,
+        /// What the node's own slider is set to — the value the sum is
+        /// added to.
+        base: f32,
+    },
+}
+
+/// What `port` does on a node of `kind`, or `None` for a port this editor
+/// does not know (a kind added upstream, or an extra port from loaded JSON).
+fn port_role(kind: &NodeKind, port: &str) -> Option<PortRole> {
+    use PortRole::{Adds, Gate, Signal};
+    let adds = |label, unit, base| Some(Adds { label, unit, base });
+    match (kind, port) {
+        (NodeKind::Sine(o), "freq") => adds("Frequency", " Hz", o.freq_hz),
+        (NodeKind::Sine(o), "amplitude") => adds("Amplitude", "", o.amplitude),
+        (NodeKind::Square(o), "freq") => adds("Frequency", " Hz", o.freq_hz),
+        (NodeKind::Square(o), "amplitude") => adds("Amplitude", "", o.amplitude),
+        (NodeKind::Sawtooth(o), "freq") => adds("Frequency", " Hz", o.freq_hz),
+        (NodeKind::Sawtooth(o), "amplitude") => adds("Amplitude", "", o.amplitude),
+        (NodeKind::Triangle(o), "freq") => adds("Frequency", " Hz", o.freq_hz),
+        (NodeKind::Triangle(o), "amplitude") => adds("Amplitude", "", o.amplitude),
+        (NodeKind::BiquadLowpass(f), "cutoff_hz") => adds("Cutoff", " Hz", f.cutoff_hz),
+        (NodeKind::BiquadLowpass(f), "q") => adds("Q", "", f.q),
+        (NodeKind::BiquadHighpass(f), "cutoff_hz") => adds("Cutoff", " Hz", f.cutoff_hz),
+        (NodeKind::BiquadHighpass(f), "q") => adds("Q", "", f.q),
+        (NodeKind::BiquadBandpass(f), "center_hz") => adds("Center", " Hz", f.center_hz),
+        (NodeKind::BiquadBandpass(f), "q") => adds("Q", "", f.q),
+        (NodeKind::Gain(g), "gain") => adds("Gain", "", g.gain),
+        (NodeKind::Adsr(_), "gate") => Some(Gate),
+        (
+            NodeKind::BiquadLowpass(_)
+            | NodeKind::BiquadHighpass(_)
+            | NodeKind::BiquadBandpass(_)
+            | NodeKind::Gain(_)
+            | NodeKind::Chorus(_)
+            | NodeKind::Reverb(_),
+            "in",
+        ) => Some(Signal),
+        (NodeKind::Mix(_), "a" | "b" | "c" | "d") => Some(Signal),
+        _ => None,
+    }
+}
+
+/// The port's row label: what driving it does, in words.
+///
+/// Falls back to the bare port name for a port with no known role, which is
+/// what every row said before this.
+fn port_label(kind: &NodeKind, port: &str) -> String {
+    match port_role(kind, port) {
+        Some(PortRole::Adds { label, unit, .. }) => {
+            if unit.is_empty() {
+                format!("{port}: adds to {label}")
+            } else {
+                format!("{port}: adds to {label} ({})", unit.trim())
+            }
+        }
+        Some(PortRole::Signal) => format!("{port}: the signal in"),
+        Some(PortRole::Gate) => format!("{port}: opens the envelope"),
+        None => format!("{port}:"),
+    }
+}
+
+/// What a node's output ranges over, in its own units, where its own
+/// parameters say — `None` where they do not.
+///
+/// Only the three #1338 names it, each verified against the core crate at
+/// HEAD rather than assumed:
+/// - an [`Lfo`] is `raw * depth + offset` with `raw` in `[-1, 1]`
+///   (symbios-audio `src/lfo.rs:143`), so `offset ± |depth|`;
+/// - an [`AdsrEnvelope`] peaks at 1 on attack and rests at 0, so `0..=1`;
+/// - an oscillator is `wave * amplitude`, so `±amplitude`.
+///
+/// A node whose own amplitude is itself modulated ranges wider than this,
+/// which is why [`sweep_text`] says "about".
+fn output_range(kind: &NodeKind) -> Option<(f32, f32)> {
+    match kind {
+        NodeKind::Lfo(lfo) => {
+            let d = lfo.depth.abs();
+            Some((lfo.offset - d, lfo.offset + d))
+        }
+        NodeKind::Adsr(_) => Some((0.0, 1.0)),
+        NodeKind::Sine(o) => Some((-o.amplitude.abs(), o.amplitude.abs())),
+        NodeKind::Square(o) => Some((-o.amplitude.abs(), o.amplitude.abs())),
+        NodeKind::Sawtooth(o) => Some((-o.amplitude.abs(), o.amplitude.abs())),
+        NodeKind::Triangle(o) => Some((-o.amplitude.abs(), o.amplitude.abs())),
+        _ => None,
+    }
+}
+
+/// What one wire actually does to the parameter at its far end, in words —
+/// `"about 150 \u{00B1} 250 Hz"`, or `"about 150 \u{27A1} 400 Hz"` when the
+/// swing is not centred on the base.
+///
+/// `from` is the source node, `to` the destination, `port` the port on it
+/// and `amount` the connection's multiplier. `None` when either end is a
+/// kind whose range this editor does not know, or when the port is a
+/// signal or a gate rather than a parameter: a sweep in Hz is a thing to
+/// say about a cutoff, and a lie about an audio input.
+///
+/// "About", because the destination's own parameter can be modulated by
+/// other wires at the same time, and the source's amplitude can be
+/// modulated too. This states what THIS wire contributes over a base
+/// nothing else is moving, which is the question a reader has while
+/// looking at this one wire.
+fn sweep_text(from: &NodeKind, to: &NodeKind, port: &str, amount: f32) -> Option<String> {
+    let PortRole::Adds { unit, base, .. } = port_role(to, port)? else {
+        return None;
+    };
+    let (lo, hi) = output_range(from)?;
+    if !amount.is_finite() || !base.is_finite() || !lo.is_finite() || !hi.is_finite() {
+        return None;
+    }
+    // A negative amount flips the ends over; the swing is the same, and
+    // the reader wants it low-to-high either way.
+    let (mut a, mut b) = (base + amount * lo, base + amount * hi);
+    if a > b {
+        std::mem::swap(&mut a, &mut b);
+    }
+    if (b - a).abs() < f32::EPSILON {
+        // An amount of zero, or a source that does not move: the wire is
+        // there and changes nothing, which is worth saying plainly.
+        return Some(format!("about {}{unit}, unmoved", round_for(base)));
+    }
+    let centre = (a + b) * 0.5;
+    let half = (b - a) * 0.5;
+    // Centred on the node's own value — the usual case, an LFO at offset 0
+    // or an oscillator — reads far better as a ± than as a span.
+    if (centre - base).abs() <= half * 0.01 {
+        Some(format!(
+            "about {} \u{00B1} {}{unit}",
+            round_for(base),
+            round_for(half)
+        ))
+    } else {
+        Some(format!(
+            "about {} \u{27A1} {}{unit}",
+            round_for(a),
+            round_for(b)
+        ))
+    }
+}
+
+/// A number at a precision a reader can hold: whole numbers for anything
+/// above ten, where a cutoff lives, and two decimals below, where a Q and
+/// an amplitude do.
+fn round_for(v: f32) -> String {
+    if v.abs() >= 10.0 {
+        format!("{v:.0}")
+    } else {
+        format!("{v:.2}")
+    }
+}
+
+/// The drag speed for an amount of `amount`, in units a pixel.
+///
+/// A fixed speed cannot serve both ends of this control: `amt` is a plain
+/// multiplier on a source's output, so it is 0.5 into an amplitude and 500
+/// into a cutoff in Hz, and the 0.05 both used to share meant ten thousand
+/// pixels of dragging to reach 500 (#65, Overlands #1338 B14). Scaling with
+/// magnitude makes every amount about the same number of pixels wide,
+/// with a floor so an amount at zero can still be moved off it.
+fn amount_speed(amount: f32) -> f64 {
+    const FLOOR: f32 = 0.01;
+    f64::from((amount.abs() * 0.01).max(FLOOR))
 }
 
 /// Longest-upstream-chain depth per node (the auto-layout column).  Falls back
@@ -992,6 +1273,9 @@ enum Action {
     /// structural edit.
     MutateNode(NodeId),
     SetOutput(NodeId),
+    /// Audition this node alone, without changing the patch — see
+    /// [`patch_hearing`].
+    HearNode(NodeId),
     Duplicate(NodeId),
     Delete(NodeId),
 }
@@ -1671,6 +1955,23 @@ fn canvas_contents(
                 // one-click Mutate used to sit a pixel from the drag handle
                 // with nothing to undo it (#60, Overlands #1333 B7).
                 grip.context_menu(|ui| {
+                    // The reason sits IN the label, not on a hover: egui
+                    // suppresses every tooltip inside an open popup, so a
+                    // menu item that explains itself on hover explains
+                    // itself nowhere (#63, Overlands #1336/#1337).
+                    let is_output = output_id == nid;
+                    let hear = if is_output {
+                        "Hear this node \u{00B7} already the output"
+                    } else {
+                        "Hear this node"
+                    };
+                    if ui
+                        .add_enabled(!is_output, egui::Button::new(hear).frame(false))
+                        .clicked()
+                    {
+                        actions.push(Action::HearNode(nid));
+                        ui.close();
+                    }
                     for (label, action) in [
                         ("Mutate this node", Action::MutateNode(nid)),
                         ("Set as output", Action::SetOutput(nid)),
@@ -2128,6 +2429,13 @@ fn canvas_contents(
                     res.rebake = true;
                 }
             }
+            Action::HearNode(nid) => {
+                // Nothing is written to the patch: `res.changed` and
+                // `res.rebake` both stay where they are, so an audition of
+                // one node is not an edit and does not reach a host's
+                // undo history or its record (#65, Overlands #1338 D3).
+                state.hear_node = Some(nid);
+            }
             Action::Duplicate(nid) => {
                 if let Some(copy) = duplicate_node(patch, state, nid) {
                     state.selected = Some(copy);
@@ -2260,12 +2568,23 @@ fn wire_tooltip(wire: &WireGeom, graph: &NodeGraph, names: &HashMap<NodeId, Stri
         Connection::Node { amount, .. } => Some(*amount),
         Connection::Constant { .. } => None,
     });
+    // What this wire actually sweeps, where both ends' ranges are known.
+    // The multiplier alone says nothing: every port ADDS its summed inputs
+    // to the node's own value, so "\u{00D7} 250" into a cutoff at 150 Hz is a
+    // filter moving between -100 and 400 Hz, which is the sentence a
+    // reader wants and the one no part of this editor said (#65,
+    // Overlands #1338 B14).
+    let sweep = amount.and_then(|amount| {
+        let kind_of = |id: NodeId| graph.nodes.iter().find(|n| n.id == id).map(|n| &n.kind);
+        sweep_text(kind_of(wire.from)?, kind_of(wire.to)?, &wire.port, amount)
+    });
     match amount {
         Some(amount) => format!(
-            "{} \u{27A1} {} \u{00B7} {} \u{00D7} {amount}",
+            "{} \u{27A1} {} \u{00B7} {} \u{00D7} {amount}{}",
             named(wire.from),
             named(wire.to),
-            wire.port
+            wire.port,
+            sweep.map(|s| format!("\n{s}")).unwrap_or_default()
         ),
         None => format!(
             "{} \u{27A1} {} \u{00B7} {}",
@@ -2473,6 +2792,13 @@ fn connection_editor(
     if ports.is_empty() {
         return (res, rows);
     }
+    // What each port does, worked out before the loop below borrows
+    // `node.inputs` mutably — `port_label` reads `node.kind`, and the two
+    // cannot be borrowed across the same closure.
+    let port_labels: Vec<String> = ports
+        .iter()
+        .map(|port| port_label(&node.kind, port))
+        .collect();
 
     rule(ui, rules);
     ui.label(egui::RichText::new("Inputs").weak());
@@ -2480,11 +2806,11 @@ fn connection_editor(
     let mut to_delete: Vec<(String, usize)> = Vec::new();
     let mut to_add_const: Vec<String> = Vec::new();
 
-    for port in &ports {
+    for (pi, port) in ports.iter().enumerate() {
         let room = port_room(limits, node, port);
         let name_row = ui
             .horizontal(|ui| {
-                ui.label(format!("{port}:"));
+                ui.label(&port_labels[pi]);
                 if ui
                     .add_enabled(room.has_room(), egui::Button::new("Add constant").small())
                     .on_hover_text(format!("Drive {port} with a fixed value instead of a wire"))
@@ -2519,7 +2845,9 @@ fn connection_editor(
                                 .cloned()
                                 .unwrap_or_else(|| format!("#{}", id.0));
                             ui.label(format!("from {from}"));
-                            let r = ui.add(egui::DragValue::new(amount).speed(0.05).prefix("amt "));
+                            let speed = amount_speed(*amount);
+                            let r =
+                                ui.add(egui::DragValue::new(amount).speed(speed).prefix("amt "));
                             res.changed |= r.changed();
                             res.rebake |= r.drag_stopped() || (r.changed() && !r.dragged());
                         }
@@ -2827,6 +3155,364 @@ mod tests {
                 "{name}: an output dot"
             );
         }
+    }
+
+    // -- D3: hear one node ------------------------------------------------
+
+    /// THE FAILURE WORTH FEARING: auditioning one node must not change the
+    /// patch. "Hear this node" is a way of listening, not an edit — if it
+    /// wrote, it would reach the owner's record, their undo history and
+    /// everyone else in the room, for pressing a menu item that says
+    /// "hear".
+    #[test]
+    fn hearing_one_node_leaves_the_original_patch_alone() {
+        let patch = three_node_patch();
+        let before = patch.clone();
+        let target = patch.graph.nodes[0].id;
+        assert_ne!(patch.graph.output, target, "a node that is not the output");
+
+        let heard = patch_hearing(&patch, target);
+
+        assert_eq!(patch, before, "the original patch was modified");
+        assert_eq!(heard.graph.output, target, "the copy is output at the node");
+        // Everything else rides along: the copy is the same patch, heard
+        // from a different place, so it sounds like that node in this
+        // patch rather than like that node on its own.
+        assert_eq!(heard.seed, before.seed);
+        assert_eq!(heard.graph.nodes.len(), before.graph.nodes.len());
+        for (a, b) in heard.graph.nodes.iter().zip(&before.graph.nodes) {
+            assert_eq!(a.id, b.id);
+            assert_eq!(a.kind, b.kind);
+            assert_eq!(a.inputs, b.inputs);
+        }
+    }
+
+    /// A node id that has gone gives back the patch as it is, rather than
+    /// a copy whose output points at nothing — which would bake to
+    /// silence, or to a `GraphError`, for a stale menu.
+    #[test]
+    fn hearing_a_node_that_is_not_there_changes_no_output() {
+        let patch = three_node_patch();
+        let heard = patch_hearing(&patch, NodeId(9_999));
+        assert_eq!(heard.graph.output, patch.graph.output);
+        assert_eq!(heard, patch);
+    }
+
+    /// The menu offers it, and choosing it asks to hear that node without
+    /// marking the patch changed — driven through the real canvas.
+    #[test]
+    fn the_node_menu_offers_hear_this_node_and_asks_for_it() {
+        let mut canvas = Canvas::new(three_node_patch());
+        let target = canvas
+            .patch
+            .graph
+            .nodes
+            .iter()
+            .map(|n| n.id)
+            .next()
+            .unwrap();
+        assert_ne!(
+            canvas.patch.graph.output, target,
+            "a node that is not the output"
+        );
+        let before = canvas.patch.clone();
+
+        canvas.open_node_menu(&format!("#{}", target.0));
+        let buttons = canvas.buttons();
+        assert!(
+            buttons.iter().any(|l| l == "Hear this node"),
+            "the node menu does not offer it; buttons {buttons:?}"
+        );
+
+        canvas.click("Hear this node");
+        let res = canvas.frame(Vec::new());
+        assert_eq!(
+            canvas.state.take_hear_node(),
+            Some(target),
+            "choosing it did not ask to hear that node"
+        );
+        assert!(
+            !res.changed && !res.rebake,
+            "an audition marked the patch edited: changed {} rebake {}",
+            res.changed,
+            res.rebake
+        );
+        assert_eq!(canvas.patch, before, "an audition changed the patch");
+        // Taken once: a host draining every frame must not re-audition
+        // for ever.
+        assert_eq!(canvas.state.take_hear_node(), None);
+    }
+
+    /// The output node's own item says why it is pointless IN THE LABEL.
+    /// egui suppresses every tooltip inside an open popup, so a disabled
+    /// menu item that explains itself on hover explains itself nowhere
+    /// (#63, Overlands #1336/#1337).
+    #[test]
+    fn hearing_the_output_node_says_why_it_is_pointless_in_the_label() {
+        let mut canvas = Canvas::new(three_node_patch());
+        let output = canvas.patch.graph.output;
+        canvas.open_node_menu(&format!("#{}", output.0));
+        let buttons = canvas.buttons();
+        assert!(
+            buttons
+                .iter()
+                .any(|t| t.starts_with("Hear this node") && t.contains("already the output")),
+            "the output node's item does not say why in its own words; buttons {buttons:?}"
+        );
+        assert!(
+            !buttons.iter().any(|t| t == "Hear this node"),
+            "the plain item is offered on the output node too; buttons {buttons:?}"
+        );
+    }
+
+    /// The history can be forgotten without losing the layout — the two
+    /// are different promises (Overlands #1338 A6).
+    #[test]
+    fn forgetting_the_history_keeps_the_layout() {
+        let mut canvas = Canvas::new(three_node_patch());
+        canvas.frame(Vec::new());
+        let moved = canvas.patch.graph.nodes[0].id;
+        canvas
+            .state
+            .positions
+            .insert(moved, Pos2::new(123.0, 456.0));
+        canvas.state.scene_rect = Rect::from_min_size(Pos2::new(7.0, 8.0), Vec2::new(9.0, 10.0));
+        canvas.state.selected = Some(moved);
+
+        canvas.state.forget_history();
+
+        assert_eq!(
+            canvas.state.positions.get(&moved),
+            Some(&Pos2::new(123.0, 456.0))
+        );
+        assert_eq!(canvas.state.scene_rect.min, Pos2::new(7.0, 8.0));
+        assert_eq!(canvas.state.selected, Some(moved));
+    }
+
+    // -- B14: what a port does, and what a wire sweeps -------------------
+
+    /// THE SWEEP MATHS, at each source whose range is known.
+    ///
+    /// Every port adds its summed inputs to the node's own value, and each
+    /// connection is the source's output times the amount. So the swing a
+    /// wire produces is `base + amount * source_range`, and this asks it at
+    /// each of the three sources #1338 names — with the range of each one
+    /// read out of the core crate rather than assumed.
+    #[test]
+    fn a_wire_states_the_sweep_it_actually_produces() {
+        use crate::{AdsrEnvelope, BiquadLowpass, Lfo, SineOsc};
+
+        // An LFO is `raw * depth + offset`, raw in [-1, 1] — so at depth
+        // 1, offset 0, amount 250, into a cutoff at 150 Hz: 150 ± 250.
+        let lfo = NodeKind::Lfo(Lfo {
+            depth: 1.0,
+            offset: 0.0,
+            ..Default::default()
+        });
+        let lowpass = NodeKind::BiquadLowpass(BiquadLowpass {
+            cutoff_hz: 150.0,
+            ..Default::default()
+        });
+        assert_eq!(
+            sweep_text(&lfo, &lowpass, "cutoff_hz", 250.0).as_deref(),
+            Some("about 150 \u{00B1} 250 Hz"),
+            "the example in the issue"
+        );
+
+        // A negative amount is the same swing, not a backwards one.
+        assert_eq!(
+            sweep_text(&lfo, &lowpass, "cutoff_hz", -250.0).as_deref(),
+            Some("about 150 \u{00B1} 250 Hz"),
+        );
+
+        // An LFO with an offset is NOT centred on the base, so it reads as
+        // a span. offset 1, depth 1 -> raw output 0..2 -> 150..650 at
+        // amount 250.
+        let offset_lfo = NodeKind::Lfo(Lfo {
+            depth: 1.0,
+            offset: 1.0,
+            ..Default::default()
+        });
+        assert_eq!(
+            sweep_text(&offset_lfo, &lowpass, "cutoff_hz", 250.0).as_deref(),
+            Some("about 150 \u{27A1} 650 Hz"),
+        );
+
+        // An ADSR rests at 0 and peaks at 1, so it only ever pushes one
+        // way: 150 up to 400 at amount 250, never below the base.
+        let adsr = NodeKind::Adsr(AdsrEnvelope::default());
+        assert_eq!(
+            sweep_text(&adsr, &lowpass, "cutoff_hz", 250.0).as_deref(),
+            Some("about 150 \u{27A1} 400 Hz"),
+        );
+
+        // An oscillator is ±amplitude, so it IS centred: amplitude 0.5,
+        // amount 100, into a cutoff at 1000 -> 1000 ± 50.
+        let osc = NodeKind::Sine(SineOsc {
+            amplitude: 0.5,
+            ..Default::default()
+        });
+        let wide = NodeKind::BiquadLowpass(BiquadLowpass {
+            cutoff_hz: 1000.0,
+            ..Default::default()
+        });
+        assert_eq!(
+            sweep_text(&osc, &wide, "cutoff_hz", 100.0).as_deref(),
+            Some("about 1000 \u{00B1} 50 Hz"),
+        );
+
+        // A unitless parameter carries no unit: a Q at 0.7 swept ±0.2.
+        assert_eq!(
+            sweep_text(&lfo, &lowpass, "q", 0.2).as_deref(),
+            Some("about 0.71 \u{00B1} 0.20"),
+        );
+
+        // An amount of zero is a wire that changes nothing, said plainly
+        // rather than as "150 ± 0".
+        assert_eq!(
+            sweep_text(&lfo, &lowpass, "cutoff_hz", 0.0).as_deref(),
+            Some("about 150 Hz, unmoved"),
+        );
+    }
+
+    /// A sweep is stated only where it is TRUE. A signal input and a gate
+    /// are not parameters, and a source with no known range gives no
+    /// number — saying nothing beats saying a figure that is wrong.
+    #[test]
+    fn no_sweep_is_stated_where_it_would_be_a_guess() {
+        use crate::{BiquadLowpass, Lfo, WhiteNoise};
+        let lfo = NodeKind::Lfo(Lfo::default());
+        let lowpass = NodeKind::BiquadLowpass(BiquadLowpass::default());
+
+        // "in" is audio, not a number to add to.
+        assert_eq!(sweep_text(&lfo, &lowpass, "in", 1.0), None);
+        // A gate opens an envelope; it has no Hz.
+        assert_eq!(
+            sweep_text(&lfo, &NodeKind::Adsr(Default::default()), "gate", 1.0),
+            None
+        );
+        // Noise has no bounded range this editor knows.
+        assert_eq!(
+            sweep_text(
+                &NodeKind::WhiteNoise(WhiteNoise::default()),
+                &lowpass,
+                "cutoff_hz",
+                1.0
+            ),
+            None
+        );
+        // A port this editor does not know at all.
+        assert_eq!(sweep_text(&lfo, &lowpass, "not_a_port", 1.0), None);
+        // And a non-finite amount is a bug in the caller, not a sweep.
+        assert_eq!(sweep_text(&lfo, &lowpass, "cutoff_hz", f32::NAN), None);
+    }
+
+    /// Each port row says what driving it DOES, not just its name — the
+    /// whole of B14's first half.
+    #[test]
+    fn a_port_row_says_what_driving_it_does() {
+        use crate::{BiquadLowpass, SineOsc};
+        let lowpass = NodeKind::BiquadLowpass(BiquadLowpass::default());
+        assert_eq!(
+            port_label(&lowpass, "cutoff_hz"),
+            "cutoff_hz: adds to Cutoff (Hz)"
+        );
+        assert_eq!(port_label(&lowpass, "q"), "q: adds to Q");
+        assert_eq!(port_label(&lowpass, "in"), "in: the signal in");
+        assert_eq!(
+            port_label(&NodeKind::Adsr(Default::default()), "gate"),
+            "gate: opens the envelope"
+        );
+        assert_eq!(
+            port_label(&NodeKind::Sine(SineOsc::default()), "freq"),
+            "freq: adds to Frequency (Hz)"
+        );
+        // An unknown port falls back to exactly what every row said before.
+        assert_eq!(port_label(&lowpass, "mystery"), "mystery:");
+    }
+
+    /// Every port `input_ports` offers has a role, so no canonical row
+    /// falls back to a bare name. The scan is over the kinds this editor
+    /// can add, so a kind gaining a port upstream is caught here rather
+    /// than by a reader noticing a row went quiet.
+    #[test]
+    fn every_canonical_port_has_a_role() {
+        for label in KIND_LABELS.iter().copied() {
+            let kind = default_kind_for(label);
+            for port in input_ports(&kind) {
+                assert!(
+                    port_role(&kind, port).is_some(),
+                    "{label} port {port} has no role, so its row says only its name"
+                );
+            }
+        }
+    }
+
+    /// B14's other half: the amount drag's speed scales with its own
+    /// magnitude, so every amount is about the same number of pixels wide.
+    ///
+    /// At the fixed 0.05 every amount used to share, reaching 500 took ten
+    /// thousand pixels of dragging — about five screens.
+    #[test]
+    fn the_amount_drag_scales_with_its_magnitude() {
+        // The defect, stated as arithmetic: at the old fixed speed, 500 is
+        // this many pixels away from zero.
+        assert_eq!(500.0 / 0.05, 10_000.0);
+
+        // Now: the pixels to cross an amount are near constant, whatever
+        // its size.
+        let pixels = |amount: f32| f64::from(amount) / amount_speed(amount);
+        assert!((pixels(500.0) - 100.0).abs() < 1.0, "{}", pixels(500.0));
+        assert!(
+            (pixels(20_000.0) - 100.0).abs() < 1.0,
+            "{}",
+            pixels(20_000.0)
+        );
+        // Below the floor it is finer, not coarser: a small amount stays
+        // adjustable rather than being scaled into uselessness.
+        assert!(pixels(0.5) < 100.0, "{}", pixels(0.5));
+        // And an amount at zero can still be moved off it.
+        assert!(amount_speed(0.0) > 0.0);
+        assert!(amount_speed(-500.0) > 0.0, "a negative amount drags too");
+        assert_eq!(amount_speed(-500.0), amount_speed(500.0));
+    }
+
+    /// The ranges this editor states are the ones the core crate actually
+    /// produces. If a node's arithmetic changes upstream, the sweep text
+    /// becomes a confident lie, and this is what notices.
+    #[test]
+    fn the_stated_output_ranges_are_the_ones_the_core_bakes() {
+        use crate::{AdsrEnvelope, Lfo, SineOsc};
+        // LFO: `raw * depth + offset`, raw in [-1, 1] (symbios-audio
+        // src/lfo.rs:143).
+        let lfo = Lfo {
+            depth: 3.0,
+            offset: 2.0,
+            ..Default::default()
+        };
+        assert_eq!(output_range(&NodeKind::Lfo(lfo)), Some((-1.0, 5.0)));
+        // A negative depth is the same swing.
+        let flipped = Lfo {
+            depth: -3.0,
+            offset: 2.0,
+            ..Default::default()
+        };
+        assert_eq!(output_range(&NodeKind::Lfo(flipped)), Some((-1.0, 5.0)));
+        // ADSR: rests at 0, peaks at 1.
+        assert_eq!(
+            output_range(&NodeKind::Adsr(AdsrEnvelope::default())),
+            Some((0.0, 1.0))
+        );
+        // Oscillator: ±amplitude.
+        assert_eq!(
+            output_range(&NodeKind::Sine(SineOsc {
+                amplitude: 0.25,
+                ..Default::default()
+            })),
+            Some((-0.25, 0.25))
+        );
+        // And nothing is claimed for a node whose range is not known.
+        assert_eq!(output_range(&NodeKind::Silence), None);
     }
 
     #[test]
@@ -3345,6 +4031,27 @@ mod tests {
             self.frame(Vec::new());
         }
 
+        /// Right-click a node's title grip and leave its context menu up.
+        fn open_node_menu(&mut self, title: &str) {
+            let grip = self.label(title);
+            self.frame(vec![
+                egui::Event::PointerMoved(grip.center()),
+                egui::Event::PointerButton {
+                    pos: grip.center(),
+                    button: egui::PointerButton::Secondary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+                egui::Event::PointerButton {
+                    pos: grip.center(),
+                    button: egui::PointerButton::Secondary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+            self.frame(Vec::new());
+        }
+
         /// Add a node through the toolbar: the Add menu, then a kind.
         ///
         /// One click dropped a Sine before this step, which is what B6 was
@@ -3403,7 +4110,11 @@ mod tests {
             let node_box = boxes[0];
             let dots = canvas.dots();
             for port in ports {
-                let row = canvas.label(&format!("{port}:"));
+                // Asked of `port_label`, not re-spelled here: the row's
+                // text says what driving the port does (B14), and a test
+                // that spells it a second way is a second answer waiting
+                // to disagree with the first.
+                let row = canvas.label(&port_label(&kind, port));
                 assert!(
                     dots.iter()
                         .any(|d| (d.x - node_box.left()).abs() < 0.5 && beside(*d, row)),
@@ -3513,7 +4224,7 @@ mod tests {
     #[test]
     fn a_wire_dropped_anywhere_on_a_row_connects_to_that_rows_port() {
         let mut canvas = Canvas::new(sine_into_gain(false));
-        let row = canvas.label("gain:");
+        let row = canvas.label("gain: adds to Gain");
         // Well right of the label: on the row, and far from the port's dot,
         // which is on the box's left edge.
         let to = Pos2::new(row.right() + 60.0, row.center().y);
@@ -3814,7 +4525,7 @@ mod tests {
             !colours(&canvas.out).contains(&s.wire_active),
             "nothing in hand yet"
         );
-        let row = canvas.label("gain:");
+        let row = canvas.label("gain: adds to Gain");
         drag_from_the_sine_to(&mut canvas, Pos2::new(row.right() + 60.0, row.center().y));
         assert!(colours(&canvas.out).contains(&s.wire_active));
     }
@@ -4574,7 +5285,7 @@ mod tests {
         let mut canvas = Canvas::new(sine_into_gain(false));
         // The "Add constant" button on the gain port's own row — there is
         // one per port, so it is found by the row it shares.
-        let row = canvas.label("gain:");
+        let row = canvas.label("gain: adds to Gain");
         let at = canvas
             .chrome(accesskit::Role::Button)
             .into_iter()
@@ -5107,7 +5818,7 @@ mod tests {
     #[test]
     fn a_wire_dragged_off_its_port_onto_another_re_routes_and_keeps_its_amount() {
         let mut canvas = Canvas::new(three_node_patch());
-        let q_row = canvas.label("q:");
+        let q_row = canvas.label("q: adds to Q");
         reroute_the_cutoff_wire(
             &mut canvas,
             Pos2::new(q_row.right() + 40.0, q_row.center().y),
