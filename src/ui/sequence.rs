@@ -112,6 +112,41 @@ const QUIET_ALPHA: f32 = 0.55;
 /// Space either side of a marker's label, and inside a note block.
 const LABEL_PAD: f32 = 4.0;
 
+/// The sample rates the transport offers when a host has not said
+/// otherwise — CD-ish and both directions from it.
+///
+/// Unchanged from what the picker has always shown, so a host that never
+/// calls [`SequenceEditorState::set_sample_rates`] sees exactly the list it
+/// saw before (#64, Overlands #1337 C7).
+pub const DEFAULT_SAMPLE_RATES: &[u32] = &[22_050, 32_000, 44_100, 48_000, 96_000];
+
+/// Bytes one mono sample of baked audio occupies: the bake is 32-bit
+/// float, in memory and in the WAV it is wrapped in
+/// (`symbios_audio::wav` — IEEE float, mono, `BLOCK_ALIGN` 4).
+const BYTES_PER_SAMPLE: f64 = 4.0;
+
+/// What a second of audio at `rate` costs, in mebibytes.
+fn mib_per_second(rate: u32) -> f64 {
+    f64::from(rate) * BYTES_PER_SAMPLE / (1024.0 * 1024.0)
+}
+
+/// A memory size in the units the number is readable in: whole mebibytes
+/// once there are some, kibibytes below that.
+///
+/// Not a general-purpose formatter — it exists so the sample-rate row can
+/// say what the choice costs *in this recipe* rather than in the abstract,
+/// the way [`beat_field`] says what a length is in seconds. Nobody hears
+/// samples a second.
+fn memory_size(mib: f64) -> String {
+    if mib >= 10.0 {
+        format!("{mib:.0} MiB")
+    } else if mib >= 0.1 {
+        format!("{mib:.1} MiB")
+    } else {
+        format!("{:.0} KiB", mib * 1024.0)
+    }
+}
+
 /// Whether an in-progress block drag is moving the event or resizing its gate.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum DragMode {
@@ -218,6 +253,17 @@ pub struct SequenceEditorState {
     /// envelope, so an editor nobody configured refuses exactly what the
     /// sanitiser would have deleted (#63, Overlands #1336 C8).
     limits: EditorLimits,
+    /// The sample rates the transport's picker offers, in the order it
+    /// offers them.
+    ///
+    /// A rate is a promise about memory — a bake is mono 32-bit float, so
+    /// every kHz costs 4 bytes a second forever — and which rates are
+    /// *sensible* is the host's question, not this editor's: a world that
+    /// plays its beds at 22 050 has no use for a 96 000 option that
+    /// quadruples the buffer for content that was never above 11 kHz
+    /// (#64, Overlands #1337 C7). [`DEFAULT_SAMPLE_RATES`] is the
+    /// unconfigured list, unchanged for hosts that do not care.
+    sample_rates: Vec<u32>,
     /// A removal that has been asked for and not yet answered.
     ///
     /// State that outlives the frame it was asked in, so it lives here
@@ -291,6 +337,7 @@ impl Default for SequenceEditorState {
             owns_keys: false,
             took_escape: false,
             limits: EditorLimits::default(),
+            sample_rates: DEFAULT_SAMPLE_RATES.to_vec(),
             pending_removal: None,
             removal_asks: Vec::new(),
             confirmation_rect: Rect::NOTHING,
@@ -1009,6 +1056,49 @@ impl SequenceEditorState {
         }
     }
 
+    /// Choose the sample rates the transport's picker offers.
+    ///
+    /// The host knows what its world plays beds at and what a bake costs
+    /// there; this editor does not. Overlands offers 22 050 and 44 100
+    /// because its ambient beds are baked at 22 050 and nothing it plays
+    /// carries content above 11 kHz, so a 96 000 option only ever
+    /// quadruples the buffer (#64, Overlands #1337 C7).
+    ///
+    /// An empty list is ignored rather than honoured: a picker with
+    /// nothing in it cannot be used, and a host that passes one has a bug
+    /// rather than an intention. The recipe's own rate is always shown
+    /// even when it is not offered — see [`Self::offered_sample_rates`].
+    pub fn set_sample_rates(&mut self, rates: &[u32]) {
+        if rates.is_empty() {
+            return;
+        }
+        self.sample_rates = rates.to_vec();
+    }
+
+    /// The rates the picker offers, as the host last set them.
+    pub fn sample_rates(&self) -> &[u32] {
+        &self.sample_rates
+    }
+
+    /// What the picker actually lists for a recipe at `current`: the
+    /// offered rates, ascending, with `current` folded in when it is not
+    /// one of them.
+    ///
+    /// A rate the host no longer offers is still a rate the record holds,
+    /// and an editor that hid it would either strand the owner at a value
+    /// with no way back or invite the editor to rewrite a value nobody
+    /// touched — the failure #63 spent a step removing from the sliders.
+    /// Showing it lists one extra row and keeps both properties.
+    pub fn offered_sample_rates(&self, current: u32) -> Vec<u32> {
+        let mut rates = self.sample_rates.clone();
+        if !rates.contains(&current) {
+            rates.push(current);
+        }
+        rates.sort_unstable();
+        rates.dedup();
+        rates
+    }
+
     /// Whether a removal is waiting to be confirmed — the host's cue that
     /// the editor has a question on screen.
     pub fn awaiting_confirmation(&self) -> bool {
@@ -1067,7 +1157,7 @@ pub fn sequence_recipe_editor(
 
     egui::CollapsingHeader::new("Transport")
         .default_open(true)
-        .show(ui, |ui| res.merge(transport(ui, recipe)));
+        .show(ui, |ui| res.merge(transport(ui, recipe, state)));
 
     ui.separator();
     res.merge(instruments_panel(ui, recipe, state, id, &style));
@@ -1240,7 +1330,11 @@ pub fn active_instrument_canvas(
 // Transport
 // ---------------------------------------------------------------------------
 
-fn transport(ui: &mut egui::Ui, recipe: &mut SequenceRecipe) -> EditorResponse {
+fn transport(
+    ui: &mut egui::Ui,
+    recipe: &mut SequenceRecipe,
+    state: &SequenceEditorState,
+) -> EditorResponse {
     let mut res = EditorResponse::NONE;
 
     res.merge(ranged_slider(ui, &mut recipe.bpm, 20.0..=300.0, |s| {
@@ -1249,10 +1343,20 @@ fn transport(ui: &mut egui::Ui, recipe: &mut SequenceRecipe) -> EditorResponse {
 
     ui.horizontal(|ui| {
         ui.label("Sample rate");
+        // The rate is the one number here whose cost is invisible: a bake
+        // is mono 32-bit float, so 96 000 is four times 22 050's memory
+        // for as long as the bed is loaded, and the picker used to offer
+        // the whole ladder with nothing said about it. The size beside the
+        // box is THIS recipe's, at its length — the same "nobody hears
+        // beats" rule `beat_field` follows (#64, Overlands #1337 C7).
+        //
+        // A readout, not a hover: the ComboBox's own rows live in a popup
+        // layer, where egui suppresses every tooltip, so a cost explained
+        // only on hovering a row is explained nowhere (#1336).
         egui::ComboBox::from_id_salt("seq_sample_rate")
             .selected_text(recipe.sample_rate.to_string())
             .show_ui(ui, |ui| {
-                for sr in [22_050_u32, 32_000, 44_100, 48_000, 96_000] {
+                for sr in state.offered_sample_rates(recipe.sample_rate) {
                     if ui
                         .selectable_label(recipe.sample_rate == sr, sr.to_string())
                         .clicked()
@@ -1263,6 +1367,18 @@ fn transport(ui: &mut egui::Ui, recipe: &mut SequenceRecipe) -> EditorResponse {
                     }
                 }
             });
+        let secs = if recipe.bpm > 0.0 {
+            f64::from(recipe.duration_beats.max(0.0)) * 60.0 / f64::from(recipe.bpm)
+        } else {
+            0.0
+        };
+        let rate = recipe.sample_rate;
+        ui.label(egui::RichText::new(memory_size(secs * mib_per_second(rate))).weak())
+            .on_hover_text(format!(
+                "What this sequence bakes to at {rate} Hz, and stays at while \
+             it plays. Mono 32-bit float: {} for every minute of audio.",
+                memory_size(60.0 * mib_per_second(rate))
+            ));
     });
 
     let bpm = recipe.bpm;
@@ -3348,6 +3464,10 @@ mod tests {
         /// The side panel's own rect, as the editor was given it: what the
         /// timeline's fit-to-width has to fit inside.
         panel: Rect,
+        /// How wide the side panel is asked to be. A row that fits at one
+        /// width is not a row that fits (#63, and again for the transport's
+        /// size readout in #64).
+        panel_width: f32,
     }
 
     impl Driver {
@@ -3374,7 +3494,29 @@ mod tests {
             Self::on(ctx, recipe, state)
         }
 
+        /// The editor in a panel `width` points wide, with the default
+        /// style.
+        ///
+        /// The width is set before the first frame, never after: a
+        /// resizable panel latches its width into egui's memory on the
+        /// frame it first draws, and `default_size` is ignored from then on
+        /// (the #1290 class).
+        fn narrow(recipe: SequenceRecipe, width: f32) -> Self {
+            let ctx = egui::Context::default();
+            set_editor_style(&ctx, distinct_style());
+            Self::on_at(ctx, recipe, SequenceEditorState::default(), width)
+        }
+
         fn on(ctx: egui::Context, recipe: SequenceRecipe, state: SequenceEditorState) -> Self {
+            Self::on_at(ctx, recipe, state, 480.0)
+        }
+
+        fn on_at(
+            ctx: egui::Context,
+            recipe: SequenceRecipe,
+            state: SequenceEditorState,
+            panel_width: f32,
+        ) -> Self {
             ctx.enable_accesskit();
             // A hover's own text is half of what this step draws, and a
             // test that waits out egui's half-second would be a test of the
@@ -3389,6 +3531,7 @@ mod tests {
                 state,
                 out: egui::FullOutput::default(),
                 panel: Rect::NOTHING,
+                panel_width,
             };
             // A new area's first pass is an invisible sizing pass; act from
             // the third frame on.
@@ -3420,7 +3563,9 @@ mod tests {
                 state,
                 out,
                 panel,
+                panel_width,
             } = self;
+            let panel_width = *panel_width;
             let mut res = EditorResponse::NONE;
             let input = egui::RawInput {
                 events,
@@ -3429,7 +3574,7 @@ mod tests {
             };
             *out = ctx.run_ui(input, |root| {
                 egui::Panel::left("seq")
-                    .default_size(480.0)
+                    .default_size(panel_width)
                     .show(root, |ui| {
                         *panel = ui.max_rect();
                         res.merge(sequence_recipe_editor(ui, recipe, state, Id::new("seq")));
@@ -5879,5 +6024,190 @@ mod tests {
         driver.click("Keep");
         driver.frame(Vec::new());
         assert!(offered(&driver, "\u{2716}"), "they never came back");
+    }
+
+    // -----------------------------------------------------------------------
+    // Sample rates the host chooses (#64, Overlands #1337 C7)
+    // -----------------------------------------------------------------------
+
+    /// An editor nobody configures offers exactly the ladder it always
+    /// offered: the setter is a new door, not a new default.
+    #[test]
+    fn an_unconfigured_editor_offers_the_ladder_it_always_did() {
+        let state = SequenceEditorState::default();
+        assert_eq!(state.sample_rates(), DEFAULT_SAMPLE_RATES);
+        assert_eq!(
+            state.offered_sample_rates(44_100),
+            vec![22_050, 32_000, 44_100, 48_000, 96_000]
+        );
+    }
+
+    /// The host's list is the list — the whole point of C7 is that a world
+    /// that plays its beds at 22 050 stops being offered 96 000.
+    #[test]
+    fn the_host_chooses_which_rates_are_offered() {
+        let mut state = SequenceEditorState::default();
+        state.set_sample_rates(&[22_050, 44_100]);
+        assert_eq!(state.sample_rates(), &[22_050, 44_100]);
+        assert_eq!(state.offered_sample_rates(22_050), vec![22_050, 44_100]);
+    }
+
+    /// A picker with nothing in it cannot be used, so an empty list is a
+    /// host bug rather than an instruction.
+    #[test]
+    fn an_empty_list_of_rates_is_ignored() {
+        let mut state = SequenceEditorState::default();
+        state.set_sample_rates(&[22_050]);
+        state.set_sample_rates(&[]);
+        assert_eq!(state.sample_rates(), &[22_050]);
+    }
+
+    /// A recipe already at a rate the host no longer offers still shows
+    /// it, and still shows it once. Hiding it would stand the owner at a
+    /// value with no way back, or invite the editor to rewrite a value
+    /// nobody touched — which is the failure #63 spent a step removing
+    /// from the sliders.
+    #[test]
+    fn a_rate_the_host_stopped_offering_is_still_shown() {
+        let mut state = SequenceEditorState::default();
+        state.set_sample_rates(&[22_050, 44_100]);
+        assert_eq!(
+            state.offered_sample_rates(96_000),
+            vec![22_050, 44_100, 96_000],
+            "the recipe's own rate is folded in, in order"
+        );
+        assert_eq!(
+            state.offered_sample_rates(44_100),
+            vec![22_050, 44_100],
+            "a rate that IS offered is not listed twice"
+        );
+    }
+
+    /// The picker draws the host's list, not the constant: the pure
+    /// function above is only the answer if the widget asks it.
+    #[test]
+    fn the_drawn_picker_lists_the_hosts_rates() {
+        let mut state = SequenceEditorState::default();
+        state.set_sample_rates(&[22_050, 44_100]);
+        let mut driver = Driver::with_state(SequenceRecipe::default(), state);
+        // The ComboBox reports its selection as an AccessKit *value*, not
+        // a label — a test that looked for a label here would find nothing
+        // and say the picker was missing.
+        let combo = driver
+            .nodes()
+            .find(|(_, n)| n.value() == Some("44100"))
+            .map(|(id, _)| id)
+            .expect("the picker shows the recipe's rate");
+        driver.act(combo, accesskit::Action::Click);
+        driver.frame(Vec::new());
+        let listed: Vec<String> = driver
+            .nodes()
+            .filter(|(_, n)| {
+                n.label()
+                    .is_some_and(|l| l.chars().all(|c| c.is_ascii_digit()))
+            })
+            .filter_map(|(_, n)| n.label().map(str::to_owned))
+            .collect();
+        assert!(
+            listed.iter().any(|l| l == "22050") && listed.iter().any(|l| l == "44100"),
+            "the host's rates are not in the open picker: {listed:?}"
+        );
+        assert!(
+            !listed.iter().any(|l| l == "96000"),
+            "96 000 is still offered to a host that did not ask for it: {listed:?}"
+        );
+    }
+
+    /// What the rate costs is written beside it, in this recipe's own
+    /// terms. A bake is mono 32-bit float and stays in memory for as long
+    /// as the bed plays, and the picker used to offer the whole ladder
+    /// with nothing said about any of it.
+    #[test]
+    fn the_transport_says_what_the_chosen_rate_costs() {
+        // One minute exactly: 120 beats at 120 BPM.
+        let driver = Driver::new(SequenceRecipe {
+            bpm: 120.0,
+            duration_beats: 120.0,
+            sample_rate: 22_050,
+            ..Default::default()
+        });
+        assert!(
+            text_painted(&driver.out, "5.0 MiB").is_some(),
+            "a minute at 22 050 does not say its 5.0 MiB"
+        );
+
+        let driver = Driver::new(SequenceRecipe {
+            bpm: 120.0,
+            duration_beats: 120.0,
+            sample_rate: 96_000,
+            ..Default::default()
+        });
+        assert!(
+            text_painted(&driver.out, "22 MiB").is_some(),
+            "a minute at 96 000 does not say its 22 MiB"
+        );
+    }
+
+    /// The size readout does not push the picker onto a second line. A
+    /// readout beside a control is exactly what pushed More off the
+    /// toolbar in #63, and the test that should have caught it only ran
+    /// at one width.
+    #[test]
+    fn the_sample_rate_row_is_one_row_at_every_width() {
+        for width in [480.0, 560.0, 720.0, 1200.0] {
+            // The widest readout the default ladder can produce.
+            let driver = Driver::narrow(
+                SequenceRecipe {
+                    bpm: 20.0,
+                    duration_beats: 512.0,
+                    sample_rate: 96_000,
+                    ..Default::default()
+                },
+                width,
+            );
+            let label = text_painted(&driver.out, "Sample rate")
+                .unwrap_or_else(|| panic!("no Sample rate label at width {width}"))
+                .0;
+            let rate = text_painted(&driver.out, "96000")
+                .unwrap_or_else(|| panic!("no rate picker at width {width}"))
+                .0;
+            let size = driver
+                .out
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Text(t) => Some((t.galley.job.text.clone(), t.pos)),
+                    _ => None,
+                })
+                .find(|(text, _)| text.ends_with("MiB"))
+                .unwrap_or_else(|| panic!("no size readout at width {width}"))
+                .1;
+            assert!(
+                (rate.center().y - label.center().y).abs() < 2.0,
+                "the picker is not on the label's row at width {width}"
+            );
+            assert!(
+                (size.y - label.min.y).abs() < 6.0,
+                "the size readout wrapped onto a second line at width {width}: \
+                 label {label:?}, size at {size:?}"
+            );
+        }
+    }
+
+    /// The arithmetic itself, so the readouts above are checked against a
+    /// number rather than against themselves. Mono 32-bit float: 4 bytes a
+    /// sample, and nothing else.
+    #[test]
+    fn a_minute_of_audio_costs_four_bytes_a_sample() {
+        for (rate, mib) in [(22_050_u32, 5.047), (44_100, 10.09), (96_000, 21.97)] {
+            let measured = 60.0 * mib_per_second(rate);
+            assert!(
+                (measured - mib).abs() < 0.01,
+                "{rate} Hz says {measured} MiB a minute, not {mib}"
+            );
+        }
+        assert_eq!(memory_size(0.05), "51 KiB");
+        assert_eq!(memory_size(5.047), "5.0 MiB");
+        assert_eq!(memory_size(21.97), "22 MiB");
     }
 }

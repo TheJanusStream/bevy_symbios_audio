@@ -99,6 +99,20 @@
 //! context menu on node #0's grip, each held open for the picture:
 //!   cargo run --example host_window --features egui -- --menu add --shot menu.png
 //!
+//! `--notice <text>` draws `<text>` as the host's own first line above the
+//! editors, and `--notice-live <text>` draws it in the accent a host uses
+//! when somebody is actually listening. It is how the audience notice
+//! Overlands puts at the top of its pop-out gets into a picture of this
+//! layout (Overlands #1337 A4). The sentence is passed in rather than
+//! written here on purpose: its wording lives in the host, in one tested
+//! function, and a copy in this example would be a second answer:
+//!   cargo run --example host_window --features egui -- \
+//!       --notice "Nobody else is here — but anyone who arrives sees these unsaved edits, not your last save." \
+//!       --shot alone.png
+//!   cargo run --example host_window --features egui -- \
+//!       --notice-live "3 people here see these edits as you make them." \
+//!       --shot heard.png
+//!
 //! `--notes <what>` drives the sequence slot's timeline: `picked` picks two
 //! notes on one track, so the picture shows their outlines and the
 //! inspector's count; `box` holds a marquee out over three of them; `snap`
@@ -285,6 +299,10 @@ struct Args {
     /// with this, so its tooltip is in the picture.
     hover: Option<String>,
     broken: bool,
+    /// `--notice <text>` / `--notice-live <text>`: the host's own line
+    /// above the editors, and whether anybody is listening.
+    notice: Option<String>,
+    notice_live: bool,
     status: Option<Status>,
     shot: Option<String>,
 }
@@ -397,6 +415,8 @@ impl Args {
             beyond: args.iter().any(|a| a == "--beyond"),
             hover: value("--hover", "Add track"),
             broken: args.iter().any(|a| a == "--broken") || status == Some(Status::Error),
+            notice: value("--notice", "").or_else(|| value("--notice-live", "")),
+            notice_live: args.iter().any(|a| a == "--notice-live"),
             status,
             shot,
         }
@@ -505,6 +525,9 @@ struct Editor {
     frames_shown: u32,
     /// `--orphan`: pin the side panel to its bottom while the layout settles.
     scroll_to_bottom: bool,
+    /// `--notice` / `--notice-live`: the host's own line above the editors.
+    notice: Option<String>,
+    notice_live: bool,
 }
 
 impl Editor {
@@ -512,6 +535,11 @@ impl Editor {
         let mut recipe = seeded_size_recipe();
         let mut sequence_state = SequenceEditorState::default();
         sequence_state.set_active_instrument(Some(OPEN_INSTRUMENT));
+        // A host that knows what its world plays beds at says so, the way
+        // Overlands does: 22 050 and 44 100, and not the ladder up to 96
+        // (#64, Overlands #1337 C7). The seeded recipe here IS a room's
+        // ambient bed, at 22 050.
+        sequence_state.set_sample_rates(&[22_050, 44_100]);
         if args.orphan {
             orphan_the_pluck(&mut recipe);
             sequence_state.set_selected_event(Some((ORPHAN_TRACK, 0)));
@@ -559,6 +587,8 @@ impl Editor {
             shown: [None; 2],
             frames_shown: 0,
             scroll_to_bottom: args.orphan,
+            notice: args.notice.clone(),
+            notice_live: args.notice_live,
         }
     }
 }
@@ -689,6 +719,28 @@ fn render_ui(
     }
 }
 
+/// The host's own first line above an editor: what Overlands' pop-out
+/// draws there, so a picture of this layout is a picture of that one
+/// (Overlands #1337 A4).
+///
+/// The sentence arrives on the command line. Its wording is the host's and
+/// lives in one tested function there; a copy here would be a second
+/// answer to the question "who is hearing this", with nothing keeping the
+/// two honest. All this example owns is where it goes and what it looks
+/// like when somebody is listening.
+fn host_notice(ui: &mut egui::Ui, notice: Option<&str>, live: bool) {
+    let Some(text) = notice else {
+        return;
+    };
+    let colour = if live {
+        ui.visuals().hyperlink_color
+    } else {
+        ui.visuals().weak_text_color()
+    };
+    ui.label(egui::RichText::new(text).small().color(colour));
+    ui.add_space(4.0);
+}
+
 /// A slot's window: the size and constraint a host gives a pop-out editor.
 fn slot_window(title: &str, pos: egui::Pos2, free: egui::Rect) -> egui::Window<'static> {
     egui::Window::new(title)
@@ -711,6 +763,7 @@ fn patch_slot(
     let id = egui::Id::new("patch_slot");
     slot_window("Patch slot", pos, free)
         .show(ctx, |ui| {
+            host_notice(ui, editor.notice.as_deref(), editor.notice_live);
             let source = AuditionSource::patch(&editor.patch, PATCH_SAMPLE_RATE, PATCH_SECS)
                 .with_note(PATCH_NOTE);
             if let Some(request) = audition_strip(
@@ -750,6 +803,7 @@ fn sequence_slot(
     let pin_to_bottom = editor.scroll_to_bottom && editor.frames_shown < ORPHAN_SCROLL_FRAMES;
     slot_window("Sequence slot", pos, free)
         .show(ctx, |ui| {
+            host_notice(ui, editor.notice.as_deref(), editor.notice_live);
             if let Some(request) = audition_strip(
                 ui,
                 monitor,

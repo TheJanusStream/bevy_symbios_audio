@@ -121,7 +121,8 @@ pub use preview::{
     AudioEditorPlugin, AudioMonitor, MonitorRequest, MonitorStatus, waveform, waveform_sized,
 };
 pub use sequence::{
-    NoteGeom, SequenceEditorState, Snap, active_instrument_canvas, sequence_recipe_editor,
+    DEFAULT_SAMPLE_RATES, NoteGeom, SequenceEditorState, Snap, active_instrument_canvas,
+    sequence_recipe_editor,
 };
 pub use style::{EditorStyle, clear_editor_style, editor_style, set_editor_style};
 
