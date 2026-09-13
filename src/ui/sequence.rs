@@ -24,7 +24,9 @@
 //!   labelled with as much of its instrument and pitch as the block has room
 //!   for (#62, Overlands #1335 C3). It opens zoomed so the whole sequence is
 //!   in view, with the loop markers labelled on the ruler ("loop start",
-//!   "blend", "end"), and there is a Fit to go back to that zoom (C4). An
+//!   "blend", "end"), and there is a Fit to go back to that zoom (C4). While
+//!   a playhead is drawn the ruler also takes a click, which plays from the
+//!   beat clicked (see the playhead, below). An
 //!   event whose instrument id names no instrument bakes to silence; its
 //!   block is drawn tinted, hatched and outlined in the error colour and
 //!   labelled `missing: <id>` — the label in a tone that reads on that
@@ -48,7 +50,12 @@
 //! - **The playhead** — a host that knows where its monitor has got to
 //!   passes it to [`SequenceEditorState::set_playhead`] and the timeline
 //!   draws a line there in beats, publishing where it put it
-//!   ([`SequenceEditorState::playhead_x`]).
+//!   ([`SequenceEditorState::playhead_x`]). While it is drawn the ruler is a
+//!   pointing hand, and a click on it asks to play from the beat under the
+//!   pointer: the host takes that place, in seconds, from
+//!   [`SequenceEditorState::take_seek`] and moves its monitor there, as a
+//!   click on the audition's waveform does (#69, Overlands #1345).
+//!   [`SequenceEditorState::x_of_beat`] says where any beat was drawn.
 //! - **Inspector** — full numeric editing of the note the last pick landed
 //!   on, plus delete. For a note with no instrument it says so and offers to
 //!   reassign every note of that id to an existing instrument.
@@ -266,6 +273,15 @@ pub struct SequenceEditorState {
     /// gutter and the scroll offset, like every other piece of this
     /// timeline's geometry (crate #67).
     playhead_x: Option<f32>,
+    /// Where beat 0 was drawn on the last frame, in screen points, and how
+    /// many points a beat was: the map the lanes, the ruler and the playhead
+    /// were all drawn through, published by [`Self::x_of_beat`]. `None`
+    /// before the timeline has been drawn.
+    beat_axis: Option<(f32, f32)>,
+    /// Where a click on the ruler asked the audition to play from, in
+    /// seconds from the start of the bake, until the host takes it with
+    /// [`Self::take_seek`].
+    seek: Option<f32>,
     /// Tracks the owner has silenced, by index.
     ///
     /// Index-keyed like [`Self::selection`], and pruned the same way when
@@ -372,6 +388,8 @@ impl Default for SequenceEditorState {
             notes: Vec::new(),
             playhead_secs: None,
             playhead_x: None,
+            beat_axis: None,
+            seek: None,
             muted_tracks: HashSet::new(),
             soloed_tracks: HashSet::new(),
             name_edits: HashMap::new(),
@@ -674,6 +692,9 @@ impl SequenceEditorState {
     /// is not the one in the room says this recipe is sounding when it is
     /// not.
     ///
+    /// While the cursor is drawn, the ruler offers a click that plays from
+    /// where it lands; take that from [`take_seek`](Self::take_seek).
+    ///
     /// A setter rather than an argument, like
     /// [`set_limits`](Self::set_limits) and
     /// [`set_sample_rates`](Self::set_sample_rates): the editor's
@@ -698,6 +719,50 @@ impl SequenceEditorState {
     /// the paint (crate #67).
     pub fn playhead_x(&self) -> Option<f32> {
         self.playhead_x
+    }
+
+    /// Where beat `beat` was on the timeline's last frame, in screen points
+    /// — the x its ruler, its lanes and its playhead were drawn at for that
+    /// beat — or `None` before the timeline has been drawn once.
+    ///
+    /// Published rather than re-derived, like [`Self::playhead_x`]: only the
+    /// timeline knows its zoom, its gutter and how far its `ScrollArea` is
+    /// scrolled (crate #67). Not held to the timeline: a beat past its end,
+    /// or one scrolled out of view, has an x all the same.
+    pub fn x_of_beat(&self, beat: f32) -> Option<f32> {
+        self.beat_axis.map(|(origin, ppb)| origin + beat * ppb)
+    }
+
+    /// Take where a click on the ruler asked the audition to play from, in
+    /// seconds from the start of the bake, and leave nothing owed.
+    ///
+    /// Drain it every frame the editor is drawn and hand what comes out to
+    /// the monitor as a
+    /// [`MonitorControl::Seek`](crate::ui::MonitorControl::Seek), but only
+    /// while the monitor is playing THIS recipe — the guard
+    /// [`set_playhead`](Self::set_playhead) asks for, because one monitor
+    /// serves every slot:
+    ///
+    /// ```ignore
+    /// let playing = audition.is_playing(monitor);
+    /// state.set_playhead(playing.then(|| monitor.position_secs()).flatten());
+    /// if let Some(secs) = state.take_seek() && playing {
+    ///     controls.write(MonitorControl::Seek(secs));
+    /// }
+    /// ```
+    ///
+    /// `Some` only after a click on the ruler while a playhead was drawn,
+    /// which is when the ruler offers one: the beat under the pointer, held
+    /// to the timeline's beats and not snapped to its grid, because a seek
+    /// is a place, not a note. A place past the end of the buffer — the
+    /// ruler runs on past it — is the monitor's to hold to its end.
+    ///
+    /// A taker on the state rather than a field of [`EditorResponse`], like
+    /// [`AuditionState::take_controls`](crate::ui::AuditionState::take_controls):
+    /// every host builds and merges that struct, so a field there would break
+    /// each of them.
+    pub fn take_seek(&mut self) -> Option<f32> {
+        self.seek.take()
     }
 
     /// Whether track `track` is silenced by its own mute.
@@ -2486,6 +2551,12 @@ fn timeline(
                 bx(0.0),
                 style,
             );
+            // After the playhead, so this frame's says whether there is
+            // anything playing for a click on the ruler to move.
+            if let Some(secs) = ruler_seek(ui, rect, id, state.playhead_x, beat_at, total, bpm) {
+                state.seek = Some(secs);
+            }
+            state.beat_axis = Some((bx(0.0), ppb));
         });
 
     // A marquee that ended over a note, or outside the timeline, never sees
@@ -2548,6 +2619,54 @@ fn paint_playhead(
         style.playhead,
     );
     Some(x)
+}
+
+/// The ruler's click: while a playhead is drawn, a click on the ruler asks to
+/// play from the beat under the pointer. Returns that place in seconds from
+/// the start of the bake, for [`SequenceEditorState::take_seek`].
+///
+/// The ruler is the band above the lanes, right of the gutter. While
+/// `playhead_x` says a cursor is drawn the pointer over it is a pointing hand
+/// and its hover says what a click does; with none drawn it is a plain
+/// pointer and a click asks nothing, because nothing is playing to move — the
+/// rule the audition's waveform keeps (Overlands #1289). The marker labels and
+/// the playhead's head on the ruler are painted, not widgets, and the lanes
+/// start below it, so nothing else takes the press.
+fn ruler_seek(
+    ui: &mut egui::Ui,
+    rect: Rect,
+    id: Id,
+    playhead_x: Option<f32>,
+    beat_at: impl Fn(f32) -> f32,
+    total: f32,
+    bpm: f32,
+) -> Option<f32> {
+    let ruler = Rect::from_min_max(
+        Pos2::new(rect.left() + GUTTER, rect.top()),
+        Pos2::new(rect.right(), rect.top() + RULER_H),
+    );
+    let response = ui.interact(ruler, id.with("ruler"), Sense::click());
+    // No cursor drawn: a plain pointer, and a click that asks nothing.
+    playhead_x?;
+    let response = response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text("Click to play from here");
+    let at = response
+        .clicked()
+        .then(|| response.interact_pointer_pos())
+        .flatten()?;
+    seconds_at_beat(beat_at(at.x), total, bpm)
+}
+
+/// [`paint_playhead`]'s conversion the other way: beat `beat` as seconds from
+/// the start of the bake at `bpm`, held to the timeline's `0..=total` beats.
+/// `None` for a BPM that converts nothing, for which no playhead is drawn
+/// either.
+fn seconds_at_beat(beat: f32, total: f32, bpm: f32) -> Option<f32> {
+    if !beat.is_finite() || !bpm.is_finite() || bpm <= 0.0 {
+        return None;
+    }
+    Some(beat.max(0.0).min(total) * 60.0 / bpm)
 }
 
 /// The row above the lanes: a track, the zoom and a Fit, the snap grid, how
@@ -5648,6 +5767,151 @@ mod tests {
             driver.state.set_playhead(Some(bad));
             driver.frame(Vec::new());
             assert_eq!(driver.state.playhead_x(), None, "a {bad} position");
+        }
+    }
+
+    // -- #69: a click on the ruler moves the audition (Overlands #1345) ----
+
+    /// While a playhead is drawn, the pointer over the ruler is a pointing
+    /// hand: the ruler offers a click that plays from there. With none
+    /// drawn it is a plain pointer, because nothing is playing to move —
+    /// the waveform's rule (Overlands #1289: no affordance for what cannot
+    /// be done).
+    ///
+    /// The control for #69: at 0.5.0 the ruler sensed nothing, the timeline
+    /// being allocated with `Sense::hover` and the ruler only painted, so the
+    /// pointer over it was the default arrow either way.
+    #[test]
+    fn the_pointer_over_the_ruler_is_a_hand_only_while_a_playhead_is_drawn() {
+        let (mut recipe, state) = two_lane_recipe();
+        recipe.bpm = 60.0;
+        let mut driver = Driver::with_state(recipe, state);
+        driver.state.set_playhead(Some(2.0));
+        driver.frame(Vec::new());
+        let x = driver.state.playhead_x().expect("a cursor at beat 2");
+        let on_ruler = Pos2::new(x, driver.state.timeline_rect().top() + RULER_H * 0.5);
+
+        driver.frame(vec![egui::Event::PointerMoved(on_ruler)]);
+        assert_eq!(
+            driver.out.platform_output.cursor_icon,
+            egui::CursorIcon::PointingHand,
+            "the pointer over the ruler of a playing timeline"
+        );
+
+        driver.state.set_playhead(None);
+        driver.frame(Vec::new());
+        driver.frame(vec![egui::Event::PointerMoved(on_ruler)]);
+        assert_eq!(
+            driver.out.platform_output.cursor_icon,
+            egui::CursorIcon::Default,
+            "the pointer over the ruler with nothing playing"
+        );
+    }
+
+    /// Half way down the ruler, at the x the timeline published for `beat`.
+    fn on_the_ruler(driver: &Driver, beat: f32) -> Pos2 {
+        Pos2::new(
+            driver
+                .state
+                .x_of_beat(beat)
+                .expect("the timeline has been drawn"),
+            driver.state.timeline_rect().top() + RULER_H * 0.5,
+        )
+    }
+
+    /// A click on the ruler at beat 4 while a playhead is drawn asks, once,
+    /// to play from beat 4, in seconds at the recipe's BPM; the next take
+    /// finds nothing owed. With no playhead the same click asks nothing.
+    #[test]
+    fn a_click_on_the_ruler_asks_once_to_play_from_its_beat() {
+        let (mut recipe, state) = two_lane_recipe();
+        recipe.bpm = 90.0; // so that a beat is not a second
+        let mut driver = Driver::with_state(recipe, state);
+        driver.state.set_playhead(Some(0.5));
+        driver.frame(Vec::new());
+        let at = on_the_ruler(&driver, 4.0);
+
+        driver.click_at(at, egui::PointerButton::Primary);
+        let asked = driver.state.take_seek();
+        assert!(
+            asked.is_some_and(|secs| (secs - 4.0 * 60.0 / 90.0).abs() < 1e-3),
+            "a click at beat 4 at 90 BPM asked for {asked:?}"
+        );
+        assert_eq!(driver.state.take_seek(), None, "a seek is owed once");
+
+        driver.state.set_playhead(None);
+        driver.frame(Vec::new());
+        driver.click_at(at, egui::PointerButton::Primary);
+        assert_eq!(
+            driver.state.take_seek(),
+            None,
+            "a click with nothing playing"
+        );
+    }
+
+    /// The ruler row's stretch over the gutter is not the ruler: the gutter
+    /// is names and buttons, not time, and a press there asks nothing.
+    #[test]
+    fn a_click_above_the_gutter_asks_for_nothing() {
+        let (mut recipe, state) = two_lane_recipe();
+        recipe.bpm = 60.0;
+        let mut driver = Driver::with_state(recipe, state);
+        driver.state.set_playhead(Some(2.0));
+        driver.frame(Vec::new());
+        let rect = driver.state.timeline_rect();
+        let above_the_gutter = Pos2::new(rect.left() + GUTTER * 0.5, rect.top() + RULER_H * 0.5);
+        driver.click_at(above_the_gutter, egui::PointerButton::Primary);
+        assert_eq!(driver.state.take_seek(), None);
+    }
+
+    /// The ruler runs on a little past the last beat, so the end marker's
+    /// label has room. A click out there asks for the last beat, never for a
+    /// place past the timeline.
+    #[test]
+    fn a_click_past_the_last_beat_asks_for_the_last_beat() {
+        let (mut recipe, _) = two_lane_recipe();
+        recipe.bpm = 60.0;
+        // Fitted, so the far end of the ruler is on the panel.
+        let mut driver = Driver::with_state(recipe, SequenceEditorState::default());
+        driver.state.set_playhead(Some(1.0));
+        driver.frame(Vec::new());
+        let rect = driver.state.timeline_rect();
+        let origin = driver.state.x_of_beat(0.0).expect("drawn");
+        let ppb = driver.state.x_of_beat(1.0).expect("drawn") - origin;
+        let last_beat = (rect.right() - TAIL_PAD - origin) / ppb;
+        let past_the_end = Pos2::new(rect.right() - 2.0, rect.top() + RULER_H * 0.5);
+        let under = (past_the_end.x - origin) / ppb;
+        assert!(
+            under > last_beat + 0.1,
+            "the press at beat {under} is past the last, {last_beat}"
+        );
+
+        driver.click_at(past_the_end, egui::PointerButton::Primary);
+        let asked = driver.state.take_seek();
+        assert!(
+            asked.is_some_and(|secs| (secs - last_beat).abs() < 0.01),
+            "a click past the last beat, {last_beat}, asked for {asked:?}"
+        );
+    }
+
+    /// The x the timeline publishes for a beat is the x it draws the
+    /// playhead at for that beat — one map, not two — and there is none
+    /// before the timeline has been drawn.
+    #[test]
+    fn x_of_beat_is_where_the_playhead_for_that_beat_is_drawn() {
+        assert_eq!(SequenceEditorState::default().x_of_beat(1.0), None);
+        let (mut recipe, state) = two_lane_recipe();
+        recipe.bpm = 120.0;
+        let mut driver = Driver::with_state(recipe, state);
+        for beat in [0.0_f32, 1.5, 4.0] {
+            driver.state.set_playhead(Some(beat * 60.0 / 120.0));
+            driver.frame(Vec::new());
+            let drawn = driver.state.playhead_x().expect("a cursor");
+            let published = driver.state.x_of_beat(beat).expect("a drawn timeline");
+            assert!(
+                (drawn - published).abs() < 1e-3,
+                "beat {beat}: drawn at {drawn}, published at {published}"
+            );
         }
     }
 

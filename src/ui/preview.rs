@@ -377,7 +377,7 @@ pub enum MonitorControl {
     /// # Not through the sink
     ///
     /// `AudioSinkPlayback::try_seek` is not used, for two reasons. Until
-    /// 0.4.11 the monitor looped an `AudioSource` under
+    /// 0.5.0 the monitor looped an `AudioSource` under
     /// `PlaybackMode::Loop`, which appends `decoder.repeat_infinite()`
     /// (bevy_audio 0.19 `src/audio_output.rs:165`), and `repeat_infinite`
     /// wraps its source in rodio's `Buffered`, whose `try_seek` is an
@@ -1731,7 +1731,7 @@ mod tests {
     /// through the backend: rodio's `Player`, built as bevy_audio builds one
     /// for the voice, with the test pulling the samples a device would.
     ///
-    /// Until 0.4.11 this was `a_seek_the_backend_refuses_moves_nothing`, and
+    /// Until 0.5.0 this was `a_seek_the_backend_refuses_moves_nothing`, and
     /// it passed by asserting the refusal. Run as written against the new
     /// voice it failed — `left: Some(0.3), right: Some(0.0)`, the cursor
     /// moved — and it is this now (#68, Overlands #1341). Its old harness

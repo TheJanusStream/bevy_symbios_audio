@@ -1,6 +1,6 @@
 [package]
 name = "bevy_symbios_audio"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2024"
 authors = ["Janus"]
 description = "Algorithmic audio generator for Bevy."

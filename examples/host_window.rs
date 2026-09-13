@@ -70,6 +70,16 @@
 //! its loop start, is a seek like any other:
 //!   cargo run --example host_window --features egui -- --status playing-sequence --playhead 1.0 --shot run-up.png
 //!
+//! `--ruler <beat>` clicks the sequence slot's ruler at `<beat>` once
+//! `--status` has the sequence playing and the ruler has held still, the way
+//! an owner moves the audition from the timeline, and `--shot` waits for the
+//! cursor to be there as it does under `--playhead`. The press is placed
+//! through [`SequenceEditorState::x_of_beat`] and goes in through
+//! `EguiInput`, and the seek comes back out of
+//! [`SequenceEditorState::take_seek`] as a real `MonitorControl::Seek`. The
+//! bed is 60 BPM, so beat 10 is 10 s:
+//!   cargo run --example host_window --features egui -- --status playing-sequence --ruler 10 --shot ruler.png
+//!
 //! A `baking` picture needs a bake slower than a few frames: the dev profile
 //! bakes the seeded-size sequence in about a second, a release build in well
 //! under a tenth of one, too fast to picture.
@@ -258,6 +268,7 @@ fn main() -> AppExit {
         .init_resource::<Noter>()
         .init_resource::<Asker>()
         .init_resource::<Parker>()
+        .init_resource::<Ruler>()
         .add_systems(Startup, setup_camera)
         .add_systems(
             PreUpdate,
@@ -267,6 +278,7 @@ fn main() -> AppExit {
                 hover_a_wire,
                 open_a_menu,
                 work_the_timeline,
+                click_the_ruler,
                 ask_to_remove_a_track,
                 park_on_a_widget,
             )
@@ -290,7 +302,7 @@ fn main() -> AppExit {
 /// The command line: `--light`, `--orphan`, `--rename <name>`, `--drag`,
 /// `--wire`, `--menu <which>`, `--notes <what>`, `--limits`, `--confirm`,
 /// `--beyond`, `--hover <label>`, `--broken`, `--status <state>`,
-/// `--playhead <secs>` and `--shot <path>`.
+/// `--playhead <secs>`, `--ruler <beat>` and `--shot <path>`.
 #[derive(Resource)]
 struct Args {
     light: bool,
@@ -323,6 +335,9 @@ struct Args {
     /// `--playhead <secs>`: seek the playing audition to `secs`, so a
     /// picture of the cursor is the same picture every run.
     playhead: Option<f32>,
+    /// `--ruler <beat>`: click the timeline's ruler at `<beat>` once the
+    /// sequence plays, so a picture shows the audition moved from there.
+    ruler: Option<f32>,
     shot: Option<String>,
 }
 
@@ -452,8 +467,20 @@ impl Args {
                     std::process::exit(2);
                 })
             }),
+            ruler: value("--ruler", "10").map(|beat| {
+                beat.parse().unwrap_or_else(|_| {
+                    eprintln!("--ruler {beat}: expected a beat, like 10");
+                    std::process::exit(2);
+                })
+            }),
             shot,
         }
+    }
+
+    /// Whether a flag moves the audition for the picture: `--playhead` seeks
+    /// it, and `--ruler` clicks the ruler to.
+    fn seeks(&self) -> bool {
+        self.playhead.is_some() || self.ruler.is_some()
     }
 
     /// Whether any flag drives the app through a gesture of its own. Those
@@ -479,6 +506,7 @@ impl Args {
             && (self.notes.is_none() || matches!(*gestures.noter, Noter::Done(_)))
             && (!self.confirm || matches!(*gestures.asker, Asker::Asked))
             && (self.hover.is_none() || matches!(*gestures.parker, Parker::Parked(_)))
+            && (self.ruler.is_none() || *gestures.ruler == Ruler::Done)
     }
 }
 
@@ -492,6 +520,7 @@ struct Gestures<'w> {
     noter: Res<'w, Noter>,
     asker: Res<'w, Asker>,
     parker: Res<'w, Parker>,
+    ruler: Res<'w, Ruler>,
 }
 
 /// `--confirm`: where the gesture that asks to remove a track has got to.
@@ -562,7 +591,8 @@ struct Editor {
     /// `--notice` / `--notice-live`: the host's own line above the editors.
     notice: Option<String>,
     notice_live: bool,
-    /// `--playhead`: the second the audition was sought to, once it has been.
+    /// `--playhead` or `--ruler`: the second the audition was sought to, once
+    /// it has been.
     sought: Option<f32>,
 }
 
@@ -936,6 +966,14 @@ fn sequence_slot(
                     .then(|| monitor.position_secs())
                     .flatten(),
             );
+            // A click on the ruler, taken every frame and passed on as the
+            // seek a click on the waveform makes, under the same guard: one
+            // monitor serves both slots.
+            if let Some(secs) = editor.sequence_state.take_seek()
+                && editor.sequence_audition.is_playing(monitor)
+            {
+                controls.write(MonitorControl::Seek(secs));
+            }
             ui.separator();
             let mut committed = false;
             // Panel ids are global, so they are salted with the slot: two
@@ -1851,6 +1889,87 @@ fn work_the_timeline(
     }
 }
 
+/// Half the height of the timeline's ruler, in points. The editor draws its
+/// ruler as the top 34 points of [`SequenceEditorState::timeline_rect`], right
+/// of the gutter, and publishes that rect and where each beat is but not the
+/// ruler's height; a press half way down it is on it.
+const RULER_MIDDLE: f32 = 17.0;
+
+/// Where `--ruler` is: waiting for a playing sequence and a still ruler,
+/// clicked, or done and out of the way.
+#[derive(Resource, Default, Clone, Copy, PartialEq, Debug)]
+enum Ruler {
+    #[default]
+    Finding,
+    /// Clicked here. The pointer leaves on the next frame, so the picture
+    /// holds no tooltip.
+    Clicked(egui::Pos2),
+    /// The click is in and the pointer is gone.
+    Done,
+}
+
+/// `--ruler <beat>`: click the sequence slot's ruler at `<beat>`, the way an
+/// owner moves the playing audition from the timeline.
+///
+/// Only once the monitor plays and the windows have settled — the ruler
+/// offers its click only while a playhead is drawn — and only once the point
+/// has held still, for the reason every gesture here waits (see "Why a
+/// scripted gesture waits"). The x is the timeline's own
+/// [`SequenceEditorState::x_of_beat`], not a zoom and a gutter worked out
+/// again here (crate #67). What the click asks for comes back out of
+/// [`SequenceEditorState::take_seek`] in [`sequence_slot`], and `--shot`
+/// waits for the voice to be there, as it does under `--playhead`.
+fn click_the_ruler(
+    args: Res<Args>,
+    mut editor: ResMut<Editor>,
+    monitor: Res<AudioMonitor>,
+    mut ruler: ResMut<Ruler>,
+    mut settle: Local<Settle>,
+    mut contexts: Query<&mut EguiInput, With<PrimaryEguiContext>>,
+) {
+    let Some(beat) = args.ruler else {
+        return;
+    };
+    let Ok(mut input) = contexts.single_mut() else {
+        return;
+    };
+    match *ruler {
+        Ruler::Done => return,
+        Ruler::Clicked(at) => {
+            input.0.events.push(egui::Event::PointerGone);
+            info!("--ruler: clicked beat {beat} at {at:?}, and the pointer has left");
+            *ruler = Ruler::Done;
+            return;
+        }
+        Ruler::Finding => {}
+    }
+    if monitor.status != MonitorStatus::Playing
+        || editor.frames_shown < SETTLE_FRAMES
+        || editor.sequence_state.playhead_x().is_none()
+    {
+        return;
+    }
+    let (Some(window), Some(x)) = (editor.shown[1], editor.sequence_state.x_of_beat(beat)) else {
+        return;
+    };
+    let at = egui::pos2(
+        x,
+        editor.sequence_state.timeline_rect().top() + RULER_MIDDLE,
+    );
+    if !window.contains(at) {
+        warn!("--ruler {beat}: that beat is not inside the sequence slot");
+        return;
+    }
+    let Some(points) = settle.settled(vec![at]) else {
+        return;
+    };
+    let at = points[0];
+    press_at(&mut input, at, egui::PointerButton::Primary);
+    release_at(&mut input, at, egui::PointerButton::Primary);
+    editor.sought = Some(beat * 60.0 / editor.recipe.bpm);
+    *ruler = Ruler::Clicked(at);
+}
+
 /// Each window's size every [`LOG_EVERY`] frames. A window whose content is
 /// taller than it grows on every frame, and this is where that shows.
 fn log_window_sizes(frame: Res<FrameCount>, editor: Res<Editor>) {
@@ -1882,8 +2001,8 @@ struct Shot {
     last_len: Option<u64>,
 }
 
-/// Whether the monitor shows what `--status` and `--playhead` asked for, so
-/// the picture can be taken. `Err` when it never will: a `baking` picture
+/// Whether the monitor shows what `--status`, `--playhead` and `--ruler` asked
+/// for, so the picture can be taken. `Err` when it never will: a `baking` picture
 /// whose bake ended before it had run [`BAKING_FOR`].
 fn status_reached(args: &Args, editor: &Editor, monitor: &AudioMonitor) -> Result<bool, String> {
     let reached = match args.status {
@@ -1892,14 +2011,14 @@ fn status_reached(args: &Args, editor: &Editor, monitor: &AudioMonitor) -> Resul
         // Playing AND far enough past where the voice started for the cursor
         // to have moved: a voice starts at its loop start, and a playhead
         // pinned there in every picture is a picture that proves nothing.
-        // Under `--playhead` the seek puts the cursor somewhere instead.
+        // Under `--playhead` or `--ruler` a seek puts the cursor somewhere
+        // instead.
         Some(Status::PlayingSequence) => {
             let started = bevy_symbios_audio::sequence_loop_start(&editor.recipe)
                 .unwrap_or_default()
                 .as_secs_f32();
             monitor.status == MonitorStatus::Playing
-                && (args.playhead.is_some()
-                    || monitor.position_secs().is_some_and(|at| at > started + 0.2))
+                && (args.seeks() || monitor.position_secs().is_some_and(|at| at > started + 0.2))
         }
         Some(Status::Error) => matches!(monitor.status, MonitorStatus::Error(_)),
         Some(Status::Baking) => match monitor.bake_elapsed() {
@@ -1913,12 +2032,12 @@ fn status_reached(args: &Args, editor: &Editor, monitor: &AudioMonitor) -> Resul
             None => false,
         },
     };
-    // `--playhead`: the seek asked for, and the cursor there — or a frame or
-    // two past it once the voice moves on, never short of it.
-    let sought = match (args.playhead, editor.sought) {
-        (None, _) => true,
-        (Some(_), None) => false,
-        (Some(_), Some(secs)) => monitor
+    // `--playhead` or `--ruler`: the seek asked for, and the cursor there — or
+    // a frame or two past it once the voice moves on, never short of it.
+    let sought = match (args.seeks(), editor.sought) {
+        (false, _) => true,
+        (true, None) => false,
+        (true, Some(secs)) => monitor
             .position_secs()
             .is_some_and(|at| at >= secs - 0.001 && at < secs + 0.25),
     };

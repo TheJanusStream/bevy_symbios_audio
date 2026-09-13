@@ -41,8 +41,9 @@ use bevy::audio::Decodable;
 use bevy::reflect::TypePath;
 use rodio::source::SeekError;
 use rodio::{ChannelCount, Sample, SampleRate, Source};
+use symbios_audio::loop_start_sample;
 
-use crate::{MAX_WAV_SAMPLES, SequenceRecipe};
+use crate::SequenceRecipe;
 
 const NANOS_PER_SEC: u128 = 1_000_000_000;
 
@@ -59,9 +60,11 @@ const NO_SEEK: usize = usize::MAX;
 /// smoothed.
 ///
 /// `Some` exactly when `loop_start_beats` is set and lands before the end of
-/// the buffer — the mixdown's own rule, in its own arithmetic. A hard-cut
-/// loop, one with no `loop_crossfade_beats`, is still `Some`: the mixdown has
-/// no tail to fold there, but the loop still runs from the point the author
+/// the buffer. The sample is symbios-audio's own [`loop_start_sample`], the
+/// one `bake_sequence` takes its loop start from, so the two cannot
+/// disagree. A hard-cut loop,
+/// one with no `loop_crossfade_beats`, is still `Some`: the mixdown has no
+/// tail to fold there, but the loop still runs from the point the author
 /// set.
 ///
 /// Ask about the recipe exactly as it is baked. A host that clamps a recipe
@@ -74,45 +77,6 @@ const NO_SEEK: usize = usize::MAX;
 pub fn sequence_loop_start(recipe: &SequenceRecipe) -> Option<Duration> {
     let rate = NonZeroU32::new(recipe.sample_rate)?;
     loop_start_sample(recipe).map(|sample| time_of(sample, rate))
-}
-
-/// The sample `bake_sequence` folds its tail into for `recipe`, or `None`
-/// when its buffer has no loop point.
-///
-/// The mixdown's own arithmetic, step for step — symbios-audio 0.2
-/// `mixdown.rs`: `beat_seconds` (in `f32`), `duration_to_samples` and the
-/// head of `apply_loop_crossfade` — because those are private there.
-/// `the_loop_start_is_where_the_mixdown_folds_its_tail` holds the two
-/// together by baking.
-fn loop_start_sample(recipe: &SequenceRecipe) -> Option<usize> {
-    let beats = recipe.loop_start_beats?;
-    let beat_secs = if recipe.bpm <= 0.0 {
-        0.0
-    } else {
-        60.0 / recipe.bpm
-    };
-    let main = duration_to_samples(recipe.duration_beats, beat_secs, recipe.sample_rate);
-    let start =
-        (f64::from(beats) * f64::from(beat_secs) * f64::from(recipe.sample_rate)).round() as usize;
-    // `apply_loop_crossfade`'s `loop_start >= main_samples` return, which
-    // covers its `main_samples == 0` too: there is nothing past the end to
-    // loop into. NOT its `tail_samples == 0` or `crossfade == 0` returns: a
-    // hard cut has no tail to fold, and still loops from where it was set.
-    (start < main).then_some(start)
-}
-
-/// `mixdown.rs`'s `duration_to_samples`: beats to samples, rounded, capped at
-/// what a WAV can hold, and zero for a non-positive length or beat.
-fn duration_to_samples(beats: f32, beat_secs: f32, sample_rate: u32) -> usize {
-    if beats <= 0.0 || beat_secs <= 0.0 {
-        return 0;
-    }
-    let samples = (f64::from(beats) * f64::from(beat_secs) * f64::from(sample_rate)).round();
-    if samples >= MAX_WAV_SAMPLES as f64 {
-        MAX_WAV_SAMPLES
-    } else {
-        samples as usize
-    }
 }
 
 /// The sample a time `at` from a buffer's start lands on, the way rodio's
@@ -394,8 +358,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        AudioPatch, Event, GraphNode, Instrument, NodeGraph, NodeId, NodeKind, SineOsc, Track,
-        bake_sequence, samples_to_audio_source,
+        AudioPatch, Event, GraphNode, Instrument, MAX_WAV_SAMPLES, NodeGraph, NodeId, NodeKind,
+        SineOsc, Track, bake_sequence, samples_to_audio_source,
     };
 
     /// The seeded bed's shape: 34 s at 22 050 Hz looping from 2.0 s — 749 700
@@ -671,8 +635,8 @@ mod tests {
         looped.iter().zip(&plain).position(|(a, b)| a != b)
     }
 
-    /// The helper agrees with the mixdown it mirrors, found by BAKING rather
-    /// than by reading: every `None` is a recipe whose bake folds nothing,
+    /// The helper agrees with the mixdown it delegates to, found by BAKING
+    /// rather than by reading: every `None` is a recipe whose bake folds nothing,
     /// and every `Some` is the sample the bake folded its tail into, reached
     /// by rodio's own arithmetic from the time the helper returns.
     #[test]

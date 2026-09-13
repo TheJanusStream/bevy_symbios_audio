@@ -244,7 +244,11 @@ embed:
   not touched). A note whose instrument is gone is tinted, hatched and
   outlined in the theme's error colour, labelled `missing: <id>` in a tone
   that reads on that tint, and the inspector offers to reassign every note
-  of that id,
+  of that id. While the audition plays, the ruler above the lanes is a
+  pointing hand, and a click on it moves the audition to the beat clicked: a
+  host takes that place from `SequenceEditorState::take_seek` and writes it
+  as a `MonitorControl::Seek`, and `SequenceEditorState::x_of_beat` says
+  where any beat was drawn,
 - a pure-egui `waveform` widget plus a Bevy audition monitor
   (`AudioEditorPlugin`) for auditioning edits. A replaced or stopped patch
   bake is cancelled, not left to run. The monitor's voice is a
@@ -324,12 +328,14 @@ editors the way a user would, each for a picture of one thing:
 | `--hover <label>` | parks the pointer on one widget, for its tooltip |
 | `--notice <text>` / `--notice-live <text>` | the host's own line above the editors |
 | `--playhead <secs>` | seeks the playing audition, so the cursor is in the same place in every picture |
+| `--ruler <beat>` | clicks the timeline's ruler at a beat once the sequence plays, and waits for the cursor there |
 
 ```sh
 cargo run --example host_window --features egui -- --shot host_window.png
 cargo run --example host_window --features egui -- --status error --shot error.png
 cargo run --example host_window --features egui -- --orphan --shot orphan.png
 cargo run --example host_window --features egui -- --status playing-sequence --playhead 1.0 --shot run-up.png
+cargo run --example host_window --features egui -- --status playing-sequence --ruler 10 --shot ruler.png
 ```
 
 ## Determinism
