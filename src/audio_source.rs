@@ -1,12 +1,16 @@
 //! Bridge from a baked `Vec<f32>` to Bevy's `AudioSource` asset.
 //!
-//! The audio engine in Bevy 0.18 (rodio under the
-//! hood) consumes [`AudioSource`] — a `bytes::Bytes`-equivalent blob that
-//! it re-decodes on play.  Rather than implementing a custom rodio
-//! `Decoder` for `Vec<f32>` (doable but ties us to rodio internals and a
-//! moving target across Bevy releases), this module wraps the raw samples
-//! in a minimal in-memory RIFF/WAVE blob with the IEEE-float (format
-//! code `0x0003`) flavour, then hands those bytes to `AudioSource`.
+//! Bevy's audio engine (rodio under the hood) consumes [`AudioSource`] — a
+//! `bytes::Bytes`-equivalent blob that it re-decodes on play.  Rather than
+//! implementing a custom rodio `Decoder` for `Vec<f32>` (which ties the
+//! crate to rodio's internals, a moving target across Bevy releases), this
+//! module wraps the raw samples in a minimal in-memory RIFF/WAVE blob with
+//! the IEEE-float (format code `0x0003`) flavour, then hands those bytes to
+//! `AudioSource`.
+//!
+//! The one voice a WAV cannot serve — a loop an editor moves while it plays
+//! — has its own source, [`crate::looping::LoopedSamples`], and pays for it
+//! with that tie.
 //!
 //! The pure RIFF/WAVE encoder ([`samples_to_wav_bytes`] / [`MAX_WAV_SAMPLES`])
 //! lives in the Bevy-free [`symbios_audio::wav`] core module and is

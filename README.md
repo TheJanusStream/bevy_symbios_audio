@@ -111,10 +111,28 @@ instrument, and offers to reassign it.
 
 Set `recipe.loop_start_beats = Some(b)` and a non-zero
 `loop_crossfade_beats` to get a seamless loop — the mixdown baker
-pre-mixes a tail crossfade onto the loop region so a hard
-`Source::loop_..()` is click-free at the seam.  See
+pre-mixes a tail crossfade onto the loop region, so the seam is
+click-free when the buffer loops back to its **loop start**, not to its
+first sample.  Play it from there: `sequence_loop_start(&recipe)` is where
+the bake loops from, and Bevy's own looping player given it as a
+`start_position` plays the loop the bake made and never the run-up before
+it.  A buffer an editor needs to move while it plays can be a
+`LoopedSamples` instead, a looping voice with a playhead.  See
 `examples/wind_demo.rs` for a complete recipe (brown-noise wind drone
 with LFO-swept cutoff plus an ADSR-gated sine voice).
+
+```rust,ignore
+use bevy::audio::{AudioPlayer, PlaybackSettings};
+use bevy_symbios_audio::sequence_loop_start;
+
+commands.spawn((
+    AudioPlayer::new(handle),
+    PlaybackSettings {
+        start_position: sequence_loop_start(&recipe),
+        ..PlaybackSettings::LOOP
+    },
+));
+```
 
 ```sh
 cargo run --release --example wind_demo
@@ -229,20 +247,26 @@ embed:
   of that id,
 - a pure-egui `waveform` widget plus a Bevy audition monitor
   (`AudioEditorPlugin`) for auditioning edits. A replaced or stopped patch
-  bake is cancelled, not left to run. The monitor publishes where its voice
-  has got to (`position_secs`, wrapped into the loop, with `loop_secs`), and
+  bake is cancelled, not left to run. The monitor's voice is a
+  `LoopedSamples`: a sequence plays from its loop start and loops across
+  the seam its bake smoothed, as a world player started at
+  `sequence_loop_start` does, and its run-up is never heard. The monitor
+  publishes where its voice has got to (`position_secs`, with
+  `loop_secs`), read from the voice's own source, and
   `waveform_with_cursor` draws that as a playhead with a seconds axis;
   `SequenceEditorState::set_playhead` puts the same position on the
-  timeline in beats. What does not need a bake — the monitor's own level,
-  mute — is a `MonitorControl` rather than a `MonitorRequest`,
+  timeline in beats. A click on a playing waveform moves the voice and the
+  cursor together. What does not need a bake — a seek, the monitor's own
+  level — is a `MonitorControl` rather than a `MonitorRequest`,
 - the audition strip (`audition_strip`), the row a host puts above an
   editor to hear it: Audition, Stop, an Auto toggle that re-bakes a playing
   audition shortly after each committed edit, a status chip (Idle, Baking
   with the seconds so far, Playing, Muted, Error), a caption saying what is
-  played ("1.0 s at 22.05 kHz, looped"), a Level for the monitor's own
-  output, and the waveform with the playhead on it. It returns the
-  `MonitorRequest` to write rather than writing it, and its
-  `MonitorControl`s through `AuditionState::take_controls`,
+  played ("1.0 s at 22.05 kHz, looped", or for a bed, "looped from beat
+  2"), a Level for the monitor's own output, and the waveform with the
+  playhead on it. It returns the `MonitorRequest` to write rather than
+  writing it, and its `MonitorControl`s through
+  `AuditionState::take_controls`,
 - `EditorLimits`, the caps every Add is held to. They default to
   symbios-audio's own `Envelope`, the bound the record sanitiser enforces
   anyway, so an editor nobody configured refuses exactly what would
@@ -282,7 +306,8 @@ reaches the screen edge. `host_window` shows both editors inside windows,
 laid out the way that works. It doubles as a screenshot harness:
 `--shot <path>` saves a picture and quits, and `--light` switches theme.
 `--status <idle|baking|playing|playing-sequence|muted|error>` puts the
-audition strips in that state through real requests. The rest drive the
+audition strips in that state through real requests, and `playing-sequence`
+waits until the voice is 0.2 s past its loop start. The rest drive the
 editors the way a user would, each for a picture of one thing:
 
 | flag | what it sets up |
@@ -298,15 +323,13 @@ editors the way a user would, each for a picture of one thing:
 | `--limits` / `--confirm` / `--beyond` | a cap reached, a removal asked about, a value outside its own slider |
 | `--hover <label>` | parks the pointer on one widget, for its tooltip |
 | `--notice <text>` / `--notice-live <text>` | the host's own line above the editors |
-
-There is no flag that pins the cursor to a chosen second: a seek on a
-looping sink is refused by the backend (see Limitations), so
-`--status playing-sequence` waits for the voice to be past 0.2 s instead.
+| `--playhead <secs>` | seeks the playing audition, so the cursor is in the same place in every picture |
 
 ```sh
 cargo run --example host_window --features egui -- --shot host_window.png
 cargo run --example host_window --features egui -- --status error --shot error.png
 cargo run --example host_window --features egui -- --orphan --shot orphan.png
+cargo run --example host_window --features egui -- --status playing-sequence --playhead 1.0 --shot run-up.png
 ```
 
 ## Determinism
@@ -359,13 +382,6 @@ produces.
   artifacts.  Because retuning happens at synthesis, no PSOLA / phase
   vocoder is needed — but it only re-pitches *oscillators* (not sampled
   or noise-based material), and LFO/filter settings stay fixed.
-- **A looping audition cannot be seeked.** `PlaybackMode::Loop` appends
-  rodio's `repeat_infinite()`, which wraps the source in a `Buffered` whose
-  `try_seek` is an unconditional `NotSupported`, so `MonitorControl::Seek`
-  is refused and moves nothing — including the cursor. Nothing in the
-  editors offers a click-to-seek for that reason. A custom `Source` that
-  plays a run-up once and then loops a window, forwarding `try_seek`, is
-  what would recover it.
 - **Buffer ≤ ~6 hours.**  `data_size` in the WAV header is a 32-bit
   field, capping ~1.07 G samples (≈ 6.7 h @ 44.1 kHz).  `samples_to_wav_bytes`
   now panics rather than emitting a silently-wrapped (corrupt) header, so

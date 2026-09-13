@@ -50,22 +50,25 @@
 //! `playing` (the patch slot auditioned; the default under `--shot`), `muted`
 //! (the same with the host bar's Mute on), `baking` (the sequence slot
 //! auditioned, pictured while its bake runs), `playing-sequence` (the
-//! sequence slot auditioned and playing, waited out until its voice is past
-//! 0.2 s so the playhead is somewhere other than the very start) and
-//! `error` (the patch slot auditioned with `--broken`'s patch). `--broken`
-//! opens the patch slot with a loop in its graph, so the canvas outlines the
-//! two nodes of the loop and names them:
+//! sequence slot auditioned and playing, waited out until its voice is 0.2 s
+//! past its loop start, where the voice starts, so the playhead is somewhere
+//! other than where it began) and `error` (the patch slot auditioned with
+//! `--broken`'s patch). `--broken` opens the patch slot with a loop in its
+//! graph, so the canvas outlines the two nodes of the loop and names them:
 //!   cargo run --example host_window --features egui -- --status baking --shot baking.png
 //!   cargo run --example host_window --features egui -- --status playing-sequence --shot cursor.png
-//!
-//! There is NO flag that puts the cursor at a chosen second. There was one,
-//! `--playhead <secs>`, and it moved nothing: every seek on a looping Bevy
-//! sink is refused by the backend (`MonitorControl::Seek` carries the
-//! measurement), so the flag promised a thing it could not do. Waiting for
-//! a voice to be past 0.2 s — what `--status playing-sequence` does — is the
-//! honest way to a picture whose cursor is not at the very start:
-//!
 //!   cargo run --example host_window --features egui -- --status error --shot error.png
+//!
+//! `--playhead <secs>` seeks the audition to `secs` once `--status` has it
+//! playing and the windows have settled, and `--shot` waits until the cursor
+//! is there, so the cursor on the waveform and on the timeline is in the same
+//! place in every picture.
+//! It goes through a real `MonitorControl::Seek`, the path a click on the
+//! waveform takes. A muted voice goes on playing — muting is a volume of
+//! zero, not a pause — so the picture shows the cursor a frame or two past
+//! `secs` rather than exactly on it. A seek into a sequence's run-up, before
+//! its loop start, is a seek like any other:
+//!   cargo run --example host_window --features egui -- --status playing-sequence --playhead 1.0 --shot run-up.png
 //!
 //! A `baking` picture needs a bake slower than a few frames: the dev profile
 //! bakes the seeded-size sequence in about a second, a release build in well
@@ -276,6 +279,7 @@ fn main() -> AppExit {
             (
                 log_window_sizes,
                 ask_for_the_status,
+                move_the_playhead,
                 silence_the_sinks,
                 shoot,
             ),
@@ -285,8 +289,8 @@ fn main() -> AppExit {
 
 /// The command line: `--light`, `--orphan`, `--rename <name>`, `--drag`,
 /// `--wire`, `--menu <which>`, `--notes <what>`, `--limits`, `--confirm`,
-/// `--beyond`, `--hover <label>`, `--broken`, `--status <state>` and
-/// `--shot <path>`.
+/// `--beyond`, `--hover <label>`, `--broken`, `--status <state>`,
+/// `--playhead <secs>` and `--shot <path>`.
 #[derive(Resource)]
 struct Args {
     light: bool,
@@ -316,6 +320,9 @@ struct Args {
     notice: Option<String>,
     notice_live: bool,
     status: Option<Status>,
+    /// `--playhead <secs>`: seek the playing audition to `secs`, so a
+    /// picture of the cursor is the same picture every run.
+    playhead: Option<f32>,
     shot: Option<String>,
 }
 
@@ -439,6 +446,12 @@ impl Args {
             notice: value("--notice", "").or_else(|| value("--notice-live", "")),
             notice_live: args.iter().any(|a| a == "--notice-live"),
             status,
+            playhead: value("--playhead", "1.0").map(|secs| {
+                secs.parse().unwrap_or_else(|_| {
+                    eprintln!("--playhead {secs}: expected seconds, like 1.0");
+                    std::process::exit(2);
+                })
+            }),
             shot,
         }
     }
@@ -549,6 +562,8 @@ struct Editor {
     /// `--notice` / `--notice-live`: the host's own line above the editors.
     notice: Option<String>,
     notice_live: bool,
+    /// `--playhead`: the second the audition was sought to, once it has been.
+    sought: Option<f32>,
 }
 
 impl Editor {
@@ -610,6 +625,7 @@ impl Editor {
             scroll_to_bottom: args.orphan,
             notice: args.notice.clone(),
             notice_live: args.notice_live,
+            sought: None,
         }
     }
 }
@@ -665,6 +681,40 @@ fn ask_for_the_status(
     };
     info!("--status {status:?}: asking the monitor to play a slot");
     requests.write(request);
+}
+
+/// `--playhead <secs>`: seek the audition to `secs`, once `--status` has it
+/// playing and the windows have settled.
+///
+/// Through a real [`MonitorControl::Seek`], not by writing a position: it is
+/// the path a click on the waveform takes, so the picture shows the mechanism
+/// rather than a value poked past it. `--shot` then waits for the cursor to
+/// be there.
+fn move_the_playhead(
+    args: Res<Args>,
+    mut editor: ResMut<Editor>,
+    monitor: Res<AudioMonitor>,
+    mut controls: MessageWriter<MonitorControl>,
+) {
+    let Some(secs) = args.playhead else {
+        return;
+    };
+    // Once, and only once a voice is playing — a seek with no buffer has
+    // nowhere to land and is dropped — and only once the layout has settled,
+    // which is when `--shot` would take its picture. Sooner, and the voice
+    // plays on past `secs` while the windows size themselves: the first run
+    // of this sought at the first playing frame, a second before the settle,
+    // and a seek into a run-up is played once, so the cursor never came
+    // back to where the picture was waiting for it.
+    if editor.sought.is_some()
+        || monitor.status != MonitorStatus::Playing
+        || editor.frames_shown < SETTLE_FRAMES
+    {
+        return;
+    }
+    editor.sought = Some(secs);
+    info!("--playhead: seeking the audition to {secs} s");
+    controls.write(MonitorControl::Seek(secs));
 }
 
 /// Hold every sink to the host bar's Mute, and silence them all under
@@ -1027,7 +1077,7 @@ fn type_the_rename(
 /// whenever the bake happens to finish. See "Why a scripted gesture waits".
 fn layout_is_final(args: &Args, editor: &Editor, monitor: &AudioMonitor) -> bool {
     editor.frames_shown >= TYPE_AFTER_FRAMES
-        && matches!(status_reached(args.status, monitor), Ok(true))
+        && matches!(status_reached(args, editor, monitor), Ok(true))
 }
 
 /// A gesture's target points, and how many frames running they have been
@@ -1832,19 +1882,24 @@ struct Shot {
     last_len: Option<u64>,
 }
 
-/// Whether the monitor shows what `--status` asked for, so the picture can
-/// be taken. `Err` when it never will: a `baking` picture whose bake ended
-/// before it had run [`BAKING_FOR`].
-fn status_reached(status: Option<Status>, monitor: &AudioMonitor) -> Result<bool, String> {
-    Ok(match status {
+/// Whether the monitor shows what `--status` and `--playhead` asked for, so
+/// the picture can be taken. `Err` when it never will: a `baking` picture
+/// whose bake ended before it had run [`BAKING_FOR`].
+fn status_reached(args: &Args, editor: &Editor, monitor: &AudioMonitor) -> Result<bool, String> {
+    let reached = match args.status {
         None | Some(Status::Idle) => true,
         Some(Status::Playing | Status::Muted) => monitor.status == MonitorStatus::Playing,
-        // Playing AND far enough in for the cursor to be off the very
-        // start: a playhead pinned to beat 0 in every picture is a picture
-        // that proves nothing.
+        // Playing AND far enough past where the voice started for the cursor
+        // to have moved: a voice starts at its loop start, and a playhead
+        // pinned there in every picture is a picture that proves nothing.
+        // Under `--playhead` the seek puts the cursor somewhere instead.
         Some(Status::PlayingSequence) => {
+            let started = bevy_symbios_audio::sequence_loop_start(&editor.recipe)
+                .unwrap_or_default()
+                .as_secs_f32();
             monitor.status == MonitorStatus::Playing
-                && monitor.position_secs().is_some_and(|at| at > 0.2)
+                && (args.playhead.is_some()
+                    || monitor.position_secs().is_some_and(|at| at > started + 0.2))
         }
         Some(Status::Error) => matches!(monitor.status, MonitorStatus::Error(_)),
         Some(Status::Baking) => match monitor.bake_elapsed() {
@@ -1857,7 +1912,17 @@ fn status_reached(status: Option<Status>, monitor: &AudioMonitor) -> Result<bool
             }
             None => false,
         },
-    })
+    };
+    // `--playhead`: the seek asked for, and the cursor there — or a frame or
+    // two past it once the voice moves on, never short of it.
+    let sought = match (args.playhead, editor.sought) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (Some(_), Some(secs)) => monitor
+            .position_secs()
+            .is_some_and(|at| at >= secs - 0.001 && at < secs + 0.25),
+    };
+    Ok(reached && sought)
 }
 
 /// Save a picture of the app window and quit, for `--shot <path>`.
@@ -1890,7 +1955,7 @@ fn shoot(
             }
             return;
         }
-        match status_reached(args.status, &monitor) {
+        match status_reached(&args, &editor, &monitor) {
             Ok(true) => {}
             Ok(false) => {
                 shot.waited += 1;

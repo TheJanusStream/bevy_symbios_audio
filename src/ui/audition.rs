@@ -4,19 +4,20 @@
 //! [`audition_strip`] draws Audition and Stop, an Auto toggle, a status chip,
 //! the monitor's own Level, a caption saying exactly what is played, the
 //! reason when a bake fails, and the waveform of the strip's last bake —
-//! with a playhead on it while this strip's audition is the one sounding.
-//! It *returns* the [`MonitorRequest`] to write, if there is one, instead of
-//! writing it, so it takes no Bevy system parameter and a test can drive it
-//! headless. The things that do not need a bake — the Level, and where a
-//! click on the waveform landed — come back through
-//! [`AuditionState::take_controls`] as [`MonitorControl`]s.
+//! with a playhead on it while this strip's audition is the one sounding,
+//! which a click on the waveform moves. It *returns* the [`MonitorRequest`]
+//! to write, if there is one, instead of writing it, so it takes no Bevy
+//! system parameter and a test can drive it headless. The things that do not
+//! need a bake — the Level, and a seek from a click on the waveform — come
+//! back through [`AuditionState::take_controls`] as [`MonitorControl`]s.
 //!
 //! # What is played
 //!
 //! An [`AuditionSource`] is a patch baked at a sample rate for a length, or a
 //! whole sequence at its own rate, and the caption says which ("1.0 s at
-//! 22.05 kHz, looped"). A host whose world bakes a slot at particular numbers
-//! should audition at those numbers, and can say so with
+//! 22.05 kHz, looped"), and where a sequence's loop starts when its bake has
+//! a loop point ("…, looped from beat 2"). A host whose world bakes a slot at
+//! particular numbers should audition at those numbers, and can say so with
 //! [`AuditionSource::with_note`]: an audition at other numbers is another
 //! sound, and a 0.4 Hz sweep that swells over four seconds in the editor is
 //! a stutter in a world that loops one second of it.
@@ -58,6 +59,7 @@ use super::preview::{
     AudioMonitor, MonitorControl, MonitorRequest, MonitorStatus, fingerprint, waveform_with_cursor,
 };
 use super::style::editor_style;
+use crate::looping::sequence_loop_start;
 use crate::patch::{AudioPatch, topo_sort};
 use crate::sequence::SequenceRecipe;
 
@@ -97,7 +99,8 @@ impl<'a> AuditionSource<'a> {
         }
     }
 
-    /// The whole of `recipe`, at its own sample rate, looped.
+    /// The whole of `recipe`, at its own sample rate, looped from its loop
+    /// start.
     pub fn sequence(recipe: &'a SequenceRecipe) -> Self {
         Self {
             what: What::Sequence(recipe),
@@ -114,7 +117,13 @@ impl<'a> AuditionSource<'a> {
     }
 
     /// What is played, in words: "1.0 s at 22.05 kHz, looped", or "The whole
-    /// sequence: 34 beats at 60 BPM, 22.05 kHz, looped", then the note.
+    /// sequence: 34 beats at 60 BPM, 22.05 kHz, looped from beat 2", then the
+    /// note.
+    ///
+    /// "From beat" only when the bake loops from a point after its first
+    /// sample ([`sequence_loop_start`]): the monitor loops a sequence from
+    /// there and never plays the beats before it. A sequence with no loop
+    /// point, or one at or past its end, loops whole, and says "looped".
     pub fn caption(&self) -> String {
         let mut caption = match self.what {
             What::Patch {
@@ -127,10 +136,11 @@ impl<'a> AuditionSource<'a> {
                 kilohertz(sample_rate)
             ),
             What::Sequence(recipe) => format!(
-                "The whole sequence: {} beats at {} BPM, {}, looped",
+                "The whole sequence: {} beats at {} BPM, {}, {}",
                 plain(recipe.duration_beats),
                 plain(recipe.bpm),
-                kilohertz(recipe.sample_rate)
+                kilohertz(recipe.sample_rate),
+                looped(recipe)
             ),
         };
         if let Some(note) = self.note {
@@ -175,6 +185,17 @@ impl<'a> AuditionSource<'a> {
                 .map(|e| describe_graph_error(&patch.graph, &e)),
             What::Sequence(_) => None,
         }
+    }
+}
+
+/// "looped from beat 2" when `recipe`'s bake loops from a point after its
+/// first sample, and "looped" when it loops whole.
+fn looped(recipe: &SequenceRecipe) -> String {
+    match (recipe.loop_start_beats, sequence_loop_start(recipe)) {
+        (Some(beats), Some(start)) if !start.is_zero() => {
+            format!("looped from beat {}", plain(beats))
+        }
+        _ => "looped".to_string(),
     }
 }
 
@@ -302,7 +323,9 @@ impl AuditionState {
 ///   heard) or Error. An error is spelled out under the row, naming the
 ///   nodes at fault when the source is a patch.
 /// - The **caption** says what is played ([`AuditionSource::caption`]).
-/// - The **waveform** of the strip's last bake, once there is one.
+/// - The **waveform** of the strip's last bake, once there is one, with a
+///   playhead while this strip's audition plays. A click on it then asks
+///   the monitor to play from there ([`MonitorControl::Seek`]).
 ///
 /// Draw it above a canvas, never after one: see the [module docs](crate::ui).
 pub fn audition_strip(
@@ -387,11 +410,18 @@ pub fn audition_strip(
             monitor.loop_secs().unwrap_or(0.0),
             egui::vec2(ui.available_width(), 72.0),
         );
-        if let Some(secs) = drawn.seek {
+        // A seek only while there is a cursor, which is this strip's own
+        // voice playing: the waveform offers its click then and only then,
+        // and a click on the last bake, with nothing of this slot's
+        // playing, has nothing to move.
+        if position.is_some()
+            && let Some(secs) = drawn.seek
+        {
             state.controls.push(MonitorControl::Seek(secs));
         }
-        drawn.response.on_hover_text(if live {
-            "What is playing, with the line showing where it has got to"
+        drawn.response.on_hover_text(if position.is_some() {
+            "What is playing, with the line showing where it has got to. \
+             Click anywhere on it to play from there"
         } else {
             "The last bake. Audition to play it"
         });
@@ -943,6 +973,70 @@ mod tests {
         }
     }
 
+    /// A click on the waveform of this strip's playing audition asks the
+    /// monitor to play from there, and the same click on the last bake with
+    /// nothing of this slot's playing asks for nothing: there is no cursor to
+    /// move, and the waveform offers no click (#68, Overlands #1341).
+    #[test]
+    fn a_click_on_a_playing_waveform_asks_for_a_seek_and_on_a_still_one_does_not() {
+        let quiet = one_gain();
+        let source = AuditionSource::patch(&quiet, 22_050, 1.0);
+        for playing in [true, false] {
+            let mut strip = Strip::new();
+            let request = strip.state.play(&source);
+            let mut monitor = AudioMonitor::default();
+            monitor.stage(&request, MonitorStatus::Playing);
+            if !playing {
+                monitor.status = MonitorStatus::Idle;
+            }
+            strip.settle(&monitor, source, false);
+            let ground = crate::ui::test_paint::shapes(&strip.out)
+                .into_iter()
+                .find_map(|shape| match shape {
+                    egui::Shape::Rect(r) if r.rect.height() == 72.0 => Some(r.rect),
+                    _ => None,
+                })
+                .expect("the waveform of the last bake is drawn either way");
+            let at = ground.center();
+            let press = |pressed| egui::Event::PointerButton {
+                pos: at,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::default(),
+            };
+            strip.frame(
+                &monitor,
+                source,
+                false,
+                false,
+                vec![egui::Event::PointerMoved(at), press(true)],
+            );
+            strip.frame(&monitor, source, false, false, vec![press(false)]);
+            let seeks: Vec<f32> = strip
+                .state
+                .take_controls()
+                .into_iter()
+                .filter_map(|control| match control {
+                    MonitorControl::Seek(secs) => Some(secs),
+                    _ => None,
+                })
+                .collect();
+            if playing {
+                let half = monitor.loop_secs().expect("a buffer") / 2.0;
+                assert!(
+                    matches!(seeks[..], [secs] if (secs - half).abs() < 0.01),
+                    "a click in the middle of a playing waveform asks for its middle, \
+                     {half} s; asked for {seeks:?}"
+                );
+            } else {
+                assert!(
+                    seeks.is_empty(),
+                    "a click on a still waveform asked for {seeks:?}"
+                );
+            }
+        }
+    }
+
     /// A strip whose audition is playing, after a settle.
     fn playing(source: AuditionSource<'_>) -> (Strip, AudioMonitor) {
         let mut strip = Strip::new();
@@ -1117,11 +1211,46 @@ mod tests {
             bpm: 60.0,
             sample_rate: 22_050,
             duration_beats: 34.0,
+            loop_start_beats: None,
             ..SequenceRecipe::default()
         };
         assert_eq!(
             AuditionSource::sequence(&recipe).caption(),
             "The whole sequence: 34 beats at 60 BPM, 22.05 kHz, looped"
         );
+    }
+
+    /// #1330's own wording, true at last: a bed whose bake loops from beat 2
+    /// says so, because the monitor loops it from there. A loop point the
+    /// bake does not have — none, one at the end, one on the first sample —
+    /// says "looped", because the whole buffer loops (#68, Overlands #1341).
+    #[test]
+    fn a_sequence_caption_says_the_beat_its_loop_starts_on() {
+        let bed = SequenceRecipe {
+            bpm: 60.0,
+            sample_rate: 22_050,
+            duration_beats: 34.0,
+            loop_start_beats: Some(2.0),
+            ..SequenceRecipe::default()
+        };
+        assert_eq!(
+            AuditionSource::sequence(&bed).caption(),
+            "The whole sequence: 34 beats at 60 BPM, 22.05 kHz, looped from beat 2"
+        );
+        for (what, loop_start_beats) in [
+            ("no loop point", None),
+            ("a loop start at the end", Some(34.0)),
+            ("a loop start on the first sample", Some(0.0)),
+        ] {
+            let recipe = SequenceRecipe {
+                loop_start_beats,
+                ..bed.clone()
+            };
+            assert_eq!(
+                AuditionSource::sequence(&recipe).caption(),
+                "The whole sequence: 34 beats at 60 BPM, 22.05 kHz, looped",
+                "{what}"
+            );
+        }
     }
 }

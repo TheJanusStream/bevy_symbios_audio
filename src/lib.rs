@@ -30,6 +30,10 @@
 //!
 //! - [`audio_source`] — the `Vec<f32>` → Bevy `AudioSource` bridge
 //!   (writes an in-memory WAV blob).
+//! - [`looping`] — playing a baked buffer from its loop start:
+//!   [`sequence_loop_start`] for a Bevy looping player's `start_position`,
+//!   and [`LoopedSamples`], a looping voice that can be moved while it
+//!   plays.
 //! - [`cache`] — Bevy `Resource` wrapper over the cache backends.
 //! - [`async_gen`] — `PendingAudioPatch`/`AudioPatchReady` ECS handover.
 //! - [`SymbiosAudioPlugin`] — the plugin entry point.
@@ -84,8 +88,11 @@
 //! (named [`AudioPatch`]es) and timed [`struct@Event`]s.  Call [`bake_sequence`]
 //! directly (offline) or wire it through the same plugin/cache path used
 //! for one-shot bakes.  Set `loop_start_beats` for seamless loops — the
-//! mixdown baker pre-mixes a tail crossfade so the buffer hard-loops
-//! through rodio's `Source::loop_..()` with no click at the seam.
+//! mixdown baker pre-mixes a tail crossfade into the loop region, so the
+//! seam is click-free when the buffer loops back to its loop start: play it
+//! with a `start_position` of [`sequence_loop_start`], or as a
+//! [`LoopedSamples`]. Looped from its first sample instead, it replays the
+//! run-up before the loop start on every pass (see [`looping`]).
 //!
 //! ## 3. CLI export — `symbios-audio-cli`
 //!
@@ -124,6 +131,7 @@
 pub mod async_gen;
 pub mod audio_source;
 pub mod cache;
+pub mod looping;
 
 // Egui editor widgets for the patch schema, behind the `egui` Cargo
 // feature.  The module documents itself via its own `//!` header (see
@@ -153,10 +161,11 @@ pub use symbios_audio::{Event, Mix, Node};
 pub use symbios_audio::impl_genotype;
 
 // Wrapper-only re-exports (the Bevy-coupled surface) — the async-bake
-// handover, the WAV→AudioSource bridge, and the `Resource` cache.  The
-// pure `samples_to_wav_bytes` / `MAX_WAV_SAMPLES` already arrive via the
-// `symbios_audio::*` glob above (and `audio_source` re-exports them too),
-// so they're intentionally omitted here to avoid an ambiguous glob.
+// handover, the WAV→AudioSource bridge, the looping voice, and the
+// `Resource` cache.  The pure `samples_to_wav_bytes` / `MAX_WAV_SAMPLES`
+// already arrive via the `symbios_audio::*` glob above (and `audio_source`
+// re-exports them too), so they're intentionally omitted here to avoid an
+// ambiguous glob.
 pub use async_gen::{
     AsyncAudioConfig, AudioPatchReady, CacheOrPending, DEFAULT_POOL_THREADS, PendingAudioPatch,
     bake_with_cache,
@@ -166,6 +175,7 @@ pub use cache::{
     DEFAULT_MEMORY_CACHE_ENTRIES, FileStore, MemoryStore, PatchCache, PatchCacheKey,
     PatchCacheStore,
 };
+pub use looping::{LoopPlayhead, LoopedSamples, LoopedSamplesDecoder, sequence_loop_start};
 
 use bevy::prelude::*;
 
