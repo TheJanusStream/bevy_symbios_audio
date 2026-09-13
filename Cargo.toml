@@ -1,6 +1,6 @@
 [package]
 name = "bevy_symbios_audio"
-version = "0.4.10"
+version = "0.5.0"
 edition = "2024"
 authors = ["Janus"]
 description = "Algorithmic audio generator for Bevy."
@@ -34,6 +34,13 @@ clap = { version = "4", features = ["derive"], optional = true }
 rand = { version = "0.9", default-features = false, features = ["std"] }
 rand_chacha = "0.9"
 rayon = "1.11"
+# The audio backend under Bevy's, named for the seekable looping source
+# (`looping::LoopedSamples`): `Source::try_seek` returns rodio's `SeekError`,
+# which Bevy does not re-export. The minor bevy_audio 0.19 uses, with no
+# features of its own, so it is the same crate in the graph: if Bevy moves to
+# another rodio, the `Decodable` impl stops compiling rather than
+# implementing a trait Bevy no longer calls.
+rodio = { version = "0.22", default-features = false }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 symbios-audio = "0.2"
