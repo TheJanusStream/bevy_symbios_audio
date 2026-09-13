@@ -1,4 +1,4 @@
-//! Offline demonstration of the full Phase 4 mixdown pipeline.
+//! Offline demonstration of the full mixdown pipeline.
 //!
 //! Builds a `SequenceRecipe` with two instruments — a brown-noise wind
 //! drone whose LP cutoff is modulated by a slow LFO, and a slightly-

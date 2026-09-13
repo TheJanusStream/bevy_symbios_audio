@@ -2,10 +2,14 @@
 //! heard (#57, Overlands #1330).
 //!
 //! [`audition_strip`] draws Audition and Stop, an Auto toggle, a status chip,
-//! a caption saying exactly what is played, the reason when a bake fails,
-//! and the waveform of the strip's last bake. It *returns* the
-//! [`MonitorRequest`] to write, if there is one, instead of writing it, so it
-//! takes no Bevy system parameter and a test can drive it headless.
+//! the monitor's own Level, a caption saying exactly what is played, the
+//! reason when a bake fails, and the waveform of the strip's last bake —
+//! with a playhead on it while this strip's audition is the one sounding.
+//! It *returns* the [`MonitorRequest`] to write, if there is one, instead of
+//! writing it, so it takes no Bevy system parameter and a test can drive it
+//! headless. The things that do not need a bake — the Level, and where a
+//! click on the waveform landed — come back through
+//! [`AuditionState::take_controls`] as [`MonitorControl`]s.
 //!
 //! # What is played
 //!
@@ -531,6 +535,9 @@ mod tests {
         out: egui::FullOutput,
         state: AuditionState,
         now: f64,
+        /// The rect the panel gave the strip on the last frame: what its
+        /// layout has to fit inside.
+        given: Option<egui::Rect>,
     }
 
     impl Strip {
@@ -542,6 +549,7 @@ mod tests {
                 out: egui::FullOutput::default(),
                 state: AuditionState::default(),
                 now: 10.0,
+                given: None,
             }
         }
 
@@ -555,7 +563,11 @@ mod tests {
             events: Vec<egui::Event>,
         ) -> Option<MonitorRequest> {
             let Self {
-                ctx, out, state, ..
+                ctx,
+                out,
+                state,
+                given,
+                ..
             } = self;
             let input = egui::RawInput {
                 time: Some(self.now),
@@ -569,6 +581,7 @@ mod tests {
             let mut asked = None;
             *out = ctx.run_ui(input, |root| {
                 egui::CentralPanel::default().show(root, |ui| {
+                    *given = Some(ui.max_rect());
                     asked = audition_strip(ui, monitor, state, source, committed, muted);
                 });
             });
@@ -675,6 +688,80 @@ mod tests {
     /// `#0` and `#1` feed each other: the bake fails with a cycle.
     fn looped() -> AudioPatch {
         patch(vec![gain_from(0, &[1]), gain_from(1, &[0])], 0)
+    }
+
+    /// E3 (Overlands #1339): the strip is ONE row of controls with its
+    /// caption under it, and none of it leaves the space the host gave it.
+    ///
+    /// [`the_strip_renders_headless_in_every_status`] is a no-panic test —
+    /// which is exactly the review's complaint, E3: nothing in the suite
+    /// could see a layout. The report's figure shows Audition, Stop, Auto,
+    /// the chip and Level on one line with the caption under them, and the
+    /// row is a `horizontal_wrapped`, so a control added to it or a chip
+    /// that grows (Baking counts seconds, Error spells out a fault) can
+    /// push Level onto a second line and the caption out of view without
+    /// anything failing.
+    #[test]
+    fn the_strip_is_one_row_of_controls_with_its_caption_under_them() {
+        let quiet = one_gain();
+        for (what, status) in [
+            ("idle", None),
+            ("baking", Some(MonitorStatus::Baking)),
+            ("playing", Some(MonitorStatus::Playing)),
+        ] {
+            let mut monitor = AudioMonitor::default();
+            let mut strip = Strip::new();
+            if let Some(status) = status {
+                let request = strip
+                    .state
+                    .play(&AuditionSource::patch(&quiet, 22_050, 1.0));
+                monitor.stage(&request, status);
+            }
+            strip.settle(&monitor, AuditionSource::patch(&quiet, 22_050, 1.0), false);
+
+            let given = strip.given.expect("the strip was drawn in a panel");
+            let mut rows: Vec<(String, egui::Rect)> = Vec::new();
+            for shape in crate::ui::test_paint::shapes(&strip.out) {
+                let egui::Shape::Text(t) = shape else {
+                    continue;
+                };
+                let at = t.visual_bounding_rect();
+                assert!(
+                    given.expand(0.5).contains_rect(at),
+                    "{what}: {:?} at {at:?} is outside the {given:?} it was given",
+                    t.galley.text()
+                );
+                rows.push((t.galley.text().to_owned(), at));
+            }
+            let find = |needle: &str| -> egui::Rect {
+                rows.iter()
+                    .find(|(text, _)| text == needle)
+                    .unwrap_or_else(|| {
+                        panic!("{what}: no {needle:?}; painted: {:?}", texts_of(&rows))
+                    })
+                    .1
+            };
+            let controls = ["\u{25B6} Audition", "\u{23F9} Stop", "Auto", "Level"];
+            let first = find(controls[0]);
+            for control in &controls[1..] {
+                let at = find(control);
+                assert!(
+                    at.y_range().intersects(first.y_range()),
+                    "{what}: {control:?} at {at:?} is not on Audition's row {first:?}"
+                );
+            }
+            let caption = AuditionSource::patch(&quiet, 22_050, 1.0).caption();
+            let under = find(&caption);
+            assert!(
+                under.top() >= first.bottom(),
+                "{what}: the caption at {under:?} is not under the row {first:?}"
+            );
+        }
+    }
+
+    /// The texts of `rows`, for a panic message.
+    fn texts_of(rows: &[(String, egui::Rect)]) -> Vec<&str> {
+        rows.iter().map(|(text, _)| text.as_str()).collect()
     }
 
     /// The strip shows each state of its own audition in a chip, and draws

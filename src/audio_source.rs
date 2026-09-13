@@ -1,6 +1,6 @@
 //! Bridge from a baked `Vec<f32>` to Bevy's `AudioSource` asset.
 //!
-//! Phase 3 ticket #10.  The audio engine in Bevy 0.18 (rodio under the
+//! The audio engine in Bevy 0.18 (rodio under the
 //! hood) consumes [`AudioSource`] — a `bytes::Bytes`-equivalent blob that
 //! it re-decodes on play.  Rather than implementing a custom rodio
 //! `Decoder` for `Vec<f32>` (doable but ties us to rodio internals and a

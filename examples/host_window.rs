@@ -49,22 +49,22 @@
 //! picture, through real requests to the monitor: `idle` (nothing asked),
 //! `playing` (the patch slot auditioned; the default under `--shot`), `muted`
 //! (the same with the host bar's Mute on), `baking` (the sequence slot
-//! auditioned, pictured while its bake runs) and `error` (the patch slot
-//! auditioned with `--broken`'s patch). `--broken` opens the patch slot with
-//! a loop in its graph, so the canvas outlines the two nodes of the loop and
-//! names them:
+//! auditioned, pictured while its bake runs), `playing-sequence` (the
+//! sequence slot auditioned and playing, waited out until its voice is past
+//! 0.2 s so the playhead is somewhere other than the very start) and
+//! `error` (the patch slot auditioned with `--broken`'s patch). `--broken`
+//! opens the patch slot with a loop in its graph, so the canvas outlines the
+//! two nodes of the loop and names them:
 //!   cargo run --example host_window --features egui -- --status baking --shot baking.png
+//!   cargo run --example host_window --features egui -- --status playing-sequence --shot cursor.png
 //!
-//! `--playhead <secs>` seeks the audition to `secs` once its bake has
-//! landed, so the cursor on the waveform and on the timeline is in the same
-//! place in every run. Through a real seek, the path a click on the
-//! waveform takes — under `--shot` every sink is muted, and muting is
-//! `set_volume(0)` rather than a pause, so a voice does go on advancing,
-//! but how far it has got when the picture is taken depends on the
-//! machine. Use it with `--status playing` for the patch waveform's cursor
-//! and `--status baking` for the timeline's:
+//! There is NO flag that puts the cursor at a chosen second. There was one,
+//! `--playhead <secs>`, and it moved nothing: every seek on a looping Bevy
+//! sink is refused by the backend (`MonitorControl::Seek` carries the
+//! measurement), so the flag promised a thing it could not do. Waiting for
+//! a voice to be past 0.2 s — what `--status playing-sequence` does — is the
+//! honest way to a picture whose cursor is not at the very start:
 //!
-//!   cargo run --example host_window --features egui -- --status playing --playhead 0.6 --shot cursor.png
 //!   cargo run --example host_window --features egui -- --status error --shot error.png
 //!
 //! A `baking` picture needs a bake slower than a few frames: the dev profile
@@ -276,7 +276,6 @@ fn main() -> AppExit {
             (
                 log_window_sizes,
                 ask_for_the_status,
-                move_the_playhead,
                 silence_the_sinks,
                 shoot,
             ),
@@ -286,8 +285,8 @@ fn main() -> AppExit {
 
 /// The command line: `--light`, `--orphan`, `--rename <name>`, `--drag`,
 /// `--wire`, `--menu <which>`, `--notes <what>`, `--limits`, `--confirm`,
-/// `--beyond`, `--hover <label>`, `--broken`, `--status <state>`,
-/// `--playhead <secs>` and `--shot <path>`.
+/// `--beyond`, `--hover <label>`, `--broken`, `--status <state>` and
+/// `--shot <path>`.
 #[derive(Resource)]
 struct Args {
     light: bool,
@@ -317,9 +316,6 @@ struct Args {
     notice: Option<String>,
     notice_live: bool,
     status: Option<Status>,
-    /// `--playhead <secs>`: seek the audition to `secs` once it is
-    /// playing, so a picture of the cursor is the same picture every run.
-    playhead: Option<f32>,
     shot: Option<String>,
 }
 
@@ -443,7 +439,6 @@ impl Args {
             notice: value("--notice", "").or_else(|| value("--notice-live", "")),
             notice_live: args.iter().any(|a| a == "--notice-live"),
             status,
-            playhead: value("--playhead", "1.0").and_then(|v| v.parse().ok()),
             shot,
         }
     }
@@ -670,37 +665,6 @@ fn ask_for_the_status(
     };
     info!("--status {status:?}: asking the monitor to play a slot");
     requests.write(request);
-}
-
-/// `--playhead <secs>`: put the audition's cursor at `secs`, once there is
-/// a bake for it to be inside.
-///
-/// Through a real [`MonitorControl::Seek`], not by writing a position: it
-/// is the same path a click on the waveform takes, so the picture proves
-/// the mechanism rather than a value poked past it. Under `--shot` every
-/// sink is muted — muting is `set_volume(0)`, not a pause, so a voice does
-/// go on advancing — but how far it has got by the time the picture is
-/// taken depends on the machine, and a cursor that lands somewhere
-/// different every run is a picture nothing can be checked against. This
-/// pins it.
-fn move_the_playhead(
-    args: Res<Args>,
-    editor: Res<Editor>,
-    monitor: Res<AudioMonitor>,
-    mut controls: MessageWriter<MonitorControl>,
-    mut asked: Local<bool>,
-) {
-    let Some(secs) = args.playhead else {
-        return;
-    };
-    // Once the bake has landed: a seek before there is a buffer has
-    // nowhere to land and is dropped.
-    if *asked || editor.frames_shown < STATUS_AT_FRAMES || monitor.loop_secs().is_none() {
-        return;
-    }
-    *asked = true;
-    info!("--playhead: seeking the audition to {secs} s");
-    controls.write(MonitorControl::Seek(secs));
 }
 
 /// Hold every sink to the host bar's Mute, and silence them all under

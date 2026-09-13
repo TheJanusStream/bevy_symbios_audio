@@ -1,7 +1,7 @@
 //! Async audio bake pool — Bevy ECS handover for the
 //! [`crate::bake::bake`] function.
 //!
-//! Phase 3 ticket #9.  Baking a 3-minute mixdown is comparably CPU-bound
+//! Baking a 3-minute mixdown is comparably CPU-bound
 //! to generating a 4K texture; doing it on the main thread will stall
 //! the frame.  This module mirrors `bevy_symbios_texture::async_gen`:
 //! a private, bounded [`rayon`] thread pool gated by [`OnceLock`] so all

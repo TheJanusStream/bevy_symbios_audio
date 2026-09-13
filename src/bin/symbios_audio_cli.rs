@@ -1,7 +1,7 @@
 //! Offline patch baker — read an `AudioPatch` (or `SequenceRecipe`) JSON
 //! file, bake it, write the result as a WAV file.
 //!
-//! Phase 3 ticket #12.  Intended for the Janus Stream video pipeline
+//! Intended for the Janus Stream video pipeline
 //! and for sound-design iteration outside the Bevy app.  Mono WAV only
 //! (IEEE float, the same encoding the in-Bevy `AudioSource` bridge
 //! produces) — Ogg Vorbis / Opus are deliberately out of scope

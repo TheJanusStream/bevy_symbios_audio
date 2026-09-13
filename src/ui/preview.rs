@@ -1,10 +1,12 @@
-//! Waveform preview and a bake-and-play audio *monitor*.
+//! Waveform preview and the audio *monitor* an audition plays through.
 //!
 //! Two independent pieces:
 //!
 //! - [`waveform`] — a pure-egui widget that draws a sample buffer as a
 //!   min/max envelope.  No audio device, no Bevy; safe on wasm and reusable on
-//!   its own.
+//!   its own. [`waveform_with_cursor`] is the same picture with a playhead
+//!   on it and a seconds axis along the bottom, and it reports where a
+//!   click landed ([`WaveformResponse`]).
 //! - The **monitor** — the first Bevy-touching part of [`crate::ui`]: a
 //!   [`MonitorRequest`] message, the [`AudioMonitor`] resource, the bake/poll
 //!   systems, and [`AudioEditorPlugin`] that wires them up.  This is a 2-D,
@@ -12,6 +14,16 @@
 //!   distinct from a game's spatial-audio pipeline (e.g. Overlands attaches
 //!   spatial `AudioPlayer`s to world entities; this just plays the buffer flat
 //!   so you can hear what you're editing).
+//!
+//!   What it publishes back, once a voice is playing:
+//!   [`AudioMonitor::position_secs`] (where that voice is in its buffer,
+//!   wrapped into the loop), [`AudioMonitor::loop_secs`] (how long the
+//!   loop is) and [`AudioMonitor::volume`]. What it takes besides a
+//!   `MonitorRequest` is a [`MonitorControl`] — volume, mute and a seek —
+//!   which is a separate message type because a request bakes and a
+//!   control does not. **A seek on a looping voice is refused by the
+//!   backend and moves nothing**; [`MonitorControl::Seek`] carries the
+//!   measurement.
 //!
 //! # Why a background bake (not the crate's rayon pool)
 //!
@@ -240,13 +252,20 @@ fn paint_seconds_axis(
             ],
             egui::Stroke::new(1.0, style.waveform_zero),
         );
-        painter.text(
-            egui::pos2(x + 2.0, rect.bottom() - 1.0),
-            egui::Align2::LEFT_BOTTOM,
-            format!("{t:.decimals$} s"),
-            font.clone(),
-            style.ground_text,
-        );
+        let label =
+            painter.layout_no_wrap(format!("{t:.decimals$} s"), font.clone(), style.ground_text);
+        // The loop runs while `t < secs`, so the last tick can land within
+        // a label's own width of the right edge: at 120 points and 2.05 s
+        // the step is 2 s and "2 s" hung 10 points off the waveform. A
+        // label that would not fit is not drawn — its tick still is, and
+        // the end of the buffer is the rect's own edge (Overlands #1339).
+        if x + 2.0 + label.size().x <= rect.right() - 1.0 {
+            painter.galley(
+                egui::pos2(x + 2.0, rect.bottom() - 1.0 - label.size().y),
+                label,
+                style.ground_text,
+            );
+        }
         t += step;
     }
     let _ = ui;
@@ -835,6 +854,77 @@ mod tests {
 
     fn a_sine() -> Vec<f32> {
         (0..2000).map(|i| (i as f32 * 0.05).sin()).collect()
+    }
+
+    /// E3 (Overlands #1339): the cursor and the seconds axis stay on the
+    /// waveform.
+    ///
+    /// Nothing measured where either landed. The axis places a label at
+    /// `x + 2` from its tick with `LEFT_BOTTOM`, and the tick loop runs
+    /// while `t < secs`, so a step that lands just under the end puts a
+    /// label most of its own width past the right edge — a waveform is
+    /// drawn at whatever width its host has, and the step is chosen from
+    /// that width, so the pair that does it is a matrix and not a guess.
+    ///
+    /// Measured against [`WaveformResponse::response`]'s own rect, which is
+    /// what the widget told its host it took.
+    #[test]
+    fn the_cursor_and_the_seconds_axis_lie_inside_the_waveform() {
+        use crate::ui::test_paint::shapes;
+        let samples = a_sine();
+        let ctx = egui::Context::default();
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 400.0),
+            )),
+            ..Default::default()
+        };
+        for width in [120.0_f32, 260.0, 890.0] {
+            for secs in [0.2_f32, 1.0, 2.05, 7.5, 34.0] {
+                for at in [0.0_f32, 0.5, 0.999] {
+                    let position = secs * at;
+                    let mut rect = None;
+                    let out = ctx.run_ui(input(), |root| {
+                        egui::CentralPanel::default().show(root, |ui| {
+                            let drawn = super::waveform_with_cursor(
+                                ui,
+                                &samples,
+                                Some(position),
+                                secs,
+                                egui::vec2(width, 72.0),
+                            );
+                            rect = Some(drawn.response.rect);
+                        });
+                    });
+                    let rect = rect.expect("the waveform drew").expand(0.5);
+                    let case = format!("{width} points, {secs} s, cursor at {position:.3} s");
+                    for shape in shapes(&out) {
+                        match shape {
+                            egui::Shape::Text(t) => {
+                                let at = t.visual_bounding_rect();
+                                assert!(
+                                    rect.contains_rect(at),
+                                    "{case}: the axis label {:?} at {at:?} is outside \
+                                     the waveform {rect:?}",
+                                    t.galley.text()
+                                );
+                            }
+                            egui::Shape::LineSegment { points, .. } => {
+                                for p in points {
+                                    assert!(
+                                        rect.contains(p),
+                                        "{case}: a line reaches {p:?}, outside the \
+                                         waveform {rect:?}"
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// The acceptance of Overlands #1331 for the waveform: in egui's dark

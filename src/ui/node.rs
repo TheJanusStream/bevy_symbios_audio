@@ -530,7 +530,7 @@ pub fn node_kind_picker(ui: &mut egui::Ui, kind: &mut NodeKind, id: egui::Id) ->
 /// variant's parameter widgets.
 ///
 /// `id` scopes egui widget ids so multiple node editors can live in one `Ui`
-/// (e.g. an inspector list, or the Phase-2 graph canvas) without colliding.
+/// (e.g. an inspector list, or the graph canvas) without colliding.
 /// Picking a new kind from the dropdown replaces the node with that kind's
 /// `Default`, which counts as both a change and a commit.
 pub fn node_kind_editor(ui: &mut egui::Ui, kind: &mut NodeKind, id: egui::Id) -> EditorResponse {

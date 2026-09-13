@@ -8,7 +8,7 @@
 //!   track/event timeline (drag blocks to move, drag a block's right edge to
 //!   resize its gate, double-click an empty lane to add an event);
 //! - **center:** the active instrument's patch in the node-graph canvas
-//!   (click ✎ next to an instrument to open it).
+//!   (click an instrument's "✏ Edit" to open it).
 //!
 //! Run with:
 //!   cargo run --example sequence_editor --features egui

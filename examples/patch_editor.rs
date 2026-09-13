@@ -1,10 +1,14 @@
 //! `patch_editor` — interactive visual editor for an [`AudioPatch`].
 //!
-//! A pannable / zoomable node-graph canvas (Phase 2): drag node numbers to
-//! move them, drag from a node's output dot (right edge) onto another node's
-//! input dot (left edge) to wire them, edit each node's parameters in place,
-//! and use the toolbar to add / delete nodes and choose the graph output. The
-//! status line turns red if the graph stops being a valid DAG.
+//! A pannable / zoomable node-graph canvas: drag node numbers to move them,
+//! drag from a node's output dot (right edge) onto another node's input —
+//! its dot, or anywhere on its named row in the "Inputs" list — to wire
+//! them, and let go over nothing to open the Add menu there and drive what
+//! you choose. Hover a wire to see what it does, click it to pick it, and
+//! edit its amount on the wire itself. Edit each node's parameters in
+//! place, and use the toolbar to add / delete nodes and choose the graph
+//! output. A graph that cannot bake says which nodes are at fault, by name,
+//! and outlines them.
 //!
 //! Pan by dragging empty canvas; zoom with the scroll wheel.
 //!

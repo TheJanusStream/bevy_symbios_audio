@@ -7,7 +7,7 @@
 //! - **Transport** — BPM, sample rate, total duration, and the optional loop
 //!   window (start + crossfade), which is drawn as markers on the timeline.
 //! - **Instruments** — add / remove / rename; pick one as *active* to edit its
-//!   embedded patch in the Phase-2 canvas (see [`active_instrument_canvas`]).
+//!   embedded patch in the node canvas (see [`active_instrument_canvas`]).
 //!   Events name their instrument by id, so a rename carries the instrument's
 //!   events on every track, and its canvas layout, to the new id. It applies
 //!   on Enter or when the field loses focus, never per keystroke, and only
@@ -26,15 +26,29 @@
 //!   in view, with the loop markers labelled on the ruler ("loop start",
 //!   "blend", "end"), and there is a Fit to go back to that zoom (C4). An
 //!   event whose instrument id names no instrument bakes to silence; its
-//!   block is drawn hatched in the error colour and labelled `missing: <id>`.
+//!   block is drawn tinted, hatched and outlined in the error colour and
+//!   labelled `missing: <id>` — the label in a tone that reads on that
+//!   tint rather than in the error colour itself, which on its own tint
+//!   was under AA in every theme (Overlands #1342).
 //! - **Editing notes** — click a block to pick it, shift-click or drag a box
 //!   over the lanes to pick several. A drag moves everything picked and a
 //!   drag on a block's right edge resizes that one's gate; Alt makes the
 //!   drag carry copies and leave the originals. Ctrl+D duplicates, the arrows
 //!   nudge by the grid (Shift for an eighth of it), Delete removes, and
-//!   Escape lets go. The grid itself is the toolbar's [`Snap`] picker, and
+//!   Escape lets go. Ctrl+Z undoes a committed edit and Ctrl+Shift+Z or
+//!   Ctrl+Y redoes it, over the whole recipe. The grid itself is the toolbar's [`Snap`] picker, and
 //!   a new note comes from a double-click or a right-click on a lane and
 //!   takes *that lane's* instrument (C6).
+//! - **Solo and mute** — an M and an S in each lane's gutter decide what the
+//!   AUDITION plays and change nothing in the recipe: any solo at all
+//!   silences every lane that is not soloed, and solo wins over mute, the
+//!   mixer convention. The host reads the outcome through
+//!   [`SequenceEditorState::track_heard`] and auditions
+//!   [`SequenceEditorState::heard_recipe`], a copy.
+//! - **The playhead** — a host that knows where its monitor has got to
+//!   passes it to [`SequenceEditorState::set_playhead`] and the timeline
+//!   draws a line there in beats, publishing where it put it
+//!   ([`SequenceEditorState::playhead_x`]).
 //! - **Inspector** — full numeric editing of the note the last pick landed
 //!   on, plus delete. For a note with no instrument it says so and offers to
 //!   reassign every note of that id to an existing instrument.
@@ -56,7 +70,7 @@
 //! ([`crate::ui::style`]), so it follows the host's theme (#58).
 //!
 //! Like the rest of [`crate::ui`] this is pure egui returning an
-//! [`EditorResponse`]; the host drives the bake-and-play monitor (Phase 3) off
+//! [`EditorResponse`]; the host drives the audition monitor off
 //! `rebake`, baking the whole recipe with [`crate::mixdown::bake_sequence`].
 //!
 //! Editor-only view state (active instrument, per-instrument canvas layout,
@@ -111,6 +125,13 @@ const BEATS_PER_BAR: f32 = 4.0;
 const QUIET_ALPHA: f32 = 0.55;
 /// Space either side of a marker's label, and inside a note block.
 const LABEL_PAD: f32 = 4.0;
+/// How strongly a missing note's block is tinted with the error colour,
+/// and how strongly when it is selected. Named because the label that goes
+/// on top has to read against the tint these compose over a lane, which is
+/// what `ui::style`'s text test measures (Overlands #1342).
+pub(crate) const MISSING_TINT: f32 = 0.2;
+/// See [`MISSING_TINT`].
+pub(crate) const MISSING_TINT_SELECTED: f32 = 0.35;
 
 /// The sample rates the transport offers when a host has not said
 /// otherwise — CD-ish and both directions from it.
@@ -502,7 +523,11 @@ fn paint_missing_block(painter: &egui::Painter, body: Rect, selected: bool, erro
     painter.rect_filled(
         body,
         3.0,
-        error.gamma_multiply(if selected { 0.35 } else { 0.2 }),
+        error.gamma_multiply(if selected {
+            MISSING_TINT_SELECTED
+        } else {
+            MISSING_TINT
+        }),
     );
     let hatch = painter.with_clip_rect(body.intersect(painter.clip_rect()));
     let stroke = Stroke::new(1.0, error.gamma_multiply(0.45));
@@ -525,6 +550,32 @@ fn paint_missing_block(painter: &egui::Painter, body: Rect, selected: bool, erro
     );
 }
 
+/// The tone a note whose instrument is gone is labelled in.
+///
+/// Not the error colour, which is what the block around it is tinted,
+/// hatched and outlined with: `missing: <id>` written in full error ON that
+/// tint measured 3.73:1 unselected and 3.05:1 selected under egui's stock
+/// dark theme, and 2.65:1 and 2.03:1 under its light one — under AA
+/// everywhere. The state is carried by the hatch, the outline and the
+/// word, and the letter is a tone that always reads, the same move the M
+/// and S chips of a lane make (Overlands #1342).
+pub(crate) fn missing_label_colour(style: &EditorStyle) -> Color32 {
+    style.node_title
+}
+
+/// The edge an unselected note block is drawn with.
+///
+/// A block is filled with its instrument's tint, and a tint is chosen for
+/// the name on it rather than for the lane under it: under egui's stock
+/// visuals the fill alone is 2.33:1 on its lane in dark and 1.55:1 in
+/// light, under the 3:1 WCAG 1.4.11 asks of a component's boundary. The
+/// edge is what carries that boundary, in the tone the block's own label is
+/// written in — and, being a colour of its own rather than the lane's, it
+/// still keeps two notes that touch two (Overlands #1339).
+pub(crate) fn note_edge(style: &EditorStyle) -> Color32 {
+    style.note_text
+}
+
 /// A note's block: its instrument's `tint`, faded by its volume, outlined
 /// in `note_selected` when selected.
 ///
@@ -544,8 +595,7 @@ fn paint_note_block(
     let edge = if selected {
         Stroke::new(2.0, style.note_selected)
     } else {
-        // The ground's colour, so two notes that touch stay two.
-        Stroke::new(1.0, style.timeline_ground)
+        Stroke::new(1.0, note_edge(style))
     };
     painter.rect_stroke(body, 3.0, edge, StrokeKind::Inside);
 }
@@ -1405,7 +1455,7 @@ fn recipe_keys(
     res
 }
 
-/// Draw the active instrument's patch in the Phase-2 node canvas, or a hint if
+/// Draw the active instrument's patch in the node canvas, or a hint if
 /// none is selected.  Each instrument keeps its own canvas layout (keyed by
 /// id) in `state`.
 ///
@@ -2332,7 +2382,7 @@ fn timeline(
                     } else {
                         paint_note_block(&painter, body, selected, tint, event.volume, style);
                     }
-                    paint_note_label(&painter, body, event, missing, error, style);
+                    paint_note_label(&painter, body, event, missing, style);
 
                     let resp = ui.interact(body, id.with(("ev", ti, ei)), Sense::click_and_drag());
                     let resp = if missing {
@@ -2931,12 +2981,21 @@ fn lane_gutter(
         Some((name, _)) => (name.clone(), style.ground_text),
         None => ("empty".to_owned(), style.ground_text.gamma_multiply(0.6)),
     };
-    let galley = painter.layout(
-        label,
-        egui::FontId::proportional(12.0),
-        colour,
-        text.width().max(1.0),
-    );
+    // One row, elided. `layout` WRAPS what does not fit, and a lane's name
+    // is an instrument id somebody typed: a 41-character one laid out to
+    // the 64 points between the cross and the chips grew the galley to 109
+    // points inside a 34-point lane and drew itself over the three lanes
+    // around it. The whole name is on the lane's own hover, below
+    // (Overlands #1339, E3).
+    let mut job =
+        egui::text::LayoutJob::simple_singleline(label, egui::FontId::proportional(12.0), colour);
+    job.wrap = egui::text::TextWrapping {
+        max_width: text.width().max(1.0),
+        max_rows: 1,
+        break_anywhere: true,
+        overflow_character: Some('\u{2026}'),
+    };
+    let galley = painter.layout_job(job);
     painter.galley(
         Pos2::new(text.left(), text.center().y - 0.5 * galley.size().y),
         galley,
@@ -3050,10 +3109,13 @@ fn paint_note_label(
     body: Rect,
     event: &Event,
     missing: bool,
-    error: Color32,
     style: &EditorStyle,
 ) {
-    let colour = if missing { error } else { style.note_text };
+    let colour = if missing {
+        missing_label_colour(style)
+    } else {
+        style.note_text
+    };
     let font = egui::FontId::proportional(11.0);
     let draw = |galley: std::sync::Arc<egui::Galley>| {
         painter.galley(
@@ -4626,10 +4688,21 @@ mod tests {
         );
     }
 
-    /// A note with no instrument and a refused name are in the style's
+    /// A note with no instrument is BLOCKED in the style's error colour and
+    /// LABELLED in a tone that reads on it, and a refused name is in the
     /// error colour.
+    ///
+    /// Until Overlands #1342 this was
+    /// `missing_notes_and_refused_names_are_in_the_styles_error_colour` and
+    /// asserted the label was the error colour too. It was — on a block
+    /// that colour had already tinted, at 3.73:1 in egui's stock dark theme
+    /// and 2.03:1 in its light one. The block still carries the state,
+    /// through the tint, the hatch, the outline and the word "missing"; the
+    /// letter is [`missing_label_colour`], which
+    /// `style::tests::from_visuals_holds_the_editors_text_to_aa_in_dark_and_light`
+    /// holds to AA over the composite.
     #[test]
-    fn missing_notes_and_refused_names_are_in_the_styles_error_colour() {
+    fn a_missing_notes_block_is_the_error_colour_and_its_label_reads_on_it() {
         let s = distinct_style();
         let mut state = SequenceEditorState::default();
         state.set_selected_event(Some((0, 0)));
@@ -4637,7 +4710,11 @@ mod tests {
         assert!(colours(&driver.out).contains(&s.error), "the ghost note");
         let (_, missing) = crate::ui::test_paint::text_painted(&driver.out, "missing: ghost")
             .expect("the ghost note's label");
-        assert_eq!(missing, s.error);
+        assert_eq!(missing, missing_label_colour(&s));
+        assert_ne!(
+            missing, s.error,
+            "the label is the colour the block under it is tinted with"
+        );
 
         driver.focus("wind");
         driver.frame(backspaces(4));
@@ -4965,6 +5042,124 @@ mod tests {
             "three instruments' notes were painted {} colour(s): {fills:?}",
             fills.len()
         );
+    }
+
+    /// E3 (Overlands #1339): a lane's gutter keeps what it draws.
+    ///
+    /// The gutter holds the remove cross, the lane's name and the M and S
+    /// chips, and the lanes beside it hold the notes. Nothing measured
+    /// that they stay on their own side: the name is laid out to the room
+    /// between the cross and the chips and WRAPS when it does not fit, so
+    /// a long instrument id grows downward into the lane under it, and the
+    /// chips are placed from the gutter's right edge with no bar that says
+    /// they may not cross it.
+    ///
+    /// One lane at a time, because a name that wraps stays inside the
+    /// gutter column and lands on the next lane's row.
+    #[test]
+    fn a_lanes_gutter_keeps_its_name_and_chips_off_the_lane() {
+        let long = "a-pad-with-a-very-long-name-somebody-typed";
+        for (what, recipe) in [
+            ("short names", two_instrument_recipe()),
+            ("a long name", {
+                let mut recipe = recipe_with(&[long], 2);
+                recipe.tracks[0].events = vec![note(long, 0.0), note(long, 2.0)];
+                recipe.tracks[1].events = vec![note(long, 1.0)];
+                recipe
+            }),
+        ] {
+            let driver = Driver::new(recipe);
+            let timeline = driver.state.timeline_rect();
+            let lanes = driver.recipe.tracks.len();
+            let cells: Vec<Rect> = (0..lanes)
+                .map(|i| {
+                    let top = timeline.top() + RULER_H + i as f32 * LANE_H;
+                    Rect::from_x_y_ranges(
+                        timeline.left()..=timeline.left() + GUTTER,
+                        top..=top + LANE_H,
+                    )
+                })
+                .collect();
+            let mut found = 0;
+            for shape in shapes(&driver.out) {
+                let egui::Shape::Text(t) = shape else {
+                    continue;
+                };
+                let at = t.visual_bounding_rect();
+                let Some(cell) = cells.iter().find(|c| c.intersects(at)) else {
+                    continue;
+                };
+                found += 1;
+                assert!(
+                    cell.expand(0.5).contains_rect(at),
+                    "{what}: {:?} at {at:?} leaves its gutter cell {cell:?}",
+                    t.galley.text()
+                );
+            }
+            // The cross, a name and the two chips, on every lane.
+            assert!(
+                found >= 4 * lanes,
+                "{what}: only {found} thing(s) drawn in {lanes} gutter(s)"
+            );
+        }
+    }
+
+    /// E3 (Overlands #1339): what a block says stays on the block.
+    ///
+    /// The report's figures show a lane of labelled notes, and nothing held
+    /// them there: `a_note_says_its_pitch_when_its_block_has_room_and_nothing_when_it_does_not`
+    /// decides WHICH of a note's labels is drawn, and
+    /// `a_notes_name_reads_on_its_block_in_dark_and_light` decides what
+    /// colour it is drawn in, but neither asks where it landed. A label
+    /// wider than its block would have passed both while writing across
+    /// the four notes after it — which is the defect #62 fixed, with no
+    /// test on the geometry it fixed.
+    ///
+    /// Read off [`SequenceEditorState::notes`], the timeline's own
+    /// published geometry, rather than derived here a second time.
+    ///
+    /// A note whose instrument is GONE is the deliberate exception and is
+    /// excluded: its label is drawn at any width, because the id nothing
+    /// answers to is the only place that id appears on the timeline. That
+    /// choice is #62's, and what it costs at a narrow block is filed
+    /// separately — see [`paint_note_label`].
+    #[test]
+    fn every_note_label_lies_inside_its_block() {
+        for (what, recipe, state) in [
+            ("wide", wide_recipe(), SequenceEditorState::default()),
+            ("two lanes", two_lane_recipe().0, two_lane_recipe().1),
+            (
+                "zoomed right in",
+                wide_recipe(),
+                view(MAX_PPB, Snap::default()),
+            ),
+            (
+                "zoomed right out",
+                wide_recipe(),
+                view(MIN_PPB, Snap::default()),
+            ),
+        ] {
+            let driver = Driver::with_state(recipe, state);
+            let bodies: Vec<Rect> = driver.state.notes().iter().map(|n| n.body).collect();
+            assert!(!bodies.is_empty(), "{what}: no notes were drawn");
+            let mut labels = 0;
+            for shape in shapes(&driver.out) {
+                let egui::Shape::Text(t) = shape else {
+                    continue;
+                };
+                let at = t.visual_bounding_rect();
+                let Some(body) = bodies.iter().find(|b| b.intersects(at)) else {
+                    continue;
+                };
+                labels += 1;
+                assert!(
+                    body.expand(0.5).contains_rect(at),
+                    "{what}: {:?} at {at:?} runs outside its block {body:?}",
+                    t.galley.text()
+                );
+            }
+            assert!(labels > 0, "{what}: no label was drawn on any block");
+        }
     }
 
     /// C3: a note off the native pitch says so on its block, and a block

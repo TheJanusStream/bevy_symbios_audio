@@ -1,6 +1,6 @@
 //! Patch cache: content-addressed store for baked WAV bytes.
 //!
-//! Phase 3 ticket #11.  A baked 3-minute mixdown is a few hundred
+//! A baked 3-minute mixdown is a few hundred
 //! kilobytes of `f32` samples (plus WAV header) that took non-trivial
 //! CPU to produce — re-baking on every room re-entry would melt the
 //! battery.  This module mirrors `bevy_symbios_texture::cache`: a small

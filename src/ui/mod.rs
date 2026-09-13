@@ -17,7 +17,7 @@
 //!   ([`graph::audio_patch_canvas`]) that edits a whole
 //!   [`crate::patch::AudioPatch`]: drag nodes, wire ports, set the output.
 //! - [`preview`] — a pure-egui [`preview::waveform`] widget plus a Bevy
-//!   bake-and-play monitor ([`preview::AudioEditorPlugin`]) for auditioning
+//!   audition monitor ([`preview::AudioEditorPlugin`]) for auditioning
 //!   edits.
 //! - [`audition`] — [`audition::audition_strip`], the row a host puts above
 //!   an editor to hear it: Audition, Stop, an Auto re-bake, a status chip, a
@@ -39,15 +39,28 @@
 //!   paints with. A host sets its own with [`set_editor_style`] when its
 //!   theme changes; with none set, the widgets derive one from the `Visuals`
 //!   they are drawn with ([`EditorStyle::from_visuals`]).
+//! - **History** — undo and redo *inside* an editor. Not a module a host
+//!   names: the ring is owned by [`PatchEditorState`] and
+//!   [`SequenceEditorState`], a step is one *committed* edit (the `rebake`
+//!   flag below, so a whole slider drag is one entry), and the canvas and
+//!   the timeline walk it themselves on Ctrl+Z, Ctrl+Shift+Z and Ctrl+Y
+//!   while they hold the keyboard. A host that re-seeds the value under an
+//!   open editor calls `forget_history` on the state, which drops the ring
+//!   and keeps the layout.
 //!
 //! Every editor composes the same [`EditorResponse`] contract.
 //!
 //! Buttons say what they do in words ("Add node", "Fit view", "Delete
-//! note"). The glyphs that stay are the remove cross `✖` and the valid
-//! check `✔`, the code points Overlands' affordances use for the same acts,
-//! the audition's `▶` and `⏹`, which Overlands draws on its own Play and
-//! Stop, and the pencil of an instrument's `✏ Edit` toggle, which Overlands
-//! puts on its own Edit audio button.
+//! note"). The glyphs that stay on a CONTROL are the ones Overlands draws
+//! for the same act: the remove cross `✖` and the valid check `✔`, the
+//! audition's `▶` and `⏹`, which Overlands puts on its own Play and
+//! Stop, and the pencil of an instrument's `✏ Edit` toggle, which it puts
+//! on its own Edit audio button. Typography and units are not affordances
+//! and are not on that list — `×` for a pitch multiplier, `±` for a
+//! sweep, `·` and `➡` in a tooltip. A host that installs its own fonts
+//! needs every one of them: `print_editor_glyph_inventory` (an ignored
+//! test here) reports the roster the editors actually draw, read out of the
+//! string literals rather than guessed.
 //!
 //! The two canvases, [`graph::audio_patch_canvas`] and
 //! [`sequence::active_instrument_canvas`], claim all the space left in the
@@ -512,8 +525,10 @@ mod glyph_guard {
     }
 
     /// The guard can tell a drawn glyph from tofu, and it sees through an
-    /// escape: the shipped pencil, `\u{270E}`, is reported missing while its
-    /// emoji-presentation sibling U+270F draws.
+    /// escape: the plain pencil `\u{270E}` is reported missing, while its
+    /// emoji-presentation sibling U+270F — the one the editors actually
+    /// draw — is found. Shipping the first of those is the mistake the
+    /// guard exists to catch, which is what this test is named for.
     #[test]
     fn the_glyph_guard_sees_the_shipped_tofu() {
         let defs = egui::FontDefinitions::default();

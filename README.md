@@ -202,23 +202,54 @@ embed:
   "Inputs" list; a wire can be dropped on the dot or anywhere on the row,
   and while it is dragged the port it would connect to is highlighted and
   named. A graph that cannot bake says why by name ("#2 Lowpass and #3
-  Gain feed each other in a loop") and outlines the nodes at fault,
+  Gain feed each other in a loop") and outlines the nodes at fault. A wire
+  can be hovered, picked, re-routed by its end and deleted, and picking one
+  opens a panel on its curve with what it drives, its amount and a cross;
+  a port's row says what driving it does, and a wire that sweeps one states
+  the range it really produces ("about 150 ± 250 Hz"). Add node is a menu
+  grouped by role, also on a right-click on clear canvas. A node the output
+  cannot be reached from is dimmed and wears a "not heard" badge, and a
+  node's own menu offers "Hear this node", which auditions a copy
+  (`patch_hearing`) and never edits the patch. Ctrl+Z undoes a committed
+  edit, Ctrl+Shift+Z and Ctrl+Y redo, and `forget_history` drops the ring
+  when a host re-seeds the value under an open editor,
 - a DAW-style sequence-recipe timeline (`sequence_recipe_editor`) with
   transport, instruments, and draggable track / event lanes. Renaming an
   instrument takes its notes and its canvas layout with it, applied on
   Enter and only for a name that is unique, not empty, and within
-  symbios-audio's `Envelope` byte limit. A note whose instrument is gone
-  is drawn in the theme's error colour, labelled `missing: <id>`, and the
-  inspector offers to reassign every note of that id,
-- a pure-egui `waveform` widget plus a Bevy bake-and-play monitor
+  symbios-audio's `Envelope` byte limit. A note is painted in its
+  instrument's own colour and says its pitch when the block has room;
+  Fit goes back to the zoom that shows the whole sequence; a double- or
+  right-click on a lane adds a note of that lane's instrument and Ctrl+D
+  duplicates what is picked. Each lane's gutter carries an M and an S that
+  decide what the AUDITION hears (solo wins over mute, and the recipe is
+  not touched). A note whose instrument is gone is tinted, hatched and
+  outlined in the theme's error colour, labelled `missing: <id>` in a tone
+  that reads on that tint, and the inspector offers to reassign every note
+  of that id,
+- a pure-egui `waveform` widget plus a Bevy audition monitor
   (`AudioEditorPlugin`) for auditioning edits. A replaced or stopped patch
-  bake is cancelled, not left to run,
+  bake is cancelled, not left to run. The monitor publishes where its voice
+  has got to (`position_secs`, wrapped into the loop, with `loop_secs`), and
+  `waveform_with_cursor` draws that as a playhead with a seconds axis;
+  `SequenceEditorState::set_playhead` puts the same position on the
+  timeline in beats. What does not need a bake — the monitor's own level,
+  mute — is a `MonitorControl` rather than a `MonitorRequest`,
 - the audition strip (`audition_strip`), the row a host puts above an
   editor to hear it: Audition, Stop, an Auto toggle that re-bakes a playing
   audition shortly after each committed edit, a status chip (Idle, Baking
   with the seconds so far, Playing, Muted, Error), a caption saying what is
-  played ("1.0 s at 22.05 kHz, looped"), and the waveform. It returns the
-  `MonitorRequest` to write rather than writing it,
+  played ("1.0 s at 22.05 kHz, looped"), a Level for the monitor's own
+  output, and the waveform with the playhead on it. It returns the
+  `MonitorRequest` to write rather than writing it, and its
+  `MonitorControl`s through `AuditionState::take_controls`,
+- `EditorLimits`, the caps every Add is held to. They default to
+  symbios-audio's own `Envelope`, the bound the record sanitiser enforces
+  anyway, so an editor nobody configured refuses exactly what would
+  otherwise have been deleted after the edit: the control is disabled *with
+  the reason* and a `N / cap` readout counts against it, and a removal that
+  loses work asks first. `set_sample_rates` says which rates the transport
+  offers,
 - `symbios_genetics`-backed Mutate / Reroll seed helpers (`mutate_patch`,
   `randomize_seed`) and a reusable JSON copy/paste section (`json_io`),
 - `EditorStyle`, the colour roles the editors paint with: canvas ground,
@@ -250,11 +281,27 @@ after a canvas is never seen, and the window grows every frame until it
 reaches the screen edge. `host_window` shows both editors inside windows,
 laid out the way that works. It doubles as a screenshot harness:
 `--shot <path>` saves a picture and quits, and `--light` switches theme.
-`--status <idle|baking|playing|muted|error>` puts the audition strips in
-that state through real requests, `--broken` opens the patch with a loop
-in its graph, `--orphan` opens the sequence with notes that name no
-instrument, `--rename <name>` types a new name over the open instrument's
-and presses Enter, and `--drag` holds a wire over a port's row mid-drag.
+`--status <idle|baking|playing|playing-sequence|muted|error>` puts the
+audition strips in that state through real requests. The rest drive the
+editors the way a user would, each for a picture of one thing:
+
+| flag | what it sets up |
+| --- | --- |
+| `--broken` | the patch opens with a loop in its graph |
+| `--orphan` | the sequence opens with notes that name no instrument |
+| `--rename <name>` | types a name over the open instrument's and presses Enter |
+| `--drag` | holds a wire over a port's row, mid-drag |
+| `--wire` / `--pick` | parks the pointer on a wire, or clicks it |
+| `--menu <add\|node>` | holds the Add menu, or a node's own menu, open |
+| `--unheard` | points the output at one node, so the rest are not heard |
+| `--notes <picked\|box\|snap\|track>` | drives the timeline's notes |
+| `--limits` / `--confirm` / `--beyond` | a cap reached, a removal asked about, a value outside its own slider |
+| `--hover <label>` | parks the pointer on one widget, for its tooltip |
+| `--notice <text>` / `--notice-live <text>` | the host's own line above the editors |
+
+There is no flag that pins the cursor to a chosen second: a seek on a
+looping sink is refused by the backend (see Limitations), so
+`--status playing-sequence` waits for the voice to be past 0.2 s instead.
 
 ```sh
 cargo run --example host_window --features egui -- --shot host_window.png
@@ -312,6 +359,13 @@ produces.
   artifacts.  Because retuning happens at synthesis, no PSOLA / phase
   vocoder is needed — but it only re-pitches *oscillators* (not sampled
   or noise-based material), and LFO/filter settings stay fixed.
+- **A looping audition cannot be seeked.** `PlaybackMode::Loop` appends
+  rodio's `repeat_infinite()`, which wraps the source in a `Buffered` whose
+  `try_seek` is an unconditional `NotSupported`, so `MonitorControl::Seek`
+  is refused and moves nothing — including the cursor. Nothing in the
+  editors offers a click-to-seek for that reason. A custom `Source` that
+  plays a run-up once and then loops a window, forwarding `try_seek`, is
+  what would recover it.
 - **Buffer ≤ ~6 hours.**  `data_size` in the WAV header is a 32-bit
   field, capping ~1.07 G samples (≈ 6.7 h @ 44.1 kHz).  `samples_to_wav_bytes`
   now panics rather than emitting a silently-wrapped (corrupt) header, so

@@ -67,6 +67,21 @@
 //!   menu opens on a right-click on clear canvas and puts the node there.
 //!   Delete acts on whatever is picked, a node or a wire, and says which.
 //!
+//! - **The keyboard, while the canvas holds it:** Ctrl+Z undoes a committed
+//!   edit and Ctrl+Shift+Z or Ctrl+Y redoes it (the ring lives in
+//!   [`PatchEditorState`]; `forget_history` drops it when a host re-seeds
+//!   the patch), Delete removes what is picked, and Escape gives up the
+//!   selection before the host's own Escape sees it.
+//! - **Hear one node:** a node's own context menu offers it, and the canvas
+//!   reports the ask through [`PatchEditorState::take_hear_node`]. The host
+//!   auditions [`patch_hearing`], a COPY whose output is that node —
+//!   listening, never an edit, so it reaches neither the record nor the
+//!   undo ring.
+//! - **What a modulation actually does:** a port's row says what driving it
+//!   does in words, and a wire that sweeps one says the range it really
+//!   produces ("about 150 ± 250 Hz") rather than the amount on its own,
+//!   which is a number in whatever unit the port happens to take.
+//!
 //! Structural edits are collected as deferred `Action`s while the node loop
 //! holds `&mut patch.graph.nodes`, then applied once the loop's borrow ends —
 //! the standard way to keep an immediate-mode graph editor borrow-clean.
@@ -3691,6 +3706,8 @@ mod tests {
         time: f64,
         /// The screen the canvas is drawn on.
         screen: Vec2,
+        /// The rect the panel gave the canvas on the last frame.
+        given: Rect,
     }
 
     impl Canvas {
@@ -3743,6 +3760,7 @@ mod tests {
                 out: egui::FullOutput::default(),
                 time: 0.0,
                 screen: Vec2::new(1600.0, 1200.0),
+                given: Rect::NOTHING,
             };
             for _ in 0..frames {
                 canvas.frame(Vec::new());
@@ -3759,6 +3777,7 @@ mod tests {
                 out,
                 time,
                 screen,
+                given,
             } = self;
             let mut res = EditorResponse::NONE;
             let input = egui::RawInput {
@@ -3770,6 +3789,7 @@ mod tests {
             };
             *out = ctx.run_ui(input, |root| {
                 egui::CentralPanel::default().show(root, |ui| {
+                    *given = ui.max_rect();
                     res = audio_patch_canvas(ui, patch, state, Id::new("geometry"));
                 });
             });
@@ -5525,6 +5545,45 @@ mod tests {
                 text.contains(part),
                 "the wire's tooltip {text:?} omits {part:?}"
             );
+        }
+    }
+
+    /// E3 (Overlands #1339): a picked wire's panel stays on the canvas.
+    ///
+    /// The panel is an `Area` in screen space, drawn from the middle of the
+    /// wire's curve with `constrain(true)` — which keeps it on the SCREEN,
+    /// not on the canvas. A wire picked near the right edge of a canvas
+    /// narrower than its screen is the case that tells the two apart, and
+    /// the canvas is routinely narrower: in the sequence editor it is a
+    /// central panel beside the recipe's own, and in Overlands' pop-out it
+    /// shares the window with the audition strip.
+    #[test]
+    fn the_picked_wires_panel_stays_on_the_canvas() {
+        for width in [1600.0_f32, 700.0, 520.0] {
+            let mut canvas = Canvas::narrow(three_node_patch(), width);
+            let at = over_the_wire(&mut canvas, "cutoff_hz");
+            click_at(&mut canvas, at);
+            assert!(
+                canvas.state.wire_is_selected(),
+                "{width}: no wire is picked"
+            );
+            let given = canvas.given.expand(0.5);
+            let mut found = 0;
+            for (text, rect) in canvas.painted_text_rects() {
+                let mine = text == "#1 LFO \u{27A1} cutoff_hz"
+                    || text.trim() == "amt"
+                    || text == "\u{2716}";
+                if !mine {
+                    continue;
+                }
+                found += 1;
+                assert!(
+                    given.contains_rect(rect),
+                    "{width}: the picked wire's {text:?} at {rect:?} is off the \
+                     canvas {given:?}"
+                );
+            }
+            assert!(found >= 3, "{width}: only {found} of the panel was drawn");
         }
     }
 

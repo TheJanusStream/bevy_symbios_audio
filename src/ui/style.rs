@@ -25,6 +25,17 @@
 //! `Visuals` change: set it again, or call [`clear_editor_style`] to go back
 //! to following the `Visuals`.
 //!
+//! # What the defaults are held to
+//!
+//! Against egui's own dark and light `Visuals`, [`EditorStyle::from_visuals`]
+//! holds every piece of text it paints to WCAG AA and every mark that is not
+//! text to `NON_TEXT_FLOOR` — the two tests at the bottom of this module
+//! carry the roster and the measurements. That is why two roles are derived
+//! rather than taken from the `Visuals` as they stand: see `edge_for` and
+//! `accent_for`, each of which records the numbers that made it necessary.
+//! A host that sets its own roles owns that bar for them; Overlands holds
+//! its three palettes to the same one.
+//!
 //! [`EditorStyle`] is `#[non_exhaustive]`: new roles may be added in a
 //! compatible release, each with a `from_visuals` default, so a host builds
 //! one from `from_visuals` and never with a struct literal.
@@ -48,6 +59,18 @@ const LANE_STRIPE: f32 = 0.06;
 const CROSSFADE_ALPHA: f32 = 0.12;
 /// Opacity of a note's release tail, a faint copy of its fill.
 const TAIL_ALPHA: f32 = 0.35;
+/// The contrast WCAG 1.4.11 asks of a mark that is not text: the boundary
+/// of a component has to be found at a glance. Text is held to the higher
+/// AA bar instead.
+pub(crate) const NON_TEXT_FLOOR: f32 = 3.0;
+/// Where `edge_for` starts looking, as a lean from the ground toward the
+/// text colour, and how far it moves per try.
+const EDGE_LEAN: f32 = 0.5;
+/// See [`EDGE_LEAN`].
+const EDGE_STEP: f32 = 0.05;
+/// What `edge_for` aims for: a little over `NON_TEXT_FLOOR`, so the
+/// edge that ships is over the bar rather than exactly on it.
+const EDGE_TARGET: f32 = 3.3;
 
 /// The editors' colour roles. See the [module docs](self).
 ///
@@ -143,21 +166,28 @@ impl EditorStyle {
     /// - Text is the theme's: a node title in `strong_text_color`, text on
     ///   a ground in `text_color`, a note's name in the selection's text
     ///   colour on the selection fill.
-    /// - Edges and the grid are the separator colour. The selected node,
-    ///   the dragged wire and the loop start are `hyperlink_color`, the
-    ///   theme's interactive accent; the output node and the sequence end
-    ///   are `strong_text_color`. The canvas grid is its ground leaned a
-    ///   tenth of the way toward the text.
+    /// - A node's edge and the canvas border bound a component, so they
+    ///   are `edge_for`: the ground leaned toward the text until they
+    ///   clear the 3:1 WCAG 1.4.11 asks. The timeline's grid and the
+    ///   waveform's zero line stay at the theme's separator colour — a
+    ///   grid is a ground, not a boundary — and the canvas grid is its
+    ///   ground leaned a tenth of the way toward the text.
+    /// - The selected node, the dragged wire and the loop start are
+    ///   `accent_for`: `hyperlink_color`, the theme's interactive
+    ///   accent, or the selection's text colour where the link colour
+    ///   cannot be found on the grounds it is drawn on. The output node
+    ///   and the sequence end are `strong_text_color`.
     /// - `warn` and `error` are the theme's. `Visuals` has no success
     ///   colour, so `ok` (and the waveform trace) is a green chosen for the
     ///   window: a pale one on a dark window, a deep one on a light window.
     pub fn from_visuals(visuals: &egui::Visuals) -> Self {
         let text = visuals.text_color();
         let strong = visuals.strong_text_color();
-        let edge = visuals.widgets.noninteractive.bg_stroke.color;
-        let accent = visuals.hyperlink_color;
         let ground = visuals.extreme_bg_color;
         let surface = visuals.window_fill;
+        let separator = visuals.widgets.noninteractive.bg_stroke.color;
+        let edge = edge_for(ground, text);
+        let accent = accent_for(visuals, ground, surface);
         let ok = ok_for(surface);
         Self {
             canvas_ground: ground,
@@ -175,7 +205,7 @@ impl EditorStyle {
             warn: visuals.warn_fg_color,
             error: visuals.error_fg_color,
             timeline_ground: ground,
-            timeline_grid: edge,
+            timeline_grid: separator,
             ground_text: text,
             lane: surface,
             lane_alt: surface.lerp_to_gamma(text, LANE_STRIPE),
@@ -187,10 +217,55 @@ impl EditorStyle {
             note_text: visuals.selection.stroke.color,
             release_tail: visuals.selection.bg_fill.gamma_multiply(TAIL_ALPHA),
             waveform_ground: ground,
-            waveform_zero: edge,
+            waveform_zero: separator,
             waveform_trace: ok,
             playhead: accent.lerp_to_gamma(strong, 0.5),
         }
+    }
+}
+
+/// The colour a boundary is drawn in on `ground`: the ground leaned toward
+/// `text` far enough that the boundary is found at a glance.
+///
+/// The separator colour a `Visuals` offers is meant to divide two halves of
+/// a window rather than to bound a component, and it measures 1.79:1 on the
+/// canvas under egui's stock dark theme and 1.86:1 under its light one —
+/// both under `NON_TEXT_FLOOR`. Leaning from the ground toward the text
+/// keeps the theme's own hue, and stopping at [`EDGE_TARGET`] lands short of
+/// the text itself, so a box's edge stays quieter than the wires drawn over
+/// it: 3.40:1 dark and 3.32:1 light, against a wire's 5.89 and 8.06
+/// (Overlands #1339).
+fn edge_for(ground: Color32, text: Color32) -> Color32 {
+    for step in 0..=10_u8 {
+        let lean = EDGE_LEAN + f32::from(step) * EDGE_STEP;
+        let edge = ground.lerp_to_gamma(text, lean);
+        if contrast_ratio(edge, ground) >= EDGE_TARGET {
+            return edge;
+        }
+    }
+    text
+}
+
+/// The accent the selected node, the dragged wire and the loop start are
+/// drawn in: the theme's link colour where it can be found on both the
+/// canvas and a lane, and the selection's text colour where it cannot.
+///
+/// egui's stock light blue is 2.94:1 on the canvas and 2.77:1 on a lane,
+/// under `NON_TEXT_FLOOR`; its dark one is 8.13:1 and clears it, so a dark
+/// theme keeps the accent it chose. A `Visuals` whose selection text is no
+/// better than its link colour keeps the link colour: the roles are there
+/// to be overwritten by a host that wants a third answer (Overlands #1339).
+fn accent_for(visuals: &egui::Visuals, ground: Color32, surface: Color32) -> Color32 {
+    let worst = |c: Color32| contrast_ratio(c, ground).min(contrast_ratio(c, surface));
+    let accent = visuals.hyperlink_color;
+    if worst(accent) >= NON_TEXT_FLOOR {
+        return accent;
+    }
+    let stand_in = visuals.selection.stroke.color;
+    if worst(stand_in) > worst(accent) {
+        stand_in
+    } else {
+        accent
     }
 }
 
@@ -255,6 +330,7 @@ pub(crate) fn contrast_ratio(a: Color32, b: Color32) -> f32 {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::ui::sequence;
     use crate::ui::test_paint::contrast_on;
 
     /// WCAG AA for normal text.
@@ -320,13 +396,14 @@ pub(crate) mod tests {
     /// wires over them — and not the 3:1 WCAG asks of a non-text mark.
     ///
     /// Against egui's stock visuals that ordering is: grid 1.10:1 dark and
-    /// 1.16:1 light on the ground, border 1.79:1 and 1.86:1 over it, a
-    /// wire 5.33:1 and 6.95:1 over the grid. The border is the same
-    /// separator colour as a node's edge and inherits the same shortfall
-    /// against 3:1, which Overlands #1339 records for the crate's defaults
-    /// as a whole. A host that maps the style holds it to 3:1 —
-    /// Overlands' own mapping does — so the value is left consistent with
-    /// every other edge the crate draws rather than singled out here.
+    /// 1.16:1 light on the ground, border 3.40:1 and 3.32:1 over it, a
+    /// wire 5.33:1 and 6.95:1 over the grid. The border is the same colour
+    /// as a node's edge, and since Overlands #1339 that is `edge_for`
+    /// rather than the theme's separator — a boundary has to clear
+    /// `NON_TEXT_FLOOR`, which the separator missed at 1.79 and 1.86.
+    /// The grid did not follow it up: a grid as strong as the content is a
+    /// grid that gets in the way, so it stays where it was, and the top of
+    /// the ordering is held here as well as the bottom.
     #[test]
     fn the_canvas_border_and_grid_are_visible_on_the_ground_in_dark_and_light() {
         for (theme, visuals) in both_themes() {
@@ -350,7 +427,69 @@ pub(crate) mod tests {
                 contrast_on(s.wire, s.canvas_grid) > grid,
                 "{theme}: a wire does not stand out from the grid it crosses"
             );
+            let wire = contrast_on(s.wire, s.canvas_ground);
+            assert!(
+                edge < wire,
+                "{theme}: the border ({edge:.2}:1) is no quieter than the wires \
+                 over it ({wire:.2}:1); it is a boundary, not content"
+            );
         }
+    }
+
+    /// Every mark the editors draw that is not text is found at a glance
+    /// in egui's own dark and light themes: WCAG 1.4.11's 3:1 for the
+    /// boundary of a component (Overlands #1339, E3).
+    ///
+    /// The roster is Overlands'
+    /// `the_audio_editors_lines_and_edges_clear_the_non_text_floor_in_every_palette`,
+    /// which holds the same marks against that host's three palettes, plus
+    /// the canvas border. Two marks are measured through the function that
+    /// paints them rather than a role, because no single role is what
+    /// reaches the screen: a note block is filled with its instrument's
+    /// tint, derived from `note_fill`, so [`sequence::note_edge`] is what
+    /// bounds it against the lane.
+    ///
+    /// The grids are deliberately NOT here — `canvas_grid` and
+    /// `timeline_grid` are grounds, not marks, and
+    /// [`Self::the_canvas_border_and_grid_are_visible_on_the_ground_in_dark_and_light`]
+    /// holds them to an ordering instead.
+    #[test]
+    fn from_visuals_holds_the_editors_marks_to_the_non_text_floor_in_dark_and_light() {
+        let mut short = Vec::new();
+        for (theme, visuals) in both_themes() {
+            let s = EditorStyle::from_visuals(&visuals);
+            let marks = [
+                ("node edge on the canvas", s.node_stroke, s.canvas_ground),
+                (
+                    "canvas border on its ground",
+                    s.canvas_edge,
+                    s.canvas_ground,
+                ),
+                ("selected node's edge", s.node_selected, s.canvas_ground),
+                ("output node's edge", s.node_output, s.canvas_ground),
+                ("wire", s.wire, s.canvas_ground),
+                ("dragged wire", s.wire_active, s.canvas_ground),
+                ("port on its box", s.port, s.node_fill),
+                ("loop start marker", s.loop_start, s.lane),
+                ("sequence end marker", s.loop_end, s.lane),
+                ("a note's edge on its lane", sequence::note_edge(&s), s.lane),
+                ("selected note's outline", s.note_selected, s.note_fill),
+            ];
+            for (what, fg, bg) in marks {
+                let ratio = contrast_on(fg, bg);
+                if ratio < NON_TEXT_FLOOR {
+                    short.push(format!(
+                        "{theme}: {what} is {ratio:.2}:1 ({fg:?} on {bg:?})"
+                    ));
+                }
+            }
+        }
+        assert!(
+            short.is_empty(),
+            "{} mark(s) under {NON_TEXT_FLOOR}:1:\n  {}",
+            short.len(),
+            short.join("\n  ")
+        );
     }
 
     /// The acceptance of Overlands #1331: in egui's own dark and light
@@ -385,6 +524,25 @@ pub(crate) mod tests {
                     ratio >= AA,
                     "{theme}: {what} is {ratio:.2}:1 ({fg:?} on {bg:?})"
                 );
+            }
+            // Overlands #1342: a note whose instrument is gone is labelled
+            // on a block the error colour tints, so the pair that has to
+            // read is the label over that composite — in both selection
+            // states, and on both of the lane stripes it composites over.
+            for (which, lane) in [("lane", s.lane), ("odd lane", s.lane_alt)] {
+                for (state, strength) in [
+                    ("unselected", sequence::MISSING_TINT),
+                    ("selected", sequence::MISSING_TINT_SELECTED),
+                ] {
+                    let tint = lane.blend(s.error.gamma_multiply(strength));
+                    let fg = sequence::missing_label_colour(&s);
+                    let ratio = contrast_on(fg, tint);
+                    assert!(
+                        ratio >= AA,
+                        "{theme}: a {state} missing note's label on the {which} \
+                         is {ratio:.2}:1 ({fg:?} on {tint:?})"
+                    );
+                }
             }
         }
     }
