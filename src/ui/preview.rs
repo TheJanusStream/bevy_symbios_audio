@@ -67,8 +67,10 @@ use bevy_egui::egui;
 use web_time::Instant;
 
 use crate::bake::try_bake_cancellable;
-use crate::looping::{LoopPlayhead, LoopedSamples, sequence_loop_start};
-use crate::{AudioPatch, SequenceRecipe, bake_sequence};
+use crate::looping::{
+    LoopPlayhead, LoopedSamples, patch_loop_bake_secs, sequence_loop_start, settle_patch_loop,
+};
+use crate::{AudioPatch, ClampToEnvelope, Envelope, SequenceRecipe, bake_sequence};
 
 // ---------------------------------------------------------------------------
 // Waveform widget (pure egui)
@@ -311,14 +313,23 @@ struct Baked {
 /// new bake lands, so a re-bake after an edit does not cut the sound out.
 #[derive(Message, Clone)]
 pub enum MonitorRequest {
-    /// Bake `patch` for `duration_secs` at `sample_rate`, then loop it.
+    /// Bake `patch` for `duration_secs` at `sample_rate`, then loop it -
+    /// warmed up for `warmup_secs` and its seam faded over
+    /// `loop_fade_secs` first, as [`settle_patch_loop`] settles a loop.
+    /// Both `0.0` loop the cold bake whole, as every audition did before.
     PlayPatch {
         /// The patch to bake.
         patch: AudioPatch,
         /// Samples per second of the bake.
         sample_rate: u32,
-        /// Length of the bake, and so of the loop, in seconds.
+        /// Length of the loop, in seconds.
         duration_secs: f32,
+        /// Seconds baked before the loop and thrown away, so that every
+        /// filter has settled by the loop's first sample.
+        warmup_secs: f32,
+        /// Seconds of the loop's own continuation faded back into its head,
+        /// so that the seam does not tick. At most half the loop.
+        loop_fade_secs: f32,
     },
     /// Bake `recipe` (at its own sample rate) and loop it from its loop
     /// start, where [`sequence_loop_start`] says the bake's loop begins.
@@ -577,11 +588,15 @@ pub(crate) fn fingerprint(request: &MonitorRequest) -> Option<u64> {
             patch,
             sample_rate,
             duration_secs,
+            warmup_secs,
+            loop_fade_secs,
         } => {
             0u8.hash(&mut hasher);
             serde_json::to_vec(patch).ok()?.hash(&mut hasher);
             sample_rate.hash(&mut hasher);
             duration_secs.to_bits().hash(&mut hasher);
+            warmup_secs.to_bits().hash(&mut hasher);
+            loop_fade_secs.to_bits().hash(&mut hasher);
         }
         MonitorRequest::PlaySequence { recipe } => {
             1u8.hash(&mut hasher);
@@ -662,16 +677,26 @@ fn handle_monitor_requests(
                 patch,
                 sample_rate,
                 duration_secs,
+                warmup_secs,
+                loop_fade_secs,
             } => {
                 monitor.cancel_bake();
                 let cancel = Arc::new(AtomicBool::new(false));
                 let flag = Arc::clone(&cancel);
-                let patch = patch.clone();
+                // Clamped to the envelope before the bake, as a host's
+                // world baker clamps whatever reaches it and a record is
+                // clamped on load: an editor's working copy has been through
+                // neither, and a value edited past the envelope would
+                // otherwise play here as no world ever will.
+                let mut patch = patch.clone();
+                patch.clamp_to_envelope(&Envelope::default());
                 let (sr, dur) = (*sample_rate, *duration_secs);
+                let (warm, fade) = (*warmup_secs, *loop_fade_secs);
                 let task = AsyncComputeTaskPool::get().spawn(async move {
-                    try_bake_cancellable(&patch, sr, dur, &flag)
+                    let secs = patch_loop_bake_secs(dur, warm, fade);
+                    try_bake_cancellable(&patch, sr, secs, &flag)
                         .map(|samples| Baked {
-                            samples,
+                            samples: settle_patch_loop(samples, sr, dur, warm, fade),
                             sample_rate: sr,
                             loop_start: Duration::ZERO,
                         })
@@ -682,7 +707,9 @@ fn handle_monitor_requests(
             }
             MonitorRequest::PlaySequence { recipe } => {
                 monitor.cancel_bake();
-                let recipe = recipe.clone();
+                // Clamped for the same reason as a patch.
+                let mut recipe = recipe.clone();
+                recipe.clamp_to_envelope(&Envelope::default());
                 let task = AsyncComputeTaskPool::get().spawn(async move {
                     Ok(Baked {
                         samples: bake_sequence(&recipe),
@@ -882,7 +909,7 @@ fn apply_monitor_controls(
 #[cfg(test)]
 mod tests {
     use super::{AudioEditorPlugin, AudioMonitor, MonitorControl, MonitorStatus, waveform};
-    use crate::looping::LoopedSamples;
+    use crate::looping::{LoopedSamples, patch_loop_bake_secs, settle_patch_loop};
     use bevy::audio::{AudioPlayer, AudioSink, Decodable, PlaybackSettings};
     use bevy::prelude::*;
     use bevy_egui::egui;
@@ -1166,7 +1193,10 @@ mod tests {
     // -----------------------------------------------------------------------
 
     use super::MonitorRequest;
-    use crate::{AudioPatch, GraphNode, NodeGraph, NodeId, NodeKind, SequenceRecipe, SineOsc};
+    use crate::{
+        AudioPatch, ClampToEnvelope, Envelope, GraphNode, NodeGraph, NodeId, NodeKind,
+        SequenceRecipe, SineOsc,
+    };
     use std::collections::BTreeMap;
     use std::sync::atomic::Ordering;
 
@@ -1193,6 +1223,104 @@ mod tests {
         }
     }
 
+    /// A patch asked for warm and faded is played warm and faded: the voice's
+    /// samples are the bake of [`patch_loop_bake_secs`] settled by
+    /// [`settle_patch_loop`], to the sample - what a world that loops the
+    /// patch bakes (Overlands #1386).
+    #[test]
+    fn a_warm_faded_patch_plays_as_the_world_bakes_it() {
+        let mut app = monitor_app();
+        let (rate, dur, warm, fade) = (22_050, 0.5, 0.25, 0.01);
+        app.world_mut().write_message(MonitorRequest::PlayPatch {
+            patch: sine(),
+            sample_rate: rate,
+            duration_secs: dur,
+            warmup_secs: warm,
+            loop_fade_secs: fade,
+        });
+        until_settled(&mut app);
+        let entity = app
+            .world()
+            .resource::<AudioMonitor>()
+            .current
+            .expect("a voice");
+        let handle = app
+            .world()
+            .get::<AudioPlayer<LoopedSamples>>(entity)
+            .expect("its player")
+            .0
+            .clone();
+        let played = app
+            .world()
+            .resource::<Assets<LoopedSamples>>()
+            .get(&handle)
+            .expect("its samples")
+            .samples()
+            .to_vec();
+        let world = settle_patch_loop(
+            crate::bake(&sine(), rate, patch_loop_bake_secs(dur, warm, fade)),
+            rate,
+            dur,
+            warm,
+            fade,
+        );
+        assert_eq!(
+            played.len(),
+            (f64::from(dur) * f64::from(rate)).round() as usize
+        );
+        assert!(
+            played == world,
+            "the monitor played another loop than the world bakes"
+        );
+    }
+
+    /// A patch past the envelope is played as the world bakes it: clamped
+    /// first. The world's baker clamps whatever reaches it; an editor's
+    /// working copy reaches the monitor unclamped, and a sine edited to
+    /// twelve times full scale was heard at that, where the world plays it
+    /// at the envelope's eight (the Group 7 critic).
+    #[test]
+    fn a_patch_past_the_envelope_plays_as_the_world_clamps_it() {
+        let loud = |amplitude: f32| AudioPatch {
+            seed: 0,
+            graph: NodeGraph {
+                nodes: vec![GraphNode {
+                    id: NodeId(0),
+                    kind: NodeKind::Sine(SineOsc {
+                        amplitude,
+                        ..SineOsc::default()
+                    }),
+                    inputs: BTreeMap::new(),
+                }],
+                output: NodeId(0),
+            },
+        };
+        let mut clamped = loud(12.0);
+        clamped.clamp_to_envelope(&Envelope::default());
+        assert_eq!(
+            clamped,
+            loud(8.0),
+            "fixture: the envelope holds a sine at 8"
+        );
+
+        let mut app = monitor_app();
+        let rate = 22_050;
+        app.world_mut().write_message(MonitorRequest::PlayPatch {
+            patch: loud(12.0),
+            sample_rate: rate,
+            duration_secs: 0.25,
+            warmup_secs: 0.0,
+            loop_fade_secs: 0.0,
+        });
+        until_settled(&mut app);
+        let played = app.world().resource::<AudioMonitor>().last_samples.clone();
+        assert!(
+            played == crate::bake(&loud(8.0), rate, 0.25),
+            "the monitor plays the clamped patch"
+        );
+        assert!(played != crate::bake(&loud(12.0), rate, 0.25));
+    }
+
     /// A bake long enough to still be running many frames after it starts:
     /// ten minutes at 48 kHz, which only a cancel ends early.
     fn endless() -> MonitorRequest {
@@ -1200,6 +1328,8 @@ mod tests {
             patch: sine(),
             sample_rate: 48_000,
             duration_secs: 600.0,
+            warmup_secs: 0.0,
+            loop_fade_secs: 0.0,
         }
     }
 
@@ -1249,6 +1379,8 @@ mod tests {
             patch: sine(),
             sample_rate: 22_050,
             duration_secs: 0.5,
+            warmup_secs: 0.0,
+            loop_fade_secs: 0.0,
         });
         app.update();
         assert!(
@@ -1316,6 +1448,8 @@ mod tests {
             patch: sine(),
             sample_rate: 22_050,
             duration_secs: 0.25,
+            warmup_secs: 0.0,
+            loop_fade_secs: 0.0,
         });
         until_settled(&mut app);
         let entity = app
@@ -1344,14 +1478,20 @@ mod tests {
     /// A bake that comes back at a sample rate of zero is an error, not a
     /// voice: a zero rate cannot play, and the monitor refuses it where it
     /// makes the voice rather than handing it to the backend.
+    ///
+    /// A patch's rate is the request's own, so a zero there still reaches
+    /// that refusal. A sequence's lives in its recipe, which the monitor
+    /// clamps to the envelope before the bake, as a world's baker does: a
+    /// zero-rate recipe plays at the envelope's floor, as the world plays it.
     #[test]
     fn a_bake_at_a_sample_rate_of_zero_is_an_error_not_a_voice() {
         let mut app = monitor_app();
-        app.world_mut().write_message(MonitorRequest::PlaySequence {
-            recipe: SequenceRecipe {
-                sample_rate: 0,
-                ..a_bed()
-            },
+        app.world_mut().write_message(MonitorRequest::PlayPatch {
+            patch: sine(),
+            sample_rate: 0,
+            duration_secs: 0.5,
+            warmup_secs: 0.0,
+            loop_fade_secs: 0.0,
         });
         until_settled(&mut app);
         {
@@ -1364,6 +1504,22 @@ mod tests {
             assert_eq!(monitor.position_secs(), None);
         }
         assert_eq!(voices(&mut app), 0);
+
+        let mut app = monitor_app();
+        app.world_mut().write_message(MonitorRequest::PlaySequence {
+            recipe: SequenceRecipe {
+                sample_rate: 0,
+                ..a_bed()
+            },
+        });
+        until_settled(&mut app);
+        let monitor = app.world().resource::<AudioMonitor>();
+        assert_eq!(
+            monitor.status,
+            MonitorStatus::Playing,
+            "clamped, as in the world"
+        );
+        assert_eq!(monitor.sample_rate, 8_000, "the envelope's floor");
     }
 
     /// An app with no voice assets — no Bevy audio plugin, so the source was
@@ -1381,6 +1537,8 @@ mod tests {
             patch: sine(),
             sample_rate: 22_050,
             duration_secs: 0.25,
+            warmup_secs: 0.0,
+            loop_fade_secs: 0.0,
         });
         until_settled(&mut app);
         {
@@ -1602,6 +1760,8 @@ mod tests {
             patch: sine(),
             sample_rate: 22_050,
             duration_secs: 0.25,
+            warmup_secs: 0.0,
+            loop_fade_secs: 0.0,
         });
         until_settled(&mut app);
         app.update();
@@ -1660,6 +1820,8 @@ mod tests {
             patch: sine(),
             sample_rate: 22_050,
             duration_secs: 0.25,
+            warmup_secs: 0.0,
+            loop_fade_secs: 0.0,
         });
         until_settled(&mut app);
         assert_eq!(
@@ -1744,6 +1906,8 @@ mod tests {
             patch: sine(),
             sample_rate: 22_050,
             duration_secs: 0.5,
+            warmup_secs: 0.0,
+            loop_fade_secs: 0.0,
         });
         until_settled(&mut app);
         assert_eq!(
@@ -1812,6 +1976,8 @@ mod tests {
             patch: sine(),
             sample_rate: 22_050,
             duration_secs: 0.25,
+            warmup_secs: 0.0,
+            loop_fade_secs: 0.0,
         });
         until_settled(&mut app);
         // Give a still-running sequence bake time to land, if it could.

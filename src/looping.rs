@@ -29,6 +29,19 @@
 //!
 //! A patch bake has no run-up: loop it from its first sample, a loop start of
 //! [`Duration::ZERO`].
+//!
+//! # A patch that meets itself
+//!
+//! Looped whole, a patch bake steps at its seam twice over (Overlands #1385,
+//! #1387). Every filter in a bake starts from rest, so the loop's first
+//! sample is a cold filter's and its last a settled one's; and a noise
+//! source is not periodic, so the seam joins two unrelated samples. A world
+//! that loops a patch therefore bakes on past a warm-up it throws away, and
+//! fades the loop's own continuation past its end back into its head:
+//! [`patch_loop_bake_secs`] says how long to bake, and [`settle_patch_loop`]
+//! cuts the bake down to the loop. The editor's monitor does the same when a
+//! [`MonitorRequest::PlayPatch`](crate::ui::MonitorRequest) asks for it, so
+//! an audition plays what the world plays.
 
 use std::fmt;
 use std::num::NonZeroU32;
@@ -77,6 +90,81 @@ const NO_SEEK: usize = usize::MAX;
 pub fn sequence_loop_start(recipe: &SequenceRecipe) -> Option<Duration> {
     let rate = NonZeroU32::new(recipe.sample_rate)?;
     loop_start_sample(recipe).map(|sample| time_of(sample, rate))
+}
+
+/// The seconds to bake for a looped patch of `duration_secs`, with
+/// `warmup_secs` of warm-up to throw away and a seam fade of
+/// `loop_fade_secs`: the warm-up, the loop, and as much of the loop's own
+/// continuation as the fade blends back into its head. The fade is at most
+/// half the loop; a negative or NaN length counts as none. Bake this long,
+/// then [`settle_patch_loop`].
+pub fn patch_loop_bake_secs(duration_secs: f32, warmup_secs: f32, loop_fade_secs: f32) -> f32 {
+    let (duration_secs, warmup_secs, loop_fade_secs) =
+        patch_loop_lengths(duration_secs, warmup_secs, loop_fade_secs);
+    warmup_secs + duration_secs + loop_fade_secs
+}
+
+/// The three lengths [`patch_loop_bake_secs`] and [`settle_patch_loop`]
+/// work from, clamped once for both: `max(0.0)` first, which sends a NaN to
+/// zero rather than through `min`, and the fade at most half the loop.
+fn patch_loop_lengths(
+    duration_secs: f32,
+    warmup_secs: f32,
+    loop_fade_secs: f32,
+) -> (f32, f32, f32) {
+    let duration_secs = duration_secs.max(0.0);
+    let warmup_secs = warmup_secs.max(0.0);
+    let loop_fade_secs = loop_fade_secs.max(0.0).min(duration_secs * 0.5);
+    (duration_secs, warmup_secs, loop_fade_secs)
+}
+
+/// Cut `samples` - a patch baked for [`patch_loop_bake_secs`] at
+/// `sample_rate` - down to a loop of `duration_secs` that meets itself:
+/// the warm-up thrown away, and the loop's continuation past its end faded
+/// into its head over `loop_fade_secs`. With no warm-up and no fade the
+/// bake comes back as it went in, bit for bit.
+///
+/// The fade sums to one - a Hann pair, `g * head + (1 - g) * tail` - and is
+/// **not** equal-power. Every rate in a patch a world loops is closed, so
+/// the tail past the loop's end is the same waveform as its head:
+/// correlated, and correlated signals sum in amplitude. An equal-power pair
+/// leaves the faded window 2.0-2.3 dB hot on every tonal patch; gains that
+/// sum to one leave the periodic part exact, at the cost of a 1.25 dB dip in
+/// a noise layer alone.
+///
+/// Every offset is counted as a bake counts a duration, from the sum of the
+/// lengths and never as `len - fade`: rounding a sum is not rounding its
+/// parts, and a loop worked back from the end of the longer bake would land
+/// a sample off (`(0.25 + 1.0) s x 22 050 Hz` is a genuine half sample).
+/// This is the treatment Overlands' worker bake gives a looped patch, so a
+/// monitor and a world agree to the sample.
+pub fn settle_patch_loop(
+    mut samples: Vec<f32>,
+    sample_rate: u32,
+    duration_secs: f32,
+    warmup_secs: f32,
+    loop_fade_secs: f32,
+) -> Vec<f32> {
+    let (duration_secs, warmup_secs, _) =
+        patch_loop_lengths(duration_secs, warmup_secs, loop_fade_secs);
+    let duration_samples = |secs: f32| (f64::from(secs) * f64::from(sample_rate)).round() as usize;
+    let loop_end = duration_samples(warmup_secs + duration_secs).min(samples.len());
+    let kept = duration_samples(duration_secs).min(loop_end);
+    let head = loop_end - kept;
+    // However many the longer bake actually added, never more than half of
+    // what is kept.
+    let fade = (samples.len() - loop_end).min(kept / 2);
+    for i in 0..fade {
+        let t = (i as f32 + 0.5) / fade as f32;
+        let g = 0.5 - 0.5 * (std::f32::consts::PI * t).cos();
+        let tail = samples[loop_end + i];
+        samples[head + i] = samples[head + i] * g + tail * (1.0 - g);
+    }
+    // The `duration_secs` window that ends at the loop's end, so a warm or
+    // faded bake is as long as a cold one.
+    samples.truncate(loop_end);
+    samples.drain(..head);
+    samples
 }
 
 /// The sample a time `at` from a buffer's start lands on, the way rodio's
@@ -349,6 +437,76 @@ impl Source for LoopedSamplesDecoder {
         self.at = sample_at(pos, self.sample_rate).min(self.samples.len().saturating_sub(1));
         self.shared.at.store(self.at, Ordering::Relaxed);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod patch_loop_tests {
+    use super::*;
+
+    /// A sine of `cycles` per second at `rate`, `secs` long.
+    fn sine(cycles: f32, rate: u32, secs: f32) -> Vec<f32> {
+        let n = (f64::from(secs) * f64::from(rate)).round() as usize;
+        (0..n)
+            .map(|i| (std::f32::consts::TAU * cycles * i as f32 / rate as f32).sin())
+            .collect()
+    }
+
+    /// With no warm-up and no fade, a bake comes back as it went in, bit for
+    /// bit, and the bake is the loop's length: an audition that asks for
+    /// neither plays what it always did.
+    #[test]
+    fn a_cold_whole_loop_is_the_bake_itself() {
+        assert_eq!(patch_loop_bake_secs(1.5, 0.0, 0.0), 1.5);
+        let bake = sine(7.0, 22_050, 1.5);
+        assert_eq!(settle_patch_loop(bake.clone(), 22_050, 1.5, 0.0, 0.0), bake);
+    }
+
+    /// A warm loop is the `duration_secs` of the bake past its warm-up, as
+    /// long as a cold one; offsets count from the sum, so `(0.25 + 1.0) s`
+    /// at 22 050 Hz - a genuine half sample - ends the loop where the bake
+    /// of that sum ends, not one sample short of it.
+    #[test]
+    fn a_warm_loop_is_the_bake_past_its_warmup() {
+        let rate = 22_050;
+        let bake: Vec<f32> = (0..27_563).map(|i| i as f32).collect();
+        assert_eq!(patch_loop_bake_secs(1.0, 0.25, 0.0), 1.25);
+        let settled = settle_patch_loop(bake, rate, 1.0, 0.25, 0.0);
+        assert_eq!(settled.len(), 22_050);
+        assert_eq!(settled.first(), Some(&5_513.0));
+        assert_eq!(settled.last(), Some(&27_562.0));
+    }
+
+    /// The fade sums to one: a periodic signal - a sine whose cycles close
+    /// the loop, as a world's looped patch does - comes through the faded
+    /// window unchanged, where an equal-power pair would swell it by up to
+    /// 3 dB; and the seam it fades joins the loop's end to its head as one
+    /// more step of the sine.
+    #[test]
+    fn the_seam_fade_sums_to_one() {
+        let rate = 8_000;
+        let (warm, dur, fade) = (0.25, 1.0, 0.05);
+        let bake = sine(5.0, rate, patch_loop_bake_secs(dur, warm, fade));
+        let settled = settle_patch_loop(bake.clone(), rate, dur, warm, fade);
+        let head = (0.25 * rate as f64) as usize;
+        for (i, (got, want)) in settled.iter().zip(&bake[head..]).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-5,
+                "sample {i}: {got} against {want}"
+            );
+        }
+        let step = (settled[0] - settled[settled.len() - 1]).abs();
+        let inside = (settled[1] - settled[0]).abs();
+        assert!(step <= inside * 1.01 + 1e-6, "seam {step} against {inside}");
+    }
+
+    /// The fade is at most half the loop, and a negative or NaN length is
+    /// none.
+    #[test]
+    fn hostile_lengths_are_clamped() {
+        assert_eq!(patch_loop_bake_secs(1.0, 0.0, 5.0), 1.5);
+        assert_eq!(patch_loop_bake_secs(1.0, -1.0, f32::NAN), 1.0);
+        assert_eq!(patch_loop_bake_secs(-1.0, 0.5, 0.5), 0.5);
     }
 }
 

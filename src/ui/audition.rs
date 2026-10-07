@@ -82,21 +82,50 @@ enum What<'a> {
         patch: &'a AudioPatch,
         sample_rate: u32,
         duration_secs: f32,
+        warmup_secs: f32,
+        loop_fade_secs: f32,
     },
     Sequence(&'a SequenceRecipe),
 }
 
 impl<'a> AuditionSource<'a> {
-    /// `patch` baked at `sample_rate` for `duration_secs`, then looped.
+    /// `patch` baked at `sample_rate` for `duration_secs`, then looped -
+    /// cold and whole unless [`with_warmup_secs`](Self::with_warmup_secs)
+    /// or [`with_loop_fade_secs`](Self::with_loop_fade_secs) asks otherwise.
     pub fn patch(patch: &'a AudioPatch, sample_rate: u32, duration_secs: f32) -> Self {
         Self {
             what: What::Patch {
                 patch,
                 sample_rate,
                 duration_secs,
+                warmup_secs: 0.0,
+                loop_fade_secs: 0.0,
             },
             note: None,
         }
+    }
+
+    /// Bake a patch on past `secs` of warm-up, thrown away, so the loop
+    /// starts with every filter settled - as a world bakes a patch it loops
+    /// (see [`settle_patch_loop`](crate::settle_patch_loop)). No effect on a
+    /// sequence, whose mixdown runs its own warm-up.
+    #[must_use]
+    pub fn with_warmup_secs(mut self, secs: f32) -> Self {
+        if let What::Patch { warmup_secs, .. } = &mut self.what {
+            *warmup_secs = secs;
+        }
+        self
+    }
+
+    /// Fade the loop's own continuation back into its head over `secs`, so
+    /// a patch's seam does not tick - as a world bakes a patch it loops. No
+    /// effect on a sequence, whose mixdown folds its own crossfade.
+    #[must_use]
+    pub fn with_loop_fade_secs(mut self, secs: f32) -> Self {
+        if let What::Patch { loop_fade_secs, .. } = &mut self.what {
+            *loop_fade_secs = secs;
+        }
+        self
     }
 
     /// The whole of `recipe`, at its own sample rate, looped from its loop
@@ -157,10 +186,14 @@ impl<'a> AuditionSource<'a> {
                 patch,
                 sample_rate,
                 duration_secs,
+                warmup_secs,
+                loop_fade_secs,
             } => MonitorRequest::PlayPatch {
                 patch: patch.clone(),
                 sample_rate,
                 duration_secs,
+                warmup_secs,
+                loop_fade_secs,
             },
             What::Sequence(recipe) => MonitorRequest::PlaySequence {
                 recipe: recipe.clone(),
@@ -945,9 +978,16 @@ mod tests {
                 patch,
                 sample_rate,
                 duration_secs,
+                warmup_secs,
+                loop_fade_secs,
             }) => {
                 assert_eq!(*patch, quiet);
                 assert_eq!((*sample_rate, *duration_secs), (22_050, 1.0));
+                assert_eq!(
+                    (*warmup_secs, *loop_fade_secs),
+                    (0.0, 0.0),
+                    "an audition is cold and whole unless asked"
+                );
             }
             other => panic!("Audition asked for {}", describe(other)),
         }

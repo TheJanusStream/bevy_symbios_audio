@@ -28,10 +28,12 @@
 //!   a playhead is drawn the ruler also takes a click, which plays from the
 //!   beat clicked (see the playhead, below). An
 //!   event whose instrument id names no instrument bakes to silence; its
-//!   block is drawn tinted, hatched and outlined in the error colour and
-//!   labelled `missing: <id>` — the label in a tone that reads on that
-//!   tint rather than in the error colour itself, which on its own tint
-//!   was under AA in every theme (Overlands #1342).
+//!   block is drawn tinted, hatched and outlined in the error colour, and
+//!   each run of such notes on a lane is labelled `missing: <id>` once,
+//!   fitted like any label to the part of the run in view (Overlands
+//!   #1344); the label in a tone that reads on that tint rather than in the
+//!   error colour itself, which on its own tint was under AA in every theme
+//!   (Overlands #1342).
 //! - **Editing notes** — click a block to pick it, shift-click or drag a box
 //!   over the lanes to pick several. A drag moves everything picked and a
 //!   drag on a block's right edge resizes that one's gate; Alt makes the
@@ -1159,7 +1161,7 @@ fn pitch_label(pitch: f32) -> Option<String> {
 /// the four notes after it.
 fn note_labels(event: &Event, missing: bool) -> Vec<String> {
     if missing {
-        return vec![missing_label(&event.instrument_id)];
+        return missing_labels(&event.instrument_id);
     }
     let name = event.instrument_id.as_str();
     match pitch_label(event.pitch_multiplier) {
@@ -2415,6 +2417,9 @@ fn timeline(
                     state.marquee = None;
                 }
 
+                // Each note's block, instrument and whether it is missing,
+                // for the run labels drawn once the lane's notes are.
+                let mut lane: Vec<(Rect, String, bool)> = Vec::with_capacity(track.events.len());
                 for (ei, event) in track.events.iter_mut().enumerate() {
                     let geom = note_geometry(event, lane_top, ppb, bx(0.0));
                     state.notes.push(NoteGeom {
@@ -2446,8 +2451,9 @@ fn timeline(
                         paint_missing_block(&painter, body, selected, error);
                     } else {
                         paint_note_block(&painter, body, selected, tint, event.volume, style);
+                        paint_note_label(&painter, body, event, style);
                     }
-                    paint_note_label(&painter, body, event, missing, style);
+                    lane.push((body, event.instrument_id.clone(), missing));
 
                     let resp = ui.interact(body, id.with(("ev", ti, ei)), Sense::click_and_drag());
                     let resp = if missing {
@@ -2492,6 +2498,7 @@ fn timeline(
                         copy_now |= state.drag_mode == DragMode::Copy;
                     }
                 }
+                paint_missing_runs(&painter, &mut lane, style);
             }
 
             if copy_now && duplicate_selection(recipe, state) {
@@ -3221,52 +3228,85 @@ fn note_geometry(event: &Event, lane_top: f32, ppb: f32, origin: f32) -> (Rect, 
     (body, extent)
 }
 
+/// What a run of missing notes says, widest first: the id nothing answers
+/// to, then that the notes are missing, then nothing.
+fn missing_labels(instrument_id: &str) -> Vec<String> {
+    vec![missing_label(instrument_id), "missing".to_owned()]
+}
+
 /// What one note's block says: the widest of [`note_labels`] that fits
-/// inside it, or nothing.
-fn paint_note_label(
-    painter: &egui::Painter,
-    body: Rect,
-    event: &Event,
-    missing: bool,
-    style: &EditorStyle,
-) {
-    let colour = if missing {
-        missing_label_colour(style)
-    } else {
-        style.note_text
-    };
+/// inside it, or nothing. A missing note's label is its run's, drawn by
+/// [`paint_missing_runs`].
+fn paint_note_label(painter: &egui::Painter, body: Rect, event: &Event, style: &EditorStyle) {
+    paint_label_in(painter, body, &note_labels(event, false), style.note_text);
+}
+
+/// Draw in `rect` the widest of `labels` that fits inside it, in `colour`,
+/// or nothing.
+///
+/// The text starts [`LABEL_PAD`] inside the left edge and needs only
+/// clearance at the right, so a 4-beat note's pitch fits at the zoom that
+/// fits the whole sequence.
+fn paint_label_in(painter: &egui::Painter, rect: Rect, labels: &[String], colour: Color32) {
     let font = egui::FontId::proportional(11.0);
-    let draw = |galley: std::sync::Arc<egui::Galley>| {
-        painter.galley(
-            Pos2::new(
-                body.left() + LABEL_PAD,
-                body.center().y - 0.5 * galley.size().y,
-            ),
-            galley,
-            colour,
-        );
-    };
-    // A broken note says so whatever its width: the label is the only
-    // thing that names the instrument nothing answers to, so it runs past
-    // the block the way every label used to. Making it fit inside is
-    // Overlands #1342, which is not this step's.
-    if missing {
-        draw(painter.layout_no_wrap(missing_label(&event.instrument_id), font, colour));
-        return;
-    }
-    // The text starts [`LABEL_PAD`] inside the left edge and needs only
-    // clearance at the right, so a 4-beat note's pitch fits at the zoom
-    // that fits the whole sequence.
-    let room = body.width() - LABEL_PAD - 1.0;
-    for label in note_labels(event, false) {
+    let room = rect.width() - LABEL_PAD - 1.0;
+    for label in labels {
         if label.is_empty() {
             continue;
         }
-        let galley = painter.layout_no_wrap(label, font.clone(), colour);
+        let galley = painter.layout_no_wrap(label.clone(), font.clone(), colour);
         if galley.size().x <= room {
-            draw(galley);
+            painter.galley(
+                Pos2::new(
+                    rect.left() + LABEL_PAD,
+                    rect.center().y - 0.5 * galley.size().y,
+                ),
+                galley,
+                colour,
+            );
             return;
         }
+    }
+}
+
+/// Label each run of missing notes once (Overlands #1344, the owner's
+/// choice): consecutive notes of a lane, in time order, whose instrument is
+/// the same missing one - whatever the space between them; another note on
+/// the lane ends the run - under one `missing: <id>`, fitted through the
+/// same ladder as any label to the part of the run in view. A lone wide
+/// orphan reads as it always did; a whole instrument renamed away - eight
+/// narrow notes, each once writing its own label over the seven after it -
+/// names the missing id once, where the run has room for it, and the label
+/// stays in view while any of the run does, rather than scrolling off with
+/// its first note.
+///
+/// `lane` holds each note's block, instrument and whether it is missing, in
+/// any order.
+fn paint_missing_runs(
+    painter: &egui::Painter,
+    lane: &mut [(Rect, String, bool)],
+    style: &EditorStyle,
+) {
+    lane.sort_by(|a, b| a.0.left().total_cmp(&b.0.left()));
+    let colour = missing_label_colour(style);
+    let mut i = 0;
+    while i < lane.len() {
+        let (first, id, missing) = &lane[i];
+        if !missing {
+            i += 1;
+            continue;
+        }
+        let mut run = *first;
+        let mut next = i + 1;
+        while next < lane.len() && lane[next].2 && lane[next].1 == *id {
+            run = run.union(lane[next].0);
+            next += 1;
+        }
+        let shown = run.intersect(painter.clip_rect());
+        if shown.is_positive() {
+            paint_label_in(painter, shown, &missing_labels(id), colour);
+        }
+        i = next;
     }
 }
 
@@ -4536,7 +4576,9 @@ mod tests {
 
     #[test]
     fn a_note_naming_no_instrument_is_marked_and_offers_a_reassign() {
-        let mut state = SequenceEditorState::default();
+        // Zoomed in, so the ghost notes' blocks have room for their label:
+        // a missing note's label is fitted to its run (Overlands #1344).
+        let mut state = view(MAX_PPB, Snap::default());
         state.set_selected_event(Some((0, 0)));
         let mut driver = Driver::with_state(ghost_recipe(), state);
 
@@ -4584,7 +4626,10 @@ mod tests {
 
     #[test]
     fn a_refused_name_moves_with_its_row_and_never_applies_itself() {
-        let mut driver = Driver::new(two_instrument_recipe());
+        // Zoomed in, so the notes the removal leaves behind have room for
+        // their label (Overlands #1344 fits it to the run).
+        let mut driver =
+            Driver::with_state(two_instrument_recipe(), view(MAX_PPB, Snap::default()));
         // inst2 typed to "inst1": refused while inst1 exists.
         driver.focus("inst2");
         driver.frame(backspaces(1));
@@ -4823,7 +4868,7 @@ mod tests {
     #[test]
     fn a_missing_notes_block_is_the_error_colour_and_its_label_reads_on_it() {
         let s = distinct_style();
-        let mut state = SequenceEditorState::default();
+        let mut state = view(MAX_PPB, Snap::default());
         state.set_selected_event(Some((0, 0)));
         let mut driver = Driver::with_state(ghost_recipe(), state);
         assert!(colours(&driver.out).contains(&s.error), "the ghost note");
@@ -5237,11 +5282,9 @@ mod tests {
     /// Read off [`SequenceEditorState::notes`], the timeline's own
     /// published geometry, rather than derived here a second time.
     ///
-    /// A note whose instrument is GONE is the deliberate exception and is
-    /// excluded: its label is drawn at any width, because the id nothing
-    /// answers to is the only place that id appears on the timeline. That
-    /// choice is #62's, and what it costs at a narrow block is filed
-    /// separately — see [`paint_note_label`].
+    /// None of these recipes has a note whose instrument is gone: such a
+    /// note's label is its run's, fitted to the run rather than to one
+    /// block, which `a_run_of_missing_notes_is_labelled_once` holds.
     #[test]
     fn every_note_label_lies_inside_its_block() {
         for (what, recipe, state) in [
@@ -5279,6 +5322,103 @@ mod tests {
             }
             assert!(labels > 0, "{what}: no label was drawn on any block");
         }
+    }
+
+    /// Overlands #1344, the owner's choice: a run of missing notes is
+    /// labelled once. Eight quarter-beat notes of an instrument renamed
+    /// away, each too narrow for `missing: pluck` but together wide enough:
+    /// one label across the run, inside it, where each note used to write
+    /// its own over the seven after it. A known note between two orphans
+    /// breaks the run, and at a zoom where even the whole run has no room
+    /// for a word, nothing is written - the hatched blocks, their hover and
+    /// the inspector still say it.
+    #[test]
+    fn a_run_of_missing_notes_is_labelled_once() {
+        let orphans = |known_at: Option<f32>| {
+            let mut recipe = recipe_with(&["wind"], 1);
+            recipe.tracks[0].events = (0..8)
+                .map(|i| Event {
+                    gate_beats: 0.25,
+                    ..note("pluck", i as f32 * 0.25)
+                })
+                .collect();
+            if let Some(at) = known_at {
+                recipe.tracks[0].events.push(Event {
+                    gate_beats: 0.25,
+                    ..note("wind", at)
+                });
+                // The known note takes the fifth orphan's place.
+                recipe.tracks[0].events.remove(4);
+            }
+            recipe
+        };
+        let labels = |driver: &Driver| -> Vec<Rect> {
+            shapes(&driver.out)
+                .into_iter()
+                .filter_map(|shape| match shape {
+                    egui::Shape::Text(t) if t.galley.text().starts_with("missing") => {
+                        Some(t.visual_bounding_rect())
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+
+        let zoom = 80.0;
+        let driver = Driver::with_state(orphans(None), view(zoom, Snap::default()));
+        let bodies: Vec<Rect> = driver.state.notes().iter().map(|n| n.body).collect();
+        assert!(
+            bodies.iter().all(|b| b.width() < 40.0),
+            "fixture: no one block has room for the label"
+        );
+        let run = bodies.iter().fold(bodies[0], |r, b| r.union(*b));
+        let drawn = labels(&driver);
+        assert_eq!(drawn.len(), 1, "one label for the run: {drawn:?}");
+        assert!(
+            run.expand(0.5).contains_rect(drawn[0]),
+            "{drawn:?} outside {run:?}"
+        );
+        assert!(driver.paints("missing: pluck"));
+
+        // A known note splits the orphans into a run of four and a run of
+        // three, each labelled on its own.
+        let split = Driver::with_state(orphans(Some(1.0)), view(zoom, Snap::default()));
+        assert_eq!(labels(&split).len(), 2, "{:?}", labels(&split));
+
+        let squeezed = Driver::with_state(orphans(None), view(MIN_PPB, Snap::default()));
+        assert!(labels(&squeezed).is_empty(), "{:?}", labels(&squeezed));
+    }
+
+    /// A run whose first notes are scrolled off the left keeps its label in
+    /// view: the label is fitted to the part of the run the timeline shows,
+    /// not pinned to a first note no one can see (the Group 7 critic: a long
+    /// run lost its only label to a scroll, where each note once drew its
+    /// own).
+    #[test]
+    fn a_run_scrolled_half_out_of_view_keeps_its_label() {
+        let ctx = egui::Context::default();
+        let style = distinct_style();
+        let shown = Rect::from_min_max(Pos2::new(200.0, 0.0), Pos2::new(400.0, 40.0));
+        let run = Rect::from_min_max(Pos2::new(0.0, 10.0), Pos2::new(380.0, 30.0));
+        let mut lane = vec![(run, String::from("pluck"), true)];
+        let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+            paint_missing_runs(&ui.painter_at(shown), &mut lane, &style);
+        });
+        let drawn: Vec<Rect> = shapes(&out)
+            .into_iter()
+            .filter_map(|shape| match shape {
+                egui::Shape::Text(t) if t.galley.text().starts_with("missing") => {
+                    Some(t.visual_bounding_rect())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(drawn.len(), 1, "one label: {drawn:?}");
+        assert!(
+            shown.contains_rect(drawn[0]),
+            "{:?} is not in the shown part {shown:?}",
+            drawn[0]
+        );
     }
 
     /// C3: a note off the native pitch says so on its block, and a block

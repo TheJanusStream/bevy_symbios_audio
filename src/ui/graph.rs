@@ -584,7 +584,7 @@ impl PatchEditorState {
     /// ```ignore
     /// if let Some(node) = state.take_hear_node() {
     ///     let heard = patch_hearing(patch, node);
-    ///     requests.push(MonitorRequest::PlayPatch { patch: heard, sample_rate, duration_secs });
+    ///     requests.push(AuditionSource::patch(&heard, sample_rate, duration_secs).request());
     /// }
     /// ```
     ///

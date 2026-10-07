@@ -126,7 +126,7 @@
 // docs.rs builds with `--cfg docsrs` on nightly, which is what puts the
 // "available on crate feature `egui`" badges on the gated items. Inert
 // everywhere else.
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 pub mod async_gen;
 pub mod audio_source;
@@ -175,7 +175,10 @@ pub use cache::{
     DEFAULT_MEMORY_CACHE_ENTRIES, FileStore, MemoryStore, PatchCache, PatchCacheKey,
     PatchCacheStore,
 };
-pub use looping::{LoopPlayhead, LoopedSamples, LoopedSamplesDecoder, sequence_loop_start};
+pub use looping::{
+    LoopPlayhead, LoopedSamples, LoopedSamplesDecoder, patch_loop_bake_secs, sequence_loop_start,
+    settle_patch_loop,
+};
 
 use bevy::prelude::*;
 

@@ -914,6 +914,10 @@ fn patch_slot(
                     patch: patch_hearing(&editor.patch, node),
                     sample_rate: PATCH_SAMPLE_RATE,
                     duration_secs: PATCH_SECS,
+                    // One node heard on its own: cold and whole, as the
+                    // canvas has always played it.
+                    warmup_secs: 0.0,
+                    loop_fade_secs: 0.0,
                 });
             }
         })
