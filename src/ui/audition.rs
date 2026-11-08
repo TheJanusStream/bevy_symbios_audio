@@ -642,7 +642,7 @@ mod tests {
                 ..Default::default()
             };
             let mut asked = None;
-            *out = ctx.run_ui(input, |root| {
+            *out = crate::ui::test_paint::run_ui(ctx, input, |root| {
                 egui::CentralPanel::default().show(root, |ui| {
                     *given = Some(ui.max_rect());
                     asked = audition_strip(ui, monitor, state, source, committed, muted);

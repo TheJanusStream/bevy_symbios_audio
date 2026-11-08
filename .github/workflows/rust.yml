@@ -87,3 +87,33 @@ jobs:
       - name: Run Tests
         run: cargo test --verbose ${{ matrix.flags }}
 
+
+  # The consuming applications ship to a browser, and until 0.7 this crate
+  # was only ever built for wasm32 inside one of them, where the app's own
+  # Bevy features could hide one this crate leans on. `--lib` only: the
+  # examples and benches are native, and the browser only links the library.
+  wasm:
+    name: wasm32 check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # As in the test job, but asking the action for the wasm target too, so
+      # the pin covers this job and the target is named in one place.
+      - name: Install Rust Toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          target: wasm32-unknown-unknown
+          cache: false
+
+      # No system libraries here: `--target wasm32` resolves its own
+      # dependency graph, and the windowing and audio crates are native-only.
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: wasm32
+
+      # The setup action already exports `RUSTFLAGS=-D warnings`; it is named
+      # here so the job says what it checks.
+      - name: Check
+        run: RUSTFLAGS='-D warnings' cargo check --verbose --target wasm32-unknown-unknown --lib --all-features

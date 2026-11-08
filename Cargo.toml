@@ -1,6 +1,6 @@
 [package]
 name = "bevy_symbios_audio"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 authors = ["Janus"]
 description = "Algorithmic audio generator for Bevy."
@@ -25,8 +25,17 @@ egui = ["dep:bevy_egui", "dep:web-time"]
 cli = ["dep:clap"]
 
 [dependencies]
-bevy = { version = "0.19", features = ["wav"] }
-bevy_egui = { version = "0.41", optional = true }
+# Only the Bevy parts this crate touches (Overlands #1576). Cargo features are
+# additive, so one library asking for bevy's `default` hands every consumer the
+# whole engine back; a dependent app gets what it asks for.
+bevy = { version = "0.20", default-features = false, features = [
+    "bevy_asset",
+    "bevy_log",
+    "bevy_audio",
+    "wav",
+] }
+# The editor draws widgets only: rendering, fonts and clipboard are the host's.
+bevy_egui = { version = "0.43.1", default-features = false, optional = true }
 clap = { version = "4", features = ["derive"], optional = true }
 # Only the `Rng` / `SeedableRng` traits over a seeded ChaCha8Rng: nothing
 # draws OS entropy, so the default os_rng / thread_rng features stay off
@@ -36,7 +45,7 @@ rand_chacha = "0.9"
 rayon = "1.11"
 # The audio backend under Bevy's, named for the seekable looping source
 # (`looping::LoopedSamples`): `Source::try_seek` returns rodio's `SeekError`,
-# which Bevy does not re-export. The minor bevy_audio 0.19 uses, with no
+# which Bevy does not re-export. The minor bevy_audio 0.20 uses, with no
 # features of its own, so it is the same crate in the graph: if Bevy moves to
 # another rodio, the `Decodable` impl stops compiling rather than
 # implementing a trait Bevy no longer calls.
@@ -53,7 +62,9 @@ web-time = { version = "1", optional = true }
 [dev-dependencies]
 tempfile = "3"
 criterion = "0.8"
-bevy_egui = "0.41"
+# The examples open a window and draw, so they ask for everything.
+bevy = "0.20"
+bevy_egui = "0.43.1"
 # The editor-glyph guard reads egui's embedded faces' charmaps (#52).
 skrifa = "0.42.1"
 

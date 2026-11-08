@@ -569,7 +569,8 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.enable_accesskit();
         let mut res = EditorResponse::NONE;
-        let out = ctx.run_ui(
+        let out = crate::ui::test_paint::run_ui(
+            &ctx,
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(
                     egui::Pos2::ZERO,
@@ -758,7 +759,7 @@ mod tests {
             )),
             ..Default::default()
         };
-        let out = ctx.run_ui(input, |ui| {
+        let out = crate::ui::test_paint::run_ui(&ctx, input, |ui| {
             egui::CentralPanel::default().show(ui, |ui| {
                 node_kind_body(ui, kind);
             });

@@ -7,6 +7,22 @@
 
 use bevy_egui::egui::{self, Color32, accesskit};
 
+/// One headless pass of `ctx`: [`egui::Context::run_ui`], with the frame's
+/// texture uploads dropped on purpose.
+///
+/// egui 0.36 asserts (in debug builds) that every `TexturesDelta` it hands
+/// out is applied before it is dropped, and a test has no renderer to apply
+/// the font atlas to. Every test pass goes through here so none trips it.
+pub(crate) fn run_ui(
+    ctx: &egui::Context,
+    input: egui::RawInput,
+    ui: impl FnMut(&mut egui::Ui),
+) -> egui::FullOutput {
+    let mut out = ctx.run_ui(input, ui);
+    out.textures_delta.clear();
+    out
+}
+
 /// Every shape `out` painted, nested ones flattened out.
 pub(crate) fn shapes(out: &egui::FullOutput) -> Vec<egui::Shape> {
     fn walk(shape: &egui::Shape, into: &mut Vec<egui::Shape>) {

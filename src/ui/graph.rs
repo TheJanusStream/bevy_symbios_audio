@@ -3553,7 +3553,7 @@ mod tests {
         let mut patch = three_node_patch();
         let mut state = PatchEditorState::default();
         for _ in 0..3 {
-            let _ = ctx.run_ui(egui::RawInput::default(), |root| {
+            let _ = crate::ui::test_paint::run_ui(&ctx, egui::RawInput::default(), |root| {
                 egui::CentralPanel::default().show(root, |ui| {
                     audio_patch_canvas(ui, &mut patch, &mut state, egui::Id::new("smoke"));
                 });
@@ -3578,7 +3578,7 @@ mod tests {
                 screen_rect: Some(screen),
                 ..Default::default()
             };
-            let _ = ctx.run_ui(input, |root| {
+            let _ = crate::ui::test_paint::run_ui(&ctx, input, |root| {
                 let strip = |ui: &mut egui::Ui| {
                     ui.horizontal(|ui| {
                         let _ = ui.button("Audition");
@@ -3787,7 +3787,7 @@ mod tests {
                 predicted_dt: FRAME_DT as f32,
                 ..Default::default()
             };
-            *out = ctx.run_ui(input, |root| {
+            *out = crate::ui::test_paint::run_ui(ctx, input, |root| {
                 egui::CentralPanel::default().show(root, |ui| {
                     *given = ui.max_rect();
                     res = audio_patch_canvas(ui, patch, state, Id::new("geometry"));
@@ -4334,7 +4334,7 @@ mod tests {
 
         let ctx = egui::Context::default();
         let mut state = PatchEditorState::default();
-        let _ = ctx.run_ui(egui::RawInput::default(), |root| {
+        let _ = crate::ui::test_paint::run_ui(&ctx, egui::RawInput::default(), |root| {
             egui::CentralPanel::default().show(root, |ui| {
                 audio_patch_canvas(ui, &mut patch, &mut state, egui::Id::new("smoke_bad"));
             });

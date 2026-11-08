@@ -12,7 +12,7 @@
 //!
 //! - **Bevy's own looping player.** `PlaybackSettings::LOOP` with its
 //!   [`start_position`](bevy::audio::PlaybackSettings::start_position) at
-//!   [`sequence_loop_start`]: bevy_audio 0.19 appends
+//!   [`sequence_loop_start`]: bevy_audio 0.20 appends
 //!   `decoder.skip_duration(start).repeat_infinite()` for that, a loop from
 //!   the loop start to the end in which the run-up is never played. One
 //!   field and no new asset, which is what a world's player wants. It cannot
@@ -576,7 +576,7 @@ mod tests {
 
     /// Bevy's own looping player, given [`sequence_loop_start`] as its
     /// `start_position`, loops the same window of the WAV a world bakes as
-    /// the editor's voice does: bevy_audio 0.19's `Loop` arm appends exactly
+    /// the editor's voice does: bevy_audio 0.20's `Loop` arm appends exactly
     /// `skip_duration(start).repeat_infinite()`.
     #[test]
     fn a_world_player_from_the_same_loop_start_plays_the_same_loop() {

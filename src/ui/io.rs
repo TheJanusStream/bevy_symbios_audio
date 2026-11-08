@@ -157,7 +157,7 @@ mod tests {
                 events,
                 ..Default::default()
             };
-            *out = ctx.run_ui(input, |root| {
+            *out = crate::ui::test_paint::run_ui(ctx, input, |root| {
                 egui::CentralPanel::default().show(root, |ui| {
                     json_io(ui, value, state, egui::Id::new("json"));
                 });
@@ -262,7 +262,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut value = AudioPatch::default();
         let mut state = JsonIoState::default();
-        let _ = ctx.run_ui(egui::RawInput::default(), |root| {
+        let _ = crate::ui::test_paint::run_ui(&ctx, egui::RawInput::default(), |root| {
             egui::CentralPanel::default().show(root, |ui| {
                 json_io(ui, &mut value, &mut state, egui::Id::new("json"));
             });

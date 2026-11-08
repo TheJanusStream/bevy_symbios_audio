@@ -919,7 +919,7 @@ mod tests {
         let ctx = egui::Context::default();
         let sine: Vec<f32> = (0..2000).map(|i| (i as f32 * 0.05).sin()).collect();
         for buf in [Vec::new(), sine] {
-            let _ = ctx.run_ui(egui::RawInput::default(), |root| {
+            let _ = crate::ui::test_paint::run_ui(&ctx, egui::RawInput::default(), |root| {
                 egui::CentralPanel::default().show(root, |ui| {
                     waveform(ui, &buf);
                 });
@@ -929,7 +929,7 @@ mod tests {
 
     /// One frame of a waveform of `samples`; what it painted.
     fn painted_waveform(ctx: &egui::Context, samples: &[f32]) -> egui::FullOutput {
-        ctx.run_ui(egui::RawInput::default(), |root| {
+        crate::ui::test_paint::run_ui(ctx, egui::RawInput::default(), |root| {
             egui::CentralPanel::default().show(root, |ui| {
                 waveform(ui, samples);
             });
@@ -969,7 +969,7 @@ mod tests {
                 for at in [0.0_f32, 0.5, 0.999] {
                     let position = secs * at;
                     let mut rect = None;
-                    let out = ctx.run_ui(input(), |root| {
+                    let out = crate::ui::test_paint::run_ui(&ctx, input(), |root| {
                         egui::CentralPanel::default().show(root, |ui| {
                             let drawn = super::waveform_with_cursor(
                                 ui,
@@ -1022,7 +1022,8 @@ mod tests {
         for (position, hand) in [(Some(0.5_f32), true), (None, false), (Some(9.0), false)] {
             let frame = |events: Vec<egui::Event>| {
                 let mut rect = egui::Rect::NOTHING;
-                let out = ctx.run_ui(
+                let out = crate::ui::test_paint::run_ui(
+                    &ctx,
                     egui::RawInput {
                         events,
                         ..Default::default()

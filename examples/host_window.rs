@@ -1728,15 +1728,25 @@ fn work_the_timeline(
     };
     match *noter {
         Noter::Done(at) => {
+            // Lets go of a Shift held by `Noter::Clicked`: since egui 0.36 a
+            // held modifier stays held until an event says otherwise.
+            input
+                .0
+                .events
+                .push(egui::Event::ModifiersChanged(egui::Modifiers::NONE));
             input.0.events.push(egui::Event::PointerMoved(at));
             return;
         }
         // A shift-click adds the second note to the picked set. The
-        // modifier goes on the frame's raw input as well as on the event:
-        // egui reads a chord from the event and `modifiers.shift` from the
-        // frame, and the editor needs the first.
+        // modifier is held (egui 0.36: an `Event::ModifiersChanged`) as well
+        // as carried on the event: egui reads a chord from the event and
+        // `modifiers.shift` from what is held, and the editor needs the
+        // first. It is released on the next frame, in `Noter::Done`.
         Noter::Clicked(second) => {
-            input.0.modifiers = egui::Modifiers::SHIFT;
+            input
+                .0
+                .events
+                .push(egui::Event::ModifiersChanged(egui::Modifiers::SHIFT));
             input.0.events.push(egui::Event::PointerMoved(second));
             input.0.events.push(egui::Event::PointerButton {
                 pos: second,

@@ -587,7 +587,7 @@ pub(crate) mod tests {
     fn ui_run(ctx: &egui::Context, visuals: egui::Visuals) -> EditorStyle {
         ctx.set_visuals(visuals);
         let mut seen = None;
-        let _ = ctx.run_ui(egui::RawInput::default(), |root| {
+        let _ = crate::ui::test_paint::run_ui(ctx, egui::RawInput::default(), |root| {
             egui::CentralPanel::default().show(root, |ui| seen = Some(editor_style(ui)));
         });
         seen.expect("the panel ran")

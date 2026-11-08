@@ -3861,7 +3861,7 @@ mod tests {
 
         let ctx = egui::Context::default();
         for _ in 0..3 {
-            let _ = ctx.run_ui(egui::RawInput::default(), |root| {
+            let _ = crate::ui::test_paint::run_ui(&ctx, egui::RawInput::default(), |root| {
                 egui::Panel::left("seq").show(root, |ui| {
                     sequence_recipe_editor(ui, &mut recipe, &mut state, Id::new("seq"));
                 });
@@ -3877,7 +3877,7 @@ mod tests {
         let mut recipe = SequenceRecipe::default();
         let mut state = SequenceEditorState::default();
         let ctx = egui::Context::default();
-        let _ = ctx.run_ui(egui::RawInput::default(), |root| {
+        let _ = crate::ui::test_paint::run_ui(&ctx, egui::RawInput::default(), |root| {
             egui::CentralPanel::default().show(root, |ui| {
                 sequence_recipe_editor(ui, &mut recipe, &mut state, Id::new("seq"));
             });
@@ -4072,14 +4072,17 @@ mod tests {
         /// One frame with `modifiers` held down as the platform reports
         /// them.
         ///
-        /// `InputState::modifiers` comes from the raw input and not from an
-        /// event's own copy of them, so a Shift-arrow needs both: the event
-        /// carries the chord that is matched, and the raw modifiers are
-        /// what the fine step is read from.
+        /// `InputState::modifiers` is not read from an event's own copy of
+        /// them, so a Shift-arrow needs both: the event carries the chord
+        /// that is matched, and the held modifiers are what the fine step is
+        /// read from. Since egui 0.36 those arrive as an
+        /// `Event::ModifiersChanged` and stay held until the next one, so
+        /// every frame opens with one: `frame` releases what an earlier
+        /// `frame_held` pressed, as the per-frame `RawInput::modifiers` did.
         fn frame_held(
             &mut self,
             modifiers: egui::Modifiers,
-            events: Vec<egui::Event>,
+            mut events: Vec<egui::Event>,
         ) -> EditorResponse {
             let Self {
                 ctx,
@@ -4091,12 +4094,12 @@ mod tests {
             } = self;
             let panel_width = *panel_width;
             let mut res = EditorResponse::NONE;
+            events.insert(0, egui::Event::ModifiersChanged(modifiers));
             let input = egui::RawInput {
                 events,
-                modifiers,
                 ..Default::default()
             };
-            *out = ctx.run_ui(input, |root| {
+            *out = crate::ui::test_paint::run_ui(ctx, input, |root| {
                 egui::Panel::left("seq")
                     .default_size(panel_width)
                     .show(root, |ui| {
@@ -4772,7 +4775,7 @@ mod tests {
                 }
                 _ => None,
             })
-            .last()
+            .next_back()
     }
 
     /// Every note label reading `name` on the timeline, with its colour and
@@ -5401,7 +5404,7 @@ mod tests {
         let shown = Rect::from_min_max(Pos2::new(200.0, 0.0), Pos2::new(400.0, 40.0));
         let run = Rect::from_min_max(Pos2::new(0.0, 10.0), Pos2::new(380.0, 30.0));
         let mut lane = vec![(run, String::from("pluck"), true)];
-        let out = ctx.run_ui(egui::RawInput::default(), |ui| {
+        let out = crate::ui::test_paint::run_ui(&ctx, egui::RawInput::default(), |ui| {
             paint_missing_runs(&ui.painter_at(shown), &mut lane, &style);
         });
         let drawn: Vec<Rect> = shapes(&out)
